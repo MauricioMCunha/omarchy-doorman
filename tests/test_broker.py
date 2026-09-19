@@ -19,6 +19,7 @@ class BrokerTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.socket_path = Path(self.temp.name) / "broker.sock"
         self.token = "test-token-only"
+        self.capability = "test-llm-capability"
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -28,6 +29,8 @@ class BrokerTest(unittest.TestCase):
                 str(self.socket_path),
                 "--token",
                 self.token,
+                "--llm-capability",
+                self.capability,
                 "--timeout",
                 "2",
             ],
@@ -61,6 +64,8 @@ class BrokerTest(unittest.TestCase):
                 "command": "comando-ficticio",
                 "cwd": str(ROOT),
                 "tty": "teste-pty",
+                "origin": "llm",
+                "capability": self.capability,
             },
         )
         self.assertTrue(created["ok"])
@@ -94,7 +99,16 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(result, {"ok": False, "error": "unauthorized"})
 
     def test_expired_request_is_rejected(self) -> None:
-        created = call(self.socket_path, self.token, {"type": "request", "command": "expira"})
+        created = call(
+            self.socket_path,
+            self.token,
+            {
+                "type": "request",
+                "command": "expira",
+                "origin": "llm",
+                "capability": self.capability,
+            },
+        )
         time.sleep(2.2)
         result = call(
             self.socket_path,
@@ -118,7 +132,13 @@ class BrokerTest(unittest.TestCase):
                 request_secret(
                     self.socket_path,
                     self.token,
-                    {"pid": os.getpid(), "command": "sudo -A teste", "prompt": "Password: "},
+                    {
+                        "pid": os.getpid(),
+                        "command": "sudo -A teste",
+                        "prompt": "Password: ",
+                        "origin": "llm",
+                        "capability": self.capability,
+                    },
                 )
             )
 
@@ -145,6 +165,14 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(approval, {"ok": True})
         thread.join(timeout=2)
         self.assertEqual(result, {"ok": True, "secret": "segredo-ficticio"})
+
+    def test_non_llm_origin_is_rejected(self) -> None:
+        result = call(
+            self.socket_path,
+            self.token,
+            {"type": "request", "origin": "terminal", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "invalid_llm_origin"})
 
 
 if __name__ == "__main__":
