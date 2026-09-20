@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -193,6 +194,39 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": False, "error": "invalid_llm_origin"})
 
+    def test_approve_requires_correct_nonce(self) -> None:
+        created = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "nonce-errado",
+             "origin": "llm", "capability": self.capability},
+        )
+        wrong = call(
+            self.socket_path, self.token,
+            {"type": "approve", "request_id": created["request_id"],
+             "nonce": "nonce-errado-de-proposito", "secret": "nao-deve-vazar"},
+        )
+        self.assertFalse(wrong["ok"])
+        correct = call(
+            self.socket_path, self.token,
+            {"type": "approve", "request_id": created["request_id"],
+             "nonce": created["nonce"], "secret": "segredo-correto"},
+        )
+        self.assertTrue(correct["ok"])
+
+    def test_idle_unauthenticated_connection_is_closed_after_handshake_timeout(self) -> None:
+        # Regressão: sem timeout no handshake, uma conexão que nunca envia
+        # dados (nem token) prendia a thread do broker para sempre — DoS
+        # local trivial, sem precisar do token, contra qualquer processo do
+        # mesmo usuário. O broker deve fechar a conexão sozinho.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.connect(str(self.socket_path))
+            conn.settimeout(8.0)
+            closed = conn.recv(1)
+        self.assertEqual(closed, b"")
+        # O broker segue respondendo normalmente a outras conexões.
+        stats = call(self.socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats["ok"])
+
     def test_cancel_requires_nonce(self) -> None:
         created = call(
             self.socket_path, self.token,
@@ -258,6 +292,89 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(helper.returncode, 0)
         self.assertEqual(helper.stdout, "segredo-ficticio\n")
         self.assertEqual(helper.stderr, "")
+
+    def test_askpass_survives_approval_slower_than_old_five_second_timeout(self) -> None:
+        # Regressão: request_secret() costumava herdar o timeout de handshake
+        # (5s) para a leitura do resultado, que só chega quando a UI decide.
+        # Uma aprovação humana real é comumente mais lenta que isso.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-slow.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "services.secure_input_broker.broker",
+                "--socket",
+                str(socket_path),
+                "--token",
+                self.token,
+                "--llm-capability",
+                self.capability,
+                "--timeout",
+                "20",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker não criou o socket")
+
+        import threading
+
+        result: dict[str, object] = {}
+
+        def askpass() -> None:
+            result.update(
+                request_secret(
+                    socket_path,
+                    self.token,
+                    {
+                        "pid": os.getpid(),
+                        "command": "sudo -A teste-lento",
+                        "prompt": "Password: ",
+                        "origin": "llm",
+                        "capability": self.capability,
+                    },
+                )
+            )
+
+        thread = threading.Thread(target=askpass)
+        thread.start()
+        request = None
+        for _ in range(50):
+            pending = call(socket_path, self.token, {"type": "pending"})
+            if pending["requests"]:
+                request = pending["requests"][0]
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(request)
+
+        time.sleep(6.0)  # excede o antigo SOCKET_TIMEOUT de 5s do cliente
+
+        approval = call(
+            socket_path,
+            self.token,
+            {
+                "type": "approve",
+                "request_id": request["request_id"],
+                "nonce": request["nonce"],
+                "secret": "segredo-lento",
+            },
+        )
+        self.assertEqual(approval, {"ok": True})
+        thread.join(timeout=2)
+        self.assertEqual(result, {"ok": True, "secret": "segredo-lento"})
 
     def test_stats_reports_request_lifecycle(self) -> None:
         created = call(
