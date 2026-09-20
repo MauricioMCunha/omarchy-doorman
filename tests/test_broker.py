@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from services.secure_input_broker.client import call, request_secret  # noqa: E402
-from services.secure_input_broker.broker import Broker, PendingRequest  # noqa: E402
+from services.secure_input_broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
 
 class BrokerTest(unittest.TestCase):
@@ -243,6 +243,38 @@ class BrokerTest(unittest.TestCase):
             {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
         )
         self.assertTrue(cancelled["ok"])
+
+    def test_broker_rejects_requests_beyond_max_pending(self) -> None:
+        accepted = []
+        for i in range(MAX_PENDING):
+            result = call(
+                self.socket_path, self.token,
+                {"type": "request", "pid": os.getpid(), "command": f"pedido-{i}",
+                 "origin": "llm", "capability": self.capability},
+            )
+            self.assertTrue(result["ok"], result)
+            accepted.append(result)
+
+        overflow = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "excedente",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(overflow, {"ok": False, "error": "too_many_pending"})
+
+        # Libera um espaço; um novo pedido deve voltar a ser aceito.
+        cancelled = call(
+            self.socket_path, self.token,
+            {"type": "cancel", "request_id": accepted[0]["request_id"],
+             "nonce": accepted[0]["nonce"]},
+        )
+        self.assertTrue(cancelled["ok"])
+        freed = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "novo-espaco",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(freed["ok"])
 
     def test_missing_pid_is_rejected(self) -> None:
         result = call(
