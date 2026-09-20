@@ -15,7 +15,7 @@
 
 ```text
 comando autorizado
-    └─ sudo -A / SUDO_ASKPASS
+    └─ sudo / sudo -A / SUDO_ASKPASS
          └─ broker local
               └─ plugin Omarchy
                    └─ usuário confirma e digita localmente
@@ -25,6 +25,11 @@ O conteúdo da senha não retorna ao agente, ao chat, ao clipboard ou ao log.
 
 ## Limite da primeira versão
 
-A primeira versão atenderá somente comandos preparados para `sudo -A` e
-`SUDO_ASKPASS`. Não haverá captura global de teclado, leitura arbitrária de
-PTYs nem tentativa de interceptar todo prompt de terminal.
+A integração não invasiva pode configurar somente `SUDO_ASKPASS`, sem
+substituir `sudo`, alterar `sudoers` ou capturar comandos globalmente. O
+comportamento exato depende da versão/política do sudo; nesta máquina, o
+helper não é chamado sem `-A`, inclusive em execução sem TTY. O wrapper
+opcional acrescenta `-A` apenas quando o usuário o invoca diretamente. O
+launcher `secure-input-run` cria um PATH temporário para um único processo,
+permitindo que um executor de LLM use `sudo comando` sem lembrar a flag, sem
+alterar o PATH global do usuário.

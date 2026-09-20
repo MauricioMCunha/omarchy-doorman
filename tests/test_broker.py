@@ -104,6 +104,7 @@ class BrokerTest(unittest.TestCase):
             self.token,
             {
                 "type": "request",
+                "pid": os.getpid(),
                 "command": "expira",
                 "origin": "llm",
                 "capability": self.capability,
@@ -173,6 +174,88 @@ class BrokerTest(unittest.TestCase):
             {"type": "request", "origin": "terminal", "capability": self.capability},
         )
         self.assertEqual(result, {"ok": False, "error": "invalid_llm_origin"})
+
+    def test_cancel_requires_nonce(self) -> None:
+        created = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "cancelável",
+             "origin": "llm", "capability": self.capability},
+        )
+        wrong = call(
+            self.socket_path, self.token,
+            {"type": "cancel", "request_id": created["request_id"], "nonce": "wrong"},
+        )
+        self.assertFalse(wrong["ok"])
+        cancelled = call(
+            self.socket_path, self.token,
+            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+        )
+        self.assertTrue(cancelled["ok"])
+
+    def test_missing_pid_is_rejected(self) -> None:
+        result = call(
+            self.socket_path, self.token,
+            {"type": "request", "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "invalid_pid"})
+
+    def test_askpass_helper_prints_only_approved_secret(self) -> None:
+        import os
+
+        env = os.environ.copy()
+        env.update({
+            "SECURE_INPUT_SOCKET": str(self.socket_path),
+            "SECURE_INPUT_TOKEN": self.token,
+            "SECURE_INPUT_LLM_CAPABILITY": self.capability,
+            "SECURE_INPUT_COMMAND": "sudo -A id",
+        })
+        result: dict[str, object] = {}
+
+        def approve() -> None:
+            for _ in range(50):
+                pending = call(self.socket_path, self.token, {"type": "pending"})
+                if pending["requests"]:
+                    item = pending["requests"][0]
+                    result.update(call(
+                        self.socket_path,
+                        self.token,
+                        {"type": "approve", "request_id": item["request_id"],
+                         "nonce": item["nonce"], "secret": "segredo-ficticio"},
+                    ))
+                    return
+                time.sleep(0.02)
+
+        import threading
+        thread = threading.Thread(target=approve)
+        thread.start()
+        helper = subprocess.run(
+            [sys.executable, "-m", "services.secure_input_broker.askpass", "Password: "],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        thread.join(timeout=2)
+        self.assertEqual(helper.returncode, 0)
+        self.assertEqual(helper.stdout, "segredo-ficticio\n")
+        self.assertEqual(helper.stderr, "")
+
+    def test_stats_reports_request_lifecycle(self) -> None:
+        created = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "métrica",
+             "origin": "llm", "capability": self.capability},
+        )
+        call(
+            self.socket_path, self.token,
+            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+        )
+        stats = call(self.socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats["ok"])
+        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["cancelled"], 1)
+        self.assertEqual(stats["approved"], 0)
 
 
 if __name__ == "__main__":
