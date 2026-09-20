@@ -6,12 +6,14 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from services.secure_input_broker.client import call, request_secret  # noqa: E402
+from services.secure_input_broker.broker import Broker, PendingRequest  # noqa: E402
 
 
 class BrokerTest(unittest.TestCase):
@@ -97,6 +99,22 @@ class BrokerTest(unittest.TestCase):
     def test_wrong_token_is_rejected(self) -> None:
         result = call(self.socket_path, "wrong-token", {"type": "pending"})
         self.assertEqual(result, {"ok": False, "error": "unauthorized"})
+
+    def test_process_cmdline_change_invalidates_identity(self) -> None:
+        identity = Broker._process_identity(os.getpid())
+        self.assertIsNotNone(identity)
+        request = PendingRequest(
+            request_id="request",
+            nonce="nonce",
+            created_at=time.time(),
+            expires_at=time.time() + 10,
+            metadata={"pid": os.getpid()},
+            process_start_time=identity["start_time"],
+            process_cmdline="/bin/another-process",
+            process_uid=identity["uid"],
+        )
+        with patch.object(Broker, "_process_identity", return_value=identity):
+            self.assertFalse(Broker._identity_matches(request))
 
     def test_expired_request_is_rejected(self) -> None:
         created = call(
