@@ -57,7 +57,7 @@ Item {
       ? (fresh[0].command || "sudo") + "  ·  expira em " + Math.max(0, Math.floor(fresh[0].expires_at - Date.now() / 1000)) + "s"
       : fresh.map(function (item) { return item.command || "sudo" }).join(", ")
     notifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-send",
-      "--app-name", root.commercialName, "-g", "󰌾", "-u", "critical", title, body]
+      "--app-name", root.commercialName, "-g", "󰠚", "-u", "critical", title, body]
     notifyProc.running = true
   }
   function metric(name) { return Number(root.metrics[name] || 0) }
@@ -213,7 +213,7 @@ Item {
     id: barButton
     anchors.fill: parent
     bar: root.bar
-    text: "󰌾"
+    text: "󰠚"
     tooltipText: root.commercialName
     active: root.open || root.requests.length > 0
     Accessible.role: Accessible.Button
@@ -255,7 +255,7 @@ Item {
           }
         }
         iconComponent: Component {
-          Text { text: "󰌾"; color: root.requests.length > 0 ? Color.accent : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.display }
+          Text { text: "󰠚"; color: root.requests.length > 0 ? Color.accent : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.display }
         }
       }
 

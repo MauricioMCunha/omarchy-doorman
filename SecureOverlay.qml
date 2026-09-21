@@ -164,7 +164,7 @@ Item {
 
                 Text {
                   anchors.centerIn: parent
-                  text: "󰌾"
+                  text: "󰠚"
                   color: Color.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.icon
