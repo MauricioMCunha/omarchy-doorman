@@ -13,6 +13,7 @@ import os
 import secrets
 import socket
 import stat
+import struct
 import threading
 import time
 import uuid
@@ -29,6 +30,15 @@ HANDSHAKE_TIMEOUT = 5.0
 # concorrentes, cada um prendendo uma thread por até timeout+1s. Isso não
 # afeta o uso normal, que raramente tem mais de um pedido pendente por vez.
 MAX_PENDING = 20
+# Nome de processo (/proc/<pid>/comm) do processo confiável que pode
+# aprovar/cancelar/listar pedidos. Configurável só para testes — em produção
+# é sempre o Quickshell real. Ver Broker._peer_is_trusted_ui.
+DEFAULT_TRUSTED_UI_EXE = "quickshell"
+# Quantos saltos de processo pai a mais, além do próprio chamador, o
+# broker segue procurando o executável confiável (bridge.py roda como
+# filho direto do Quickshell — 1 salto basta na prática; a folga cobre um
+# wrapper de shell futuro sem exigir outra mudança).
+_TRUSTED_UI_MAX_HOPS = 4
 
 
 @dataclass
@@ -48,11 +58,19 @@ class PendingRequest:
 
 
 class Broker:
-    def __init__(self, socket_path: Path, session_token: str, llm_capability: str, timeout: float) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        session_token: str,
+        llm_capability: str,
+        timeout: float,
+        trusted_ui_exe: str = DEFAULT_TRUSTED_UI_EXE,
+    ) -> None:
         self.socket_path = socket_path
         self.session_token = session_token
         self.llm_capability = llm_capability
         self.timeout = timeout
+        self.trusted_ui_exe = trusted_ui_exe
         self.pending: dict[str, PendingRequest] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -124,14 +142,27 @@ class Broker:
                     self._send(conn, {"ok": False, "error": "invalid_llm_origin"})
                     return
                 self._create_request(conn, message)
-            elif kind == "approve":
-                self._approve(conn, message)
-            elif kind == "cancel":
-                self._cancel(conn, message)
-            elif kind == "pending":
-                self._pending(conn)
-            elif kind == "stats":
-                self._stats(conn)
+            elif kind in ("approve", "cancel", "pending", "stats"):
+                # Origin=llm + capability só controla quem pode CRIAR um
+                # pedido; approve/cancel/pending/stats só checavam o token de
+                # sessão, e qualquer processo do mesmo usuário que consegue
+                # criar um pedido também consegue ler esse token (é o mesmo
+                # arquivo 0600). Sem esta checagem, um agente comprometido
+                # podia se autoaprovar direto pelo socket, sem UI e sem
+                # humano — confirmado manualmente antes deste fix. SO_PEERCRED
+                # é verificado pelo kernel a partir do processo que chamou
+                # connect(); não é algo que o processo remoto possa forjar.
+                if not self._peer_is_trusted_ui(conn):
+                    self._send(conn, {"ok": False, "error": "untrusted_caller"})
+                    return
+                if kind == "approve":
+                    self._approve(conn, message)
+                elif kind == "cancel":
+                    self._cancel(conn, message)
+                elif kind == "pending":
+                    self._pending(conn)
+                else:
+                    self._stats(conn)
             else:
                 self._send(conn, {"ok": False, "error": "unknown_type"})
 
@@ -282,6 +313,54 @@ class Broker:
             return None
         return pid if pid > 0 else None
 
+    def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        except OSError:
+            return False
+        pid, uid, _gid = struct.unpack("3i", creds)
+        if pid <= 0 or uid != os.getuid():
+            return False
+        for _ in range(_TRUSTED_UI_MAX_HOPS):
+            info = self._process_ppid_and_comm(pid)
+            if info is None:
+                return False
+            ppid, comm = info
+            if comm == self.trusted_ui_exe:
+                return True
+            if ppid <= 1:
+                return False
+            pid = ppid
+        return False
+
+    @staticmethod
+    def _process_ppid_and_comm(pid: int) -> tuple[int, str] | None:
+        # Comparar /proc/<pid>/exe (o caminho real do binário, não forjável
+        # por argv[0]/prctl) seria mais forte que comm — mas ler o exe de
+        # outro processo, mesmo do mesmo usuário, exige permissão equivalente
+        # a ptrace, e um serviço systemd --user recebe essa permissão negada
+        # (EACCES) mesmo com CAP_SYS_PTRACE concedido e zero hardening extra
+        # (confirmado testando; a mesma leitura funciona normalmente fora do
+        # systemd). /proc/<pid>/comm não exige essa permissão. Isso troca
+        # "impossível de forjar" por "exige um passo deliberado" (renomear o
+        # processo via prctl/argv[0]) — pior que o ideal, mas muito melhor
+        # que aceitar qualquer chamador com o token, que é o que existia
+        # antes deste fix.
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            comm = ""
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Mesmo truque de _process_identity: o nome do processo pode ter
+            # espaços/parênteses, então lê os campos após o último ")". Nesse
+            # recorte o ppid é o campo 1 (0-indexado).
+            fields = stat_text.rsplit(")", 1)[1].split()
+            ppid = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+        return ppid, comm
+
     @staticmethod
     def _process_identity(pid: int) -> dict[str, Any] | None:
         proc = Path(f"/proc/{pid}")
@@ -345,12 +424,18 @@ def main() -> None:
     parser.add_argument("--token", default=None)
     parser.add_argument("--llm-capability", default=None)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--trusted-ui-exe", default=None)
     args = parser.parse_args()
     token = args.token or os.environ.get("DOORMAN_TOKEN")
     capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
     if not token or not capability:
         parser.error("use --token/DOORMAN_TOKEN e --llm-capability/DOORMAN_LLM_CAPABILITY")
-    Broker(args.socket, token, capability, max(1.0, min(args.timeout, 300.0))).serve()
+    trusted_ui_exe = (
+        args.trusted_ui_exe
+        or os.environ.get("DOORMAN_TRUSTED_UI_EXE")
+        or DEFAULT_TRUSTED_UI_EXE
+    )
+    Broker(args.socket, token, capability, max(1.0, min(args.timeout, 300.0)), trusted_ui_exe).serve()
 
 
 if __name__ == "__main__":

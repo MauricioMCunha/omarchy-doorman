@@ -16,6 +16,19 @@ sys.path.insert(0, str(ROOT))
 from services.doorman_broker.client import call, request_secret  # noqa: E402
 from services.doorman_broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
+# approve/cancel/pending/stats now require the caller (or its near ancestry)
+# to be the trusted UI process — see Broker._peer_is_trusted_ui, which reads
+# /proc/<pid>/comm (not /proc/<pid>/exe: reading another same-user process's
+# exe needs ptrace-equivalent permission that a systemd --user service is
+# denied even with CAP_SYS_PTRACE and zero sandboxing — confirmed while
+# building this; comm has no such restriction). Read this process's own
+# /proc/self/comm the same way, rather than assuming it matches
+# sys.executable's basename (comm reflects how the interpreter was invoked,
+# e.g. "python3", not the resolved binary name like "python3.14"). Tests
+# point the broker at this process's own comm instead of the real
+# "quickshell" to simulate a trusted caller.
+TEST_TRUSTED_UI_EXE = Path("/proc/self/comm").read_text(encoding="utf-8").strip()
+
 
 class BrokerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -36,6 +49,8 @@ class BrokerTest(unittest.TestCase):
                 self.capability,
                 "--timeout",
                 "2",
+                "--trusted-ui-exe",
+                TEST_TRUSTED_UI_EXE,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -345,6 +360,8 @@ class BrokerTest(unittest.TestCase):
                 self.capability,
                 "--timeout",
                 "20",
+                "--trusted-ui-exe",
+                TEST_TRUSTED_UI_EXE,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -407,6 +424,68 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(approval, {"ok": True})
         thread.join(timeout=2)
         self.assertEqual(result, {"ok": True, "secret": "segredo-lento"})
+
+    def test_untrusted_caller_cannot_approve_cancel_pending_or_stats(self) -> None:
+        # Regressão: um processo com o token de sessão válido — qualquer
+        # coisa rodando como o mesmo usuário, já que os arquivos de sessão
+        # são só 0600, incluindo um agente que os leu para criar seu próprio
+        # pedido — conseguia se autoaprovar direto pelo socket, sem UI e sem
+        # humano. Confirmado manualmente antes deste fix. Aqui o broker roda
+        # com o --trusted-ui-exe padrão real ("quickshell"), que o processo
+        # de teste não é, então approve/cancel/pending/stats devem falhar
+        # mesmo com token correto; só "request" (a criação, que é o que um
+        # agente legitimamente precisa fazer) continua funcionando.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-untrusted.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "services.doorman_broker.broker",
+                "--socket",
+                str(socket_path),
+                "--token",
+                self.token,
+                "--llm-capability",
+                self.capability,
+                "--timeout",
+                "2",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker não criou o socket")
+
+        created = call(
+            socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "command": "tentativa-de-autoaprovacao",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(created["ok"], created)
+
+        for message in (
+            {"type": "pending"},
+            {"type": "stats"},
+            {"type": "approve", "request_id": created["request_id"],
+             "nonce": created["nonce"], "secret": "segredo-forjado"},
+            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+        ):
+            result = call(socket_path, self.token, message)
+            self.assertEqual(
+                result, {"ok": False, "error": "untrusted_caller"}, message,
+            )
 
     def test_stats_reports_request_lifecycle(self) -> None:
         created = call(

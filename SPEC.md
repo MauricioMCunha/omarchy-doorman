@@ -87,9 +87,12 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
 ### 4.1 In scope
 
 - A malicious or buggy **background agent process** that can set arbitrary
-  metadata (command string, cwd, tty) and can read the broker's public
-  responses, but does not have the session token/capability and cannot read
-  the human's keystrokes into the modal.
+  metadata (command string, cwd, tty), can read the broker's public
+  responses, and — this was wrong in an earlier draft of this document —
+  *does* have the session token and capability: they live in files under
+  the same UID the agent runs as, exactly like the UI reads them. What the
+  agent cannot do is act as the trusted UI (§6.8) or read the human's
+  keystrokes into the modal.
 - **Process identity drift**: the PID a request was opened for exits and is
   reused by an unrelated process before the human approves.
 - **Local resource exhaustion**: another process on the same machine (with
@@ -335,8 +338,69 @@ which bypasses `PATH` resolution entirely — no user-level shadow can catch
 that without replacing the system binary itself, which this project
 deliberately does not do (see §2, "Non-goals").
 
+### 6.9 approve/cancel/pending/stats require being the trusted UI, not just the token
+
+An earlier version of this document (§4.1, now corrected) assumed the agent
+doesn't have the session token. That's false: the token and capability live
+in files under the same UID the agent runs as, exactly like the UI reads
+them — `origin=llm` + capability only gates who can *create* a request.
+Manual testing during development confirmed the consequence directly: a
+plain shell script that reads those files can create a request and then
+immediately call `approve` on it with a fabricated secret, with zero UI, no
+human click, and no visible sign anything happened — the broker returned
+`{"ok": true}`. A fabricated secret doesn't leak the real password, but it
+completely defeats the "a human reviews and approves each command" promise
+this project exists for: if an agent ever learns the real password through
+any other means (a `.env` file, shell history, a password manager entry
+read by accident), self-approval lets it use that password for `sudo`
+silently, with no modal, no notification, no countdown — the one layer
+Doorman was supposed to add on top of already knowing the password.
+
+The fix gates `approve`, `cancel`, `pending`, and `stats` — every message
+type except `request`, which is what an agent legitimately needs — behind
+a check that the *connection itself*, not anything in the message, comes
+from the trusted UI:
+
+1. `SO_PEERCRED` on the accepted socket gives the kernel's own account of
+   the connecting process's PID/UID — not something the remote process can
+   spoof, unlike anything it puts in the JSON payload.
+2. Starting from that PID, walk up to a few parent hops (bridge.py's
+   python3 process is a direct child of Quickshell in practice — verified
+   with a live `ps -eo pid,ppid,cmd` while the real UI was polling — one
+   hop is enough, extra hops are headroom for a future wrapper) looking for
+   a process name that matches the trusted UI (`quickshell` by default,
+   `Broker(..., trusted_ui_exe=...)` / `--trusted-ui-exe` elsewhere, for
+   tests).
+
+That process name comes from `/proc/<pid>/comm`, not `/proc/<pid>/exe`.
+`exe` would be the stronger check — it's the kernel's resolved path to the
+actual binary, not spoofable by `argv[0]` or `prctl(PR_SET_NAME)` the way
+`comm` is — and was the first implementation. It broke the real UI outright:
+reading *another* same-UID process's `/proc/<pid>/exe` requires
+ptrace-equivalent permission, and a `systemd --user` service is denied that
+(`EACCES`) even after granting it `CAP_SYS_PTRACE` explicitly and stripping
+every other sandboxing directive back to nothing — confirmed by bisecting
+the unit file directive-by-directive down to zero. The identical read
+succeeds immediately from a plain interactive shell with the same UID and
+no special capabilities at all. Whatever draws that line (contributors
+looking into this further should start with how `systemd --user` scopes
+relate to Yama's `ptrace_scope`, since capabilities alone didn't explain
+it), it isn't testable input coverage — it's a structural property of this
+deployment shape, not a bug in this project's own sandboxing. `comm` needs
+no such permission. The trade-off is real: forging `comm` costs an attacker
+one deliberate `prctl`/`argv[0]` step instead of nothing, not the
+impossible-to-forge guarantee `exe` would have given. Still a large
+improvement over no check at all, which is what shipped first.
+
 ## 7. Known limitations
 
+- The trusted-UI check (§6.9) matches on `/proc/<pid>/comm`, which a
+  process can set to anything via `argv[0]` or `prctl(PR_SET_NAME)`. An
+  agent that deliberately spawns a child process named `quickshell` and
+  connects from it would pass. This is a real gap, accepted because the
+  alternative (`/proc/<pid>/exe`) doesn't work at all under how this
+  broker is deployed (see §6.9) — not a claim that `comm` is sufficient
+  against a targeted attacker, only that it's better than no check.
 - The `~/.local/bin/sudo` shadow (§6.8) does not catch a caller that
   invokes `/usr/bin/sudo` by absolute path, or one running in an
   environment where `~/.local/bin` isn't on `PATH` ahead of `/usr/bin`
@@ -358,9 +422,12 @@ Every property in §6 has a corresponding automated test in `tests/`:
 wrong token, invalid origin, missing PID, process-identity change, request
 expiry, approve/replay, wrong-nonce approve and cancel, the askpass helper's
 stdout-only contract, the idle-unauthenticated-connection close, the
-slow-approval timeout regression, and the `MAX_PENDING` cap with slot
-release on cancel. `python3 -m unittest discover -s tests -p 'test_*.py'`
-must pass before any change to `broker/broker.py` is considered done.
+slow-approval timeout regression, the `MAX_PENDING` cap with slot release on
+cancel, and — for §6.9 — that a caller with a valid token but the wrong
+process ancestry gets `untrusted_caller` on all four of
+approve/cancel/pending/stats, while `request` still succeeds for it.
+`python3 -m unittest discover -s tests -p 'test_*.py'` must pass before any
+change to `broker/broker.py` is considered done.
 
 ## 9. Glossary
 
