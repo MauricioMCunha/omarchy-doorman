@@ -46,6 +46,9 @@ Three components:
 - Not a secrets vault or password manager — nothing is persisted.
 - Not a `sudoers` replacement or a sandbox — it sits in front of the
   existing `sudo`/`SUDO_ASKPASS` mechanism, unchanged.
+- Not a replacement for the system `/usr/bin/sudo` binary or a `sudoers`
+  edit — interception is a per-user `PATH` shadow (§6.8), scoped to this
+  user's own shells, not a machine-wide change.
 - Not protection against a compromised UI process itself, or against an
   attacker who already has an interactive session as the same user and is
   willing to guess a 256-bit token (see §4.3).
@@ -299,8 +302,45 @@ clock, hostname, namespaces, realtime scheduling, SUID/SGID,
 for a pure-Python service that only speaks Unix sockets and reads `/proc`;
 they remove attack surface the broker was never going to use anyway.
 
+### 6.8 PATH shadowing is what makes interception actually happen
+
+`sudo` prefers a real controlling terminal over `SUDO_ASKPASS` whenever one
+is available; `-A` must be passed explicitly by the caller for askpass to
+be used at all. An agent that opens its own terminal to run a privileged
+command (observed in practice: an unrelated coding-agent CLI spawning a
+`foot` window and asking the human to type the password into it) never
+touches Doorman, because nothing forced `-A`. Documenting "route privileged
+commands through `doorman-run`/`doorman-sudo`" in an agent's own
+instructions is not a real fix for a published plugin — it requires every
+agent operator to have configured that agent specifically for Doorman,
+which defeats the point of publishing it as something that works out of
+the box.
+
+The fix is a per-user `PATH` shadow: `ln -s .../scripts/doorman-sudo
+~/.local/bin/sudo`. Since `~/.local/bin` precedes `/usr/bin` in a default
+Omarchy `PATH` — including in a `bash -lc` login shell, which is how the
+agent above spawned its terminal — any caller that resolves `sudo` by name
+(the overwhelming majority of scripts and agent tool-calls) reaches
+`doorman-sudo` first, which always forwards to the real `sudo -A` unless
+the caller already passed an explicit askpass/stdin/non-interactive flag
+(see the `doorman-sudo` case statement — note the `--*` guard added
+specifically so a long flag merely containing the letters A/S/n, like
+`--preserve-env`, isn't mistaken for one of those explicit flags). This is
+scoped entirely to this user's own shell environment: `/usr/bin/sudo`,
+`/etc/sudoers`, and every other user's session are untouched, and removing
+the symlink fully reverts the behavior.
+
+Its one hole is a caller that invokes `/usr/bin/sudo` by absolute path,
+which bypasses `PATH` resolution entirely — no user-level shadow can catch
+that without replacing the system binary itself, which this project
+deliberately does not do (see §2, "Non-goals").
+
 ## 7. Known limitations
 
+- The `~/.local/bin/sudo` shadow (§6.8) does not catch a caller that
+  invokes `/usr/bin/sudo` by absolute path, or one running in an
+  environment where `~/.local/bin` isn't on `PATH` ahead of `/usr/bin`
+  (non-interactive systemd units, cron, a stripped-down `PATH`).
 - No automated test against a real Quickshell session, real Omarchy, or
   real `sudo` — the test suite drives the broker's own protocol directly
   and via the askpass helper, not the full stack end to end.

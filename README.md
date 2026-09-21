@@ -95,24 +95,53 @@ systemctl --user enable --now omarchy-doorman.service
 
 # 3. Reload Omarchy's shell so it picks up the new widget
 omarchy-restart-shell
+
+# 4. Shadow `sudo` for this user so agents pick it up without any
+#    per-agent configuration — see "Wiring up sudo" below for why this
+#    step is the one that actually makes Doorman useful.
+ln -s "$(pwd)/scripts/doorman-sudo" ~/.local/bin/sudo
 ```
 
-Nothing here touches `/usr/share/omarchy/`, replaces the system `sudo`, or
-edits `sudoers`. Both steps are explicit and reversible: stop the service and
+Nothing here touches `/usr/share/omarchy/`, replaces `/usr/bin/sudo`, or edits
+`sudoers`. Both steps are explicit and reversible: stop the service and
 delete the plugin directory to remove it completely.
 
 ### Wiring up `sudo`
 
-Doorman speaks the standard `SUDO_ASKPASS` protocol, so it works with any of
-the usual integration points:
+The whole point of Doorman is that an agent shouldn't need to know it
+exists. If it only intercepts `sudo` calls that were deliberately routed
+through a wrapper, it's back to being a personal habit, not something that
+protects anyone who installs it from the catalog without also editing every
+agent's own instructions.
+
+`sudo` itself won't cooperate here: given a real terminal to prompt on, it
+prefers that terminal over `SUDO_ASKPASS` regardless of what's in the
+environment — `-A` has to be passed explicitly, every time, by whatever
+calls `sudo`. Since agents (and plain scripts) almost always resolve `sudo`
+by name rather than by absolute path, the fix is to make sure they resolve
+*Doorman's* `sudo` first:
 
 ```bash
-# One-off, for a single command:
-scripts/doorman-run -- sudo systemctl restart some-service
+# Recommended: shadow `sudo` for this user's own shells only.
+# ~/.local/bin generally precedes /usr/bin in PATH already (Omarchy ships
+# this by default); this does not touch /usr/bin/sudo, sudoers, or any
+# other user's environment.
+ln -s "$(pwd)/scripts/doorman-sudo" ~/.local/bin/sudo
+```
 
-# Transparent wrapper (shadows `sudo` for one subprocess tree only,
-# via a temporary PATH — never installed globally):
-scripts/doorman-sudo systemctl restart some-service
+With that in place, plain `sudo <command>` — typed by you, or run by an
+agent in a background job or a terminal it opened itself — resolves to the
+wrapper, which always forwards to the real `sudo -A` unless the caller
+already passed `-A`/`-S`/`-n`/`--stdin`/`--non-interactive` explicitly. The
+one thing this can't catch is a caller that hardcodes `/usr/bin/sudo` by
+absolute path, bypassing `PATH` resolution entirely — see
+[`SPEC.md`](SPEC.md#7-known-limitations).
+
+Other integration points still exist for narrower cases:
+
+```bash
+# One-off, for a single external command, without shadowing sudo at all:
+scripts/doorman-run -- sudo systemctl restart some-service
 
 # Or point SUDO_ASKPASS at the plugin's askpass helper directly, the way
 # a real `sudo -A` invocation (or an agent's own shell) would:

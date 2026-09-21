@@ -12,7 +12,17 @@ readonly askpass="${DOORMAN_ASKPASS:-${plugin_dir}/askpass.py}"
 
 for arg in "$@"; do
   case "$arg" in
-    -A|--askpass|-S|--stdin|-n|--non-interactive|-*[ASn]*)
+    -A|--askpass|-S|--stdin|-n|--non-interactive)
+      exec "$real_sudo" "$@"
+      ;;
+    --*)
+      # A long option not in the explicit list above. Checked separately from
+      # the short-cluster pattern below: that pattern matches any of A/S/n
+      # ANYWHERE in the argument, which would otherwise misfire on long
+      # options that merely contain one of those letters, e.g. --preserve-env
+      # (contains "n") — silently skipping Doorman for an unrelated flag.
+      ;;
+    -*[ASn]*)
       exec "$real_sudo" "$@"
       ;;
   esac
