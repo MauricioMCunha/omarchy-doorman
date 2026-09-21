@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run one command in an isolated doorman execution profile. The temporary
+# PATH shadows `sudo` only for this child process and is removed on exit.
+
+(( $# > 0 )) || {
+  echo "uso: doorman-run -- comando [argumentos...]" >&2
+  exit 64
+}
+if [[ "$1" == "--" ]]; then
+  shift
+fi
+(( $# > 0 )) || {
+  echo "uso: doorman-run -- comando [argumentos...]" >&2
+  exit 64
+}
+
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly bin_dir="$(mktemp -d "${TMPDIR:-/tmp}/doorman-bin.XXXXXX")"
+cleanup() { rm -rf -- "$bin_dir"; }
+trap cleanup EXIT INT TERM
+
+ln -s -- "$script_dir/doorman-sudo" "$bin_dir/sudo"
+export PATH="$bin_dir:$PATH"
+exec "$@"

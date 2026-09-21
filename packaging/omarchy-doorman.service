@@ -1,0 +1,41 @@
+[Unit]
+Description=Omarchy Doorman Broker
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mauriciocunha/DEV/omarchy-plugins
+ExecStart=/home/mauriciocunha/DEV/omarchy-plugins/scripts/run-doorman-broker
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RuntimeDirectory=omarchy-doorman
+RuntimeDirectoryMode=0700
+ReadWritePaths=%t/omarchy-doorman
+UMask=0077
+
+# Hardening extra: o broker fala apenas Unix socket local e lê /proc do
+# próprio usuário, então pode abrir mão de quase toda outra superfície.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RemoveIPC=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target

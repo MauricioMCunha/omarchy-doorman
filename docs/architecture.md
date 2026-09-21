@@ -30,6 +30,6 @@ substituir `sudo`, alterar `sudoers` ou capturar comandos globalmente. O
 comportamento exato depende da versão/política do sudo; nesta máquina, o
 helper não é chamado sem `-A`, inclusive em execução sem TTY. O wrapper
 opcional acrescenta `-A` apenas quando o usuário o invoca diretamente. O
-launcher `secure-input-run` cria um PATH temporário para um único processo,
+launcher `doorman-run` cria um PATH temporário para um único processo,
 permitindo que um executor de LLM use `sudo comando` sem lembrar a flag, sem
 alterar o PATH global do usuário.

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "mauricio.doorman",
+  "name": "Doorman",
+  "version": "0.1.0",
+  "author": "Mauricio Cunha",
+  "license": "MIT",
+  "description": "Autorização gráfica local para operações privilegiadas",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "Doorman",
+    "description": "Pedidos de autorização privilegiada sem senha no chat",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

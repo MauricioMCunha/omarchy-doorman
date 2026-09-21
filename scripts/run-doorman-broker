@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+umask 077
+mkdir -p "$runtime_dir"
+token_file="$runtime_dir/token"
+capability_file="$runtime_dir/llm-capability"
+
+ensure_private_secret() {
+  local path="$1"
+  if [[ ! -s "$path" ]]; then
+    /usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$path"
+  fi
+  local mode owner
+  mode="$(stat -c '%a' -- "$path")"
+  owner="$(stat -c '%u' -- "$path")"
+  if [[ "$mode" != "600" || "$owner" != "$(id -u)" ]]; then
+    echo "arquivo de sessão inseguro: $path" >&2
+    exit 1
+  fi
+}
+
+if [[ ! -s "$token_file" ]]; then
+  /usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$token_file"
+fi
+if [[ ! -s "$capability_file" ]]; then
+  /usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$capability_file"
+fi
+ensure_private_secret "$token_file"
+ensure_private_secret "$capability_file"
+cd "$project_dir"
+exec /usr/bin/python3 -m services.doorman_broker.broker \
+  --socket "$runtime_dir/broker.sock" --token "$(<"$token_file")" \
+  --llm-capability "$(<"$capability_file")" \
+  --timeout 30

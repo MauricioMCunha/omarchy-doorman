@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from services.secure_input_broker.client import call, request_secret  # noqa: E402
-from services.secure_input_broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
+from services.doorman_broker.client import call, request_secret  # noqa: E402
+from services.doorman_broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
 
 class BrokerTest(unittest.TestCase):
@@ -27,7 +27,7 @@ class BrokerTest(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "services.secure_input_broker.broker",
+                "services.doorman_broker.broker",
                 "--socket",
                 str(self.socket_path),
                 "--token",
@@ -288,10 +288,10 @@ class BrokerTest(unittest.TestCase):
 
         env = os.environ.copy()
         env.update({
-            "SECURE_INPUT_SOCKET": str(self.socket_path),
-            "SECURE_INPUT_TOKEN": self.token,
-            "SECURE_INPUT_LLM_CAPABILITY": self.capability,
-            "SECURE_INPUT_COMMAND": "sudo -A id",
+            "DOORMAN_SOCKET": str(self.socket_path),
+            "DOORMAN_TOKEN": self.token,
+            "DOORMAN_LLM_CAPABILITY": self.capability,
+            "DOORMAN_COMMAND": "sudo -A id",
         })
         result: dict[str, object] = {}
 
@@ -313,7 +313,7 @@ class BrokerTest(unittest.TestCase):
         thread = threading.Thread(target=approve)
         thread.start()
         helper = subprocess.run(
-            [sys.executable, "-m", "services.secure_input_broker.askpass", "Password: "],
+            [sys.executable, "-m", "services.doorman_broker.askpass", "Password: "],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -336,7 +336,7 @@ class BrokerTest(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "services.secure_input_broker.broker",
+                "services.doorman_broker.broker",
                 "--socket",
                 str(socket_path),
                 "--token",

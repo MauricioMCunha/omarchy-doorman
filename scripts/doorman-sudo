@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Transparent sudo compatibility layer. It makes ordinary `sudo command`
+# invoke the local askpass flow without requiring the caller to remember -A.
+# Explicit non-interactive/stdin modes remain untouched.
+
+readonly real_sudo="/usr/bin/sudo"
+readonly runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
+readonly plugin_dir="${DOORMAN_PLUGIN_DIR:-${HOME}/.config/omarchy/plugins/mauricio.doorman}"
+readonly askpass="${DOORMAN_ASKPASS:-${plugin_dir}/askpass.py}"
+
+for arg in "$@"; do
+  case "$arg" in
+    -A|--askpass|-S|--stdin|-n|--non-interactive|-*[ASn]*)
+      exec "$real_sudo" "$@"
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  -h|--help|-V|--version)
+    exec "$real_sudo" "$@"
+    ;;
+esac
+
+[[ -x "$askpass" || -f "$askpass" ]] || {
+  echo "doorman: askpass não está instalado em $askpass" >&2
+  exit 1
+}
+
+export SUDO_ASKPASS="$askpass"
+export DOORMAN_SOCKET="${DOORMAN_SOCKET:-${runtime_dir}/broker.sock}"
+export DOORMAN_COMMAND="sudo $*"
+export PYTHONPATH="${plugin_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+
+exec "$real_sudo" -A "$@"

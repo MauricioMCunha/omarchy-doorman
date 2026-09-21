@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# SUDO_ASKPASS entrypoint. It reads session material from the private runtime
+# directory and never places the secret in argv, files or shell output.
+runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+readonly socket_path="${DOORMAN_SOCKET:-${runtime_dir}/broker.sock}"
+readonly token_file="${DOORMAN_TOKEN_FILE:-${runtime_dir}/token}"
+readonly capability_file="${DOORMAN_CAPABILITY_FILE:-${runtime_dir}/llm-capability}"
+
+[[ -S "$socket_path" && -r "$token_file" && -r "$capability_file" ]] || exit 1
+umask 077
+export DOORMAN_SOCKET="$socket_path"
+export DOORMAN_TOKEN="$(<"$token_file")"
+export DOORMAN_LLM_CAPABILITY="$(<"$capability_file")"
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${project_dir}"
+
+exec /usr/bin/python3 -m services.doorman_broker.askpass "$@"
