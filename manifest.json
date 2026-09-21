@@ -5,12 +5,12 @@
   "version": "0.1.0",
   "author": "Mauricio Cunha",
   "license": "MIT",
-  "description": "Autorização gráfica local para operações privilegiadas",
+  "description": "Local, human-approved sudo for background agents — the password never reaches the chat, the log, or the agent.",
   "kinds": ["bar-widget"],
   "entryPoints": {"barWidget": "Panel.qml"},
   "barWidget": {
     "displayName": "Doorman",
-    "description": "Pedidos de autorização privilegiada sem senha no chat",
+    "description": "Approve or deny privileged commands from background agents in a local prompt only you can see.",
     "category": "Security",
     "allowMultiple": false,
     "defaultSection": "right"
