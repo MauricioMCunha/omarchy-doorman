@@ -487,6 +487,77 @@ class BrokerTest(unittest.TestCase):
                 result, {"ok": False, "error": "untrusted_caller"}, message,
             )
 
+    def test_retry_with_same_sudo_pid_is_tagged_as_new_attempt(self) -> None:
+        # sudo reinvoca o SUDO_ASKPASS (pid novo) sob o mesmo processo sudo
+        # pai quando a senha da tentativa anterior é rejeitada pelo PAM. O
+        # askpass repassa esse pid pai como "sudo_pid"; o broker usa isso só
+        # para rotular a UI ("tentativa 2"), nunca para saber se a senha
+        # estava certa. A tentativa anterior também nunca é lida de volta
+        # pelo askpass que a criou (o sudo já matou aquele processo), então
+        # o broker precisa encerrá-la sozinho quando a nova chega — senão
+        # ela ficava pendurada até expirar, e a UI podia selecionar essa
+        # entrada morta em vez da tentativa atual.
+        import threading
+
+        first_result: dict[str, object] = {}
+
+        def first_askpass() -> None:
+            first_result.update(
+                request_secret(
+                    self.socket_path, self.token,
+                    {"pid": os.getpid(), "sudo_pid": 999999, "command": "sudo -A id",
+                     "origin": "llm", "capability": self.capability},
+                )
+            )
+
+        thread = threading.Thread(target=first_askpass)
+        thread.start()
+        pending = None
+        for _ in range(50):
+            pending = call(self.socket_path, self.token, {"type": "pending"})
+            if pending["requests"]:
+                break
+            time.sleep(0.02)
+        self.assertTrue(pending and pending["requests"], pending)
+        self.assertEqual(pending["requests"][0]["attempt"], 1)
+
+        second = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "sudo_pid": 999999,
+             "command": "sudo -A id", "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(second["ok"], second)
+        pending = call(self.socket_path, self.token, {"type": "pending"})
+        self.assertEqual(len(pending["requests"]), 1, pending)
+        self.assertEqual(pending["requests"][0]["attempt"], 2)
+        self.assertEqual(pending["requests"][0]["request_id"], second["request_id"])
+
+        thread.join(timeout=2)
+        self.assertEqual(first_result, {"ok": False, "error": "superseded_by_retry"})
+
+        # Um sudo_pid diferente (comando não relacionado) começa do zero.
+        unrelated = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(), "sudo_pid": 999998,
+             "command": "sudo -A whoami", "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(unrelated["ok"], unrelated)
+        pending = call(self.socket_path, self.token, {"type": "pending"})
+        by_id = {item["request_id"]: item for item in pending["requests"]}
+        self.assertEqual(by_id[unrelated["request_id"]]["attempt"], 1)
+
+        # Um pedido sem sudo_pid (chamador que não manda o campo) nunca
+        # entra na correlação nem quebra o fluxo normal.
+        no_sudo_pid = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": os.getpid(),
+             "command": "sudo -A ls", "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(no_sudo_pid["ok"], no_sudo_pid)
+        pending = call(self.socket_path, self.token, {"type": "pending"})
+        by_id = {item["request_id"]: item for item in pending["requests"]}
+        self.assertEqual(by_id[no_sudo_pid["request_id"]]["attempt"], 1)
+
     def test_stats_reports_request_lifecycle(self) -> None:
         created = call(
             self.socket_path, self.token,

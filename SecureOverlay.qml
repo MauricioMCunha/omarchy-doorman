@@ -17,6 +17,11 @@ Item {
   property int secondsRemaining: 0
   property real totalSeconds: 0
   readonly property bool expiringSoon: root.secondsRemaining > 0 && root.secondsRemaining <= 10
+  // Um "attempt" > 1 significa que o sudo rejeitou a senha da tentativa
+  // anterior e pediu de novo (ver RETRY_WINDOW_SECONDS em broker.py). O
+  // Doorman nunca valida a senha em si, só sabe que houve uma tentativa
+  // antes desta com o mesmo processo sudo pai.
+  readonly property bool wrongPassword: !!root.request && Number(root.request.attempt || 1) > 1
   signal approved(string secret)
   signal cancelled()
   signal decisionFinished()
@@ -34,6 +39,7 @@ Item {
   onRequestChanged: {
     refreshSecondsRemaining()
     root.totalSeconds = root.secondsRemaining
+    if (root.wrongPassword) shakeAnim.restart()
   }
 
   Timer {
@@ -137,6 +143,20 @@ Item {
           color: Color.background
           borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
           radius: Style.cornerRadius
+          // Deslocamento imperativo via transform, não via `x`: `x` já tem
+          // um binding vindo de anchors.centerIn, e uma animação de
+          // propriedade sobrescreveria esse binding para sempre depois de
+          // rodar uma vez, descentralizando o card em qualquer resize.
+          transform: Translate { id: shakeTranslate }
+
+          SequentialAnimation {
+            id: shakeAnim
+            NumberAnimation { target: shakeTranslate; property: "x"; to: -8; duration: 55 }
+            NumberAnimation { target: shakeTranslate; property: "x"; to: 8; duration: 55 }
+            NumberAnimation { target: shakeTranslate; property: "x"; to: -6; duration: 55 }
+            NumberAnimation { target: shakeTranslate; property: "x"; to: 6; duration: 55 }
+            NumberAnimation { target: shakeTranslate; property: "x"; to: 0; duration: 55 }
+          }
 
           Column {
             id: content
@@ -158,14 +178,14 @@ Item {
                 width: Style.space(36)
                 height: Style.space(36)
                 anchors.verticalCenter: parent.verticalCenter
-                color: Util.alpha(Color.accent, 0.12)
-                borderSpec: Border.flat(Util.alpha(Color.accent, 0.55), Style.normalBorderWidth)
+                color: Util.alpha(root.wrongPassword ? Color.urgent : Color.accent, 0.12)
+                borderSpec: Border.flat(Util.alpha(root.wrongPassword ? Color.urgent : Color.accent, 0.55), Style.normalBorderWidth)
                 radius: Style.cornerRadius
 
                 Text {
                   anchors.centerIn: parent
                   text: "󰠚"
-                  color: Color.accent
+                  color: root.wrongPassword ? Color.urgent : Color.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.icon
                 }
@@ -177,7 +197,7 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: root.submitting ? "Aguarde" : "Autorização segura"
+                  text: root.submitting ? "Aguarde" : (root.wrongPassword ? "Senha incorreta" : "Autorização segura")
                   color: Color.popups.text
                   font.family: Style.font.family
                   font.pixelSize: Style.font.title
@@ -188,11 +208,13 @@ Item {
                   width: parent.width
                   text: root.submitting
                     ? "WAIT " + root.waitSeconds + "s"
-                    : "LLM local  •  expira em " + root.secondsRemaining + "s"
-                  color: root.submitting ? Color.accent : (root.expiringSoon ? Color.urgent : Color.accent)
+                    : (root.wrongPassword
+                        ? "Tentativa " + root.request.attempt + "  •  expira em " + root.secondsRemaining + "s"
+                        : "LLM local  •  expira em " + root.secondsRemaining + "s")
+                  color: root.submitting ? Color.accent : ((root.expiringSoon || root.wrongPassword) ? Color.urgent : Color.accent)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
-                  font.bold: root.expiringSoon
+                  font.bold: root.expiringSoon || root.wrongPassword
                 }
               }
             }
@@ -223,10 +245,13 @@ Item {
             Text {
               width: parent.width
               visible: !root.submitting
-              text: "Revise a solicitação antes de liberar esta credencial."
-              color: Util.alpha(Color.popups.text, 0.68)
+              text: root.wrongPassword
+                ? "A senha anterior não foi aceita pelo sistema. Revise e tente novamente."
+                : "Revise a solicitação antes de liberar esta credencial."
+              color: root.wrongPassword ? Color.urgent : Util.alpha(Color.popups.text, 0.68)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+              font.bold: root.wrongPassword
               wrapMode: Text.WordWrap
             }
 
@@ -362,6 +387,7 @@ Item {
               activeFocusOnPress: true
               Keys.priority: Keys.BeforeItem
               password: true
+              accent: root.wrongPassword ? Color.urgent : Color.accent
               placeholderText: "Digite a senha nesta janela segura"
               function submitSecret() {
                 if (root.submitting) return

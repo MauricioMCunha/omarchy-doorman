@@ -39,6 +39,17 @@ DEFAULT_TRUSTED_UI_EXE = "quickshell"
 # filho direto do Quickshell — 1 salto basta na prática; a folga cobre um
 # wrapper de shell futuro sem exigir outra mudança).
 _TRUSTED_UI_MAX_HOPS = 4
+# Quando o sudo rejeita a senha ele reinvoca o SUDO_ASKPASS num processo
+# filho novo (pid novo a cada tentativa), mas o processo sudo pai é o
+# mesmo durante todo o loop de passwd_tries. O askpass repassa esse pid
+# pai como "sudo_pid"; se dois pedidos chegarem com o mesmo sudo_pid
+# dentro desta janela, o segundo só pode existir porque o sudo pediu de
+# novo — e o sudo só faz isso depois de uma tentativa de senha rejeitada
+# pelo PAM (cancelamento/expiração pelo Doorman fazem o askpass sair sem
+# imprimir nada, o que aborta o sudo em vez de disparar outra tentativa).
+# O broker nunca sabe se a senha em si estava certa — só infere que houve
+# uma tentativa anterior, para a UI poder sinalizar isso ao usuário.
+RETRY_WINDOW_SECONDS = 20.0
 
 
 @dataclass
@@ -51,6 +62,7 @@ class PendingRequest:
     process_start_time: str | None = None
     process_cmdline: str | None = None
     process_uid: int | None = None
+    attempt: int = 1
     delivered: bool = False
     decision_event: threading.Event = field(default_factory=threading.Event)
     secret: str | None = None
@@ -72,6 +84,9 @@ class Broker:
         self.timeout = timeout
         self.trusted_ui_exe = trusted_ui_exe
         self.pending: dict[str, PendingRequest] = {}
+        # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
+        # Ver RETRY_WINDOW_SECONDS.
+        self._sudo_pid_attempts: dict[int, dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.started_at = time.time()
@@ -189,6 +204,7 @@ class Broker:
             "prompt": str(message.get("prompt", "Password: "))[:300],
             "screen": str(message.get("screen", ""))[:200],
         }
+        sudo_pid = self._positive_pid(message.get("sudo_pid"))
         request = PendingRequest(
             request_id=uuid.uuid4().hex,
             nonce=secrets.token_urlsafe(24),
@@ -204,6 +220,28 @@ class Broker:
                 overflow = True
             else:
                 overflow = False
+                if sudo_pid is not None:
+                    now = time.time()
+                    previous = self._sudo_pid_attempts.get(sudo_pid)
+                    if previous is not None and now - previous["last_seen"] <= RETRY_WINDOW_SECONDS:
+                        request.attempt = int(previous["attempt"]) + 1
+                        stale = self.pending.get(previous["request_id"])
+                        if stale is not None and not stale.delivered:
+                            # A tentativa anterior nunca vai ser lida de
+                            # volta: o askpass que a criou já morreu (o sudo
+                            # matou aquele processo e chamou o askpass de
+                            # novo). Sem isso ela ficaria pendurada na lista
+                            # de pendentes até expirar sozinha, e a UI podia
+                            # selecionar essa entrada morta em vez da
+                            # tentativa atual.
+                            stale.delivered = True
+                            stale.error = "superseded_by_retry"
+                            stale.decision_event.set()
+                    self._sudo_pid_attempts[sudo_pid] = {
+                        "attempt": request.attempt,
+                        "last_seen": now,
+                        "request_id": request.request_id,
+                    }
                 self.pending[request.request_id] = request
                 self.metrics["requests"] += 1
                 self.last_activity_at = time.time()
@@ -238,6 +276,7 @@ class Broker:
                     "nonce": r.nonce,
                     **r.metadata,
                     "expires_at": r.expires_at,
+                    "attempt": r.attempt,
                 }
                 for r in self.pending.values()
                 if not r.delivered and r.expires_at > now
@@ -408,6 +447,12 @@ class Broker:
                         self.metrics["expired"] += 1
                         self.last_activity_at = time.time()
                         request.decision_event.set()
+                stale_sudo_pids = [
+                    spid for spid, info in self._sudo_pid_attempts.items()
+                    if now - info["last_seen"] > RETRY_WINDOW_SECONDS
+                ]
+                for spid in stale_sudo_pids:
+                    del self._sudo_pid_attempts[spid]
 
     @staticmethod
     def _send(conn: socket.socket, payload: dict[str, Any]) -> None:

@@ -37,6 +37,12 @@ def main() -> int:
             token,
             {
                 "pid": os.getpid(),
+                # sudo executa este script diretamente (fork+exec); o ppid é
+                # o próprio processo sudo, estável durante todo o loop de
+                # passwd_tries. É o sinal que o broker usa para saber que
+                # duas solicitações são retentativas do mesmo comando — ver
+                # RETRY_WINDOW_SECONDS em broker.py.
+                "sudo_pid": os.getppid(),
                 "command": os.environ.get("DOORMAN_COMMAND", "sudo"),
                 "cwd": os.getcwd(),
                 "tty": os.environ.get("DOORMAN_TTY", ""),

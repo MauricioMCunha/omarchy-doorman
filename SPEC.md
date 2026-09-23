@@ -150,7 +150,8 @@ with `secrets.compare_digest`. A wrong or missing token gets
   "cwd": "/home/user/project",           // truncated to 1000 chars, display only
   "tty": "pts/3",                        // truncated to 300 chars, display only
   "prompt": "[sudo] password for user: ",// truncated to 300 chars, shown verbatim in the UI
-  "screen": "DP-2"                       // optional monitor hint, truncated to 200 chars
+  "screen": "DP-2",                      // optional monitor hint, truncated to 200 chars
+  "sudo_pid": 6789                       // optional, see §6.10; omitted callers just get attempt=1 always
 }
 ```
 
@@ -178,6 +179,7 @@ exactly one more line:
 {"ok": true, "secret": "…"}                              // approved
 {"ok": false, "error": "expired"}                         // no decision within the deadline
 {"ok": false, "error": "cancelado_pelo_usuario"}          // explicit cancel
+{"ok": false, "error": "superseded_by_retry"}             // a newer request with the same sudo_pid arrived — see §6.10
 ```
 
 `expires_at` is `created_at + timeout`, where `timeout` is the broker's
@@ -215,10 +217,11 @@ secret is a string of at most 4096 bytes.
 // →
 {"token": "…", "type": "pending"}
 // ←
-{"ok": true, "requests": [{"request_id": "…", "nonce": "…", "pid": …, "command": "…", "cwd": "…", "tty": "…", "prompt": "…", "screen": "…", "expires_at": …}]}
+{"ok": true, "requests": [{"request_id": "…", "nonce": "…", "pid": …, "command": "…", "cwd": "…", "tty": "…", "prompt": "…", "screen": "…", "expires_at": …, "attempt": 1}]}
 ```
 
-Only non-delivered, non-expired requests are listed.
+Only non-delivered, non-expired requests are listed. `attempt` is 1 unless
+the request was correlated to an earlier one via `sudo_pid` (§6.10).
 
 ### 5.5 `stats` — session metrics (for the UI's status display)
 
@@ -392,6 +395,63 @@ one deliberate `prctl`/`argv[0]` step instead of nothing, not the
 impossible-to-forge guarantee `exe` would have given. Still a large
 improvement over no check at all, which is what shipped first.
 
+### 6.10 A rejected password shows up as a retry, not a second, unrelated request
+
+Doorman never validates the password itself — that's `sudo`/PAM's job,
+entirely outside the broker. If the user approves with the wrong password,
+the secret is still delivered (that's a success from the broker's point of
+view), `sudo` rejects it via PAM, and — by default (`Defaults passwd_tries`,
+commonly 3) — `sudo` re-invokes `SUDO_ASKPASS` in a brand-new process. Without
+correlation, that looks to the broker like a completely unrelated new
+request: a second modal, a second notification, with no indication it's the
+same command asking again. Confirmed empirically during development
+(deliberately wrong password against a disposable local askpass, well under
+this machine's `pam_faillock` threshold): the prompt text sudo passes to
+askpass on retry does **not** change (`"Sorry, try again."` goes only to
+sudo's own stderr, which the askpass child never sees) — so there is no
+signal in the request payload itself to detect a retry from.
+
+The fix correlates on the *sudo parent process*, not the payload: `sudo`
+forks a new askpass child each retry, but the `sudo` process itself is the
+same one throughout the whole `passwd_tries` loop, and both askpass
+entrypoints (`services/doorman_broker/askpass.py`,
+`plugins/doorman/askpass.py`) are exec'd directly or via an `exec` shell
+wrapper, so `os.getppid()` at that point is always `sudo`'s own PID. That
+PID is sent as `sudo_pid` on `request`. The broker keeps a short-lived map
+(`_sudo_pid_attempts`, pruned after `RETRY_WINDOW_SECONDS` = 20s) from
+`sudo_pid` to the attempt count and the `request_id` it belongs to. A new
+request whose `sudo_pid` matches one seen within that window can only exist
+because `sudo` asked again — which only happens after a real PAM rejection,
+not after Doorman's own cancel/expiry (those make askpass exit without
+printing anything, which makes `sudo` abort instead of retrying) — so it's
+tagged `attempt = previous.attempt + 1`.
+
+Two consequences the implementation handles explicitly:
+
+- The superseded, previous-attempt request is never actually read again —
+  its askpass process already exited after sudo killed it to retry — so
+  without help it would sit in `pending` until its own timeout, and the UI
+  could end up selecting that dead entry instead of the live one. The
+  broker resolves it itself the moment the retry arrives
+  (`error: "superseded_by_retry"`), the same `decision_event` mechanism used
+  for expiry.
+- The UI's own desktop notification for the first attempt would otherwise
+  stay on screen, stale, next to a second one for the retry.
+  `omarchy-notification-send -p` prints the notification's id; Panel.qml
+  keeps it and passes it back via `-r <id>` on the next send, updating the
+  toast in place instead of stacking a second one. The notification title
+  stays constant (`"Autorização pendente"`) so `omarchy-notification-dismiss`
+  — which matches by title — still clears it when the queue empties.
+
+This is a UX heuristic, not a security control: `sudo_pid` is optional and
+self-reported by the caller (any `origin=llm` request can claim any
+`sudo_pid`, causing a false "attempt 2" label at worst), and the inference
+that a same-`sudo_pid` retry implies "the previous password was wrong"
+relies on the observed (not kernel-guaranteed) behavior that Doorman's own
+cancel/expiry don't trigger a `sudo` retry. Getting this wrong only affects
+what the modal *says*; it never changes whether a request needs a real human
+approval, still gated by the exact same checks as any other request.
+
 ## 7. Known limitations
 
 - The trusted-UI check (§6.9) matches on `/proc/<pid>/comm`, which a
@@ -415,6 +475,11 @@ improvement over no check at all, which is what shipped first.
 - Multiple simultaneous requests from different agent sessions are listed
   with a count but the UI can only act on one at a time (`root.selected`);
   there's no way to triage or batch-decide a queue.
+- The retry heuristic (§6.10) is self-reported (`sudo_pid` is whatever the
+  caller sends) and inferred from behavior, not a kernel guarantee — a
+  caller could claim an arbitrary `sudo_pid` to make an unrelated request
+  falsely show as "attempt 2", or vice versa. Cosmetic only: it never
+  changes which checks gate approval.
 
 ## 8. Acceptance criteria
 
@@ -423,9 +488,12 @@ wrong token, invalid origin, missing PID, process-identity change, request
 expiry, approve/replay, wrong-nonce approve and cancel, the askpass helper's
 stdout-only contract, the idle-unauthenticated-connection close, the
 slow-approval timeout regression, the `MAX_PENDING` cap with slot release on
-cancel, and — for §6.9 — that a caller with a valid token but the wrong
+cancel, — for §6.9 — that a caller with a valid token but the wrong
 process ancestry gets `untrusted_caller` on all four of
-approve/cancel/pending/stats, while `request` still succeeds for it.
+approve/cancel/pending/stats, while `request` still succeeds for it, and —
+for §6.10 — that a same-`sudo_pid` retry is tagged `attempt = 2`, supersedes
+the previous pending request, and that unrelated or `sudo_pid`-less requests
+are unaffected.
 `python3 -m unittest discover -s tests -p 'test_*.py'` must pass before any
 change to `broker/broker.py` is considered done.
 

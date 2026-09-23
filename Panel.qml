@@ -22,6 +22,11 @@ Item {
   property string pendingApprovalSecret: ""
   property string approvalRequestId: ""
   property string approvalNonce: ""
+  // Id do toast atual (0 = nenhum). Uma retentativa troca o request_id
+  // (dedupado por NotifyState), mas ainda é a mesma fila de notificação
+  // visual — reenviar com -r <id> atualiza o toast existente em vez de
+  // empilhar um segundo, obsoleto, ao lado dele.
+  property int notificationId: 0
   readonly property string commercialName: "Doorman"
 
   readonly property color foreground: bar && bar.foreground ? bar.foreground : Color.foreground
@@ -52,12 +57,23 @@ Item {
     }
     NotifyState.forgetExcept(seen)
     if (fresh.length === 0 || notifyProc.running) return
+    // O título fica fixo mesmo numa retentativa: omarchy-notification-dismiss
+    // casa por título, e é ele quem fecha o toast quando a fila esvazia.
     var title = fresh.length === 1 ? "Autorização pendente" : (fresh.length + " autorizações pendentes")
-    var body = fresh.length === 1
-      ? (fresh[0].command || "sudo") + "  ·  expira em " + Math.max(0, Math.floor(fresh[0].expires_at - Date.now() / 1000)) + "s"
-      : fresh.map(function (item) { return item.command || "sudo" }).join(", ")
-    notifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-send",
-      "--app-name", root.commercialName, "-g", "󰠚", "-u", "critical", title, body]
+    var body
+    if (fresh.length === 1) {
+      var item = fresh[0]
+      var retry = Number(item.attempt || 1) > 1
+      body = (retry ? "Senha incorreta — tentativa " + item.attempt + "  ·  " : "") +
+        (item.command || "sudo") + "  ·  expira em " + Math.max(0, Math.floor(item.expires_at - Date.now() / 1000)) + "s"
+    } else {
+      body = fresh.map(function (item) { return item.command || "sudo" }).join(", ")
+    }
+    var command = ["/usr/share/omarchy/bin/omarchy-notification-send",
+      "--app-name", root.commercialName, "-g", "󰠚", "-u", "critical", "-p"]
+    if (root.notificationId > 0) command.push("-r", String(root.notificationId))
+    command.push(title, body)
+    notifyProc.command = command
     notifyProc.running = true
   }
   function metric(name) { return Number(root.metrics[name] || 0) }
@@ -116,6 +132,7 @@ Item {
           if (hadPending && root.requests.length === 0 && !dismissNotifyProc.running) {
             dismissNotifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-dismiss", "Autorização pendente"]
             dismissNotifyProc.running = true
+            root.notificationId = 0
           }
           if (!root.decisionBusy && root.selected && !root.requests.some(function (item) { return item.request_id === root.selected.request_id })) root.selected = null
           if (root.requests.length > 0 && !root.selected) root.selected = root.requests[0]
@@ -127,7 +144,12 @@ Item {
 
   Process {
     id: notifyProc
-    stdout: StdioCollector {}
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var value = parseInt(text, 10)
+        if (!isNaN(value) && value > 0) root.notificationId = value
+      }
+    }
   }
 
   Process {
