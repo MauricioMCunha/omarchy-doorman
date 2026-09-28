@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from services.doorman_broker.client import call, request_secret  # noqa: E402
-from services.doorman_broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
+from broker.client import call, request_secret  # noqa: E402
+from broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
 # approve/cancel/pending/stats now require the caller (or its near ancestry)
 # to be the trusted UI process — see Broker._peer_is_trusted_ui, which reads
@@ -40,7 +40,7 @@ class BrokerTest(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "services.doorman_broker.broker",
+                "broker.broker",
                 "--socket",
                 str(self.socket_path),
                 "--token",
@@ -328,7 +328,7 @@ class BrokerTest(unittest.TestCase):
         thread = threading.Thread(target=approve)
         thread.start()
         helper = subprocess.run(
-            [sys.executable, "-m", "services.doorman_broker.askpass", "Password: "],
+            [sys.executable, "-m", "broker.askpass", "Password: "],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -351,7 +351,7 @@ class BrokerTest(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "services.doorman_broker.broker",
+                "broker.broker",
                 "--socket",
                 str(socket_path),
                 "--token",
@@ -442,7 +442,7 @@ class BrokerTest(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "services.doorman_broker.broker",
+                "broker.broker",
                 "--socket",
                 str(socket_path),
                 "--token",

@@ -22,8 +22,12 @@ do projeto e deve acompanhar qualquer submissão.
 
 ## Blockers antes da submissão
 
-1. Publicar o plugin como repositório próprio, em vez de submeter este
-   monorepo diretamente.
+1. ~~Publicar o plugin como repositório próprio, em vez de submeter este
+   monorepo diretamente.~~ Feito em 2026-09-27: este repositório é o
+   resultado dessa extração (via `git filter-repo`, preservando a autoria e
+   o histórico de `omarchy-plugins`). O monorepo de origem
+   (`github.com/MauricioMCunha/omarchy-plugins`) passa a ser só um laboratório
+   de criação/teste de novos plugins.
 2. ~~Adicionar o entrypoint `BarWidget.qml` conforme o contrato Quattro e
    mover o painel para o ciclo de vida `Panel`/`KeyboardPanel` oficial.~~
    Feito em 2026-09-27: `BarWidget.qml` hospeda o ícone e todo o estado do

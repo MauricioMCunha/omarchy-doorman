@@ -1,1 +1,1 @@
-../../plugins/doorman/client.py
+../client.py

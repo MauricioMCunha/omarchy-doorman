@@ -1,6 +1,6 @@
 # OpenSpec do Omarchy Plugins Lab
 
-Esta pasta contém a especificação executável do primeiro plugin do monorepo.
+Esta pasta contém a especificação executável do Doorman.
 Cada requisito tem critérios de aceitação que devem ser cobertos por testes,
 validação estática ou uma verificação manual documentada.
 

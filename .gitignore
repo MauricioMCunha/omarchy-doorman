@@ -1,0 +1,16 @@
+# Build and runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local secrets and sockets
+.env
+.env.*
+*.sock
+*.socket
+*.key
+*.token
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

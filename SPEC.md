@@ -1,6 +1,3 @@
-> **Note (pre-extraction draft):** written for Doorman's planned standalone
-> repository. See the note at the top of `README.md`.
-
 # Doorman — Technical Specification
 
 This document describes what Doorman does, what it explicitly does not do,
@@ -9,7 +6,7 @@ security property. It is the reference for anyone auditing, extending, or
 re-implementing a piece of this system. For the short pitch and install
 steps, see [`README.md`](README.md). For machine-checkable functional
 requirements and acceptance criteria in MUST/SHOULD form, see the sibling
-`openspec/doorman.md` in the monorepo — this document is the narrative
+`openspec/doorman.md` in this repository — this document is the narrative
 version of the same system.
 
 ## 1. Overview
@@ -419,8 +416,8 @@ signal in the request payload itself to detect a retry from.
 The fix correlates on the *sudo parent process*, not the payload: `sudo`
 forks a new askpass child each retry, but the `sudo` process itself is the
 same one throughout the whole `passwd_tries` loop, and both askpass
-entrypoints (`services/doorman_broker/askpass.py`,
-`plugins/doorman/askpass.py`) are exec'd directly or via an `exec` shell
+entrypoints (`broker/askpass.py`,
+`askpass.py`) are exec'd directly or via an `exec` shell
 wrapper, so `os.getppid()` at that point is always `sudo`'s own PID. That
 PID is sent as `sudo_pid` on `request`. The broker keeps a short-lived map
 (`_sudo_pid_attempts`, pruned after `RETRY_WINDOW_SECONDS` = 20s) from

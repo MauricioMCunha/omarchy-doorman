@@ -31,7 +31,7 @@ fi
 ensure_private_secret "$token_file"
 ensure_private_secret "$capability_file"
 cd "$project_dir"
-exec /usr/bin/python3 -m services.doorman_broker.broker \
+exec /usr/bin/python3 -m broker.broker \
   --socket "$runtime_dir/broker.sock" --token "$(<"$token_file")" \
   --llm-capability "$(<"$capability_file")" \
   --timeout 30

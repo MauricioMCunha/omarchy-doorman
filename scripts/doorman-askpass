@@ -17,4 +17,4 @@ export DOORMAN_TOKEN="$(<"$token_file")"
 export DOORMAN_LLM_CAPABILITY="$(<"$capability_file")"
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${project_dir}"
 
-exec /usr/bin/python3 -m services.doorman_broker.askpass "$@"
+exec /usr/bin/python3 -m broker.askpass "$@"

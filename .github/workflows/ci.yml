@@ -25,7 +25,7 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Compile check (broker + plugin Python sources)
-        run: python3 -m py_compile services/doorman_broker/*.py plugins/doorman/*.py
+        run: python3 -m py_compile broker/*.py *.py
 
       - name: Whitespace and conflict-marker check
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

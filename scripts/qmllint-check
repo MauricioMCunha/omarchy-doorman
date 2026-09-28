@@ -47,6 +47,6 @@ exec "$qmllint_bin" \
   --signal-handler-parameters info \
   --unqualified info \
   --uncreatable-type info \
-  "$repo_root/plugins/doorman/BarWidget.qml" \
-  "$repo_root/plugins/doorman/Panel.qml" \
-  "$repo_root/plugins/doorman/SecureOverlay.qml"
+  "$repo_root/BarWidget.qml" \
+  "$repo_root/Panel.qml" \
+  "$repo_root/SecureOverlay.qml"

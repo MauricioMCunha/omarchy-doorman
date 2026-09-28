@@ -1,1 +1,1 @@
-../../plugins/doorman/bridge.py
+../bridge.py

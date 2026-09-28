@@ -1,9 +1,3 @@
-> **Note (pre-extraction draft):** this README is written for Doorman's
-> planned standalone repository (see `docs/decisions/0002-rename-to-doorman.md`
-> in the monorepo). Paths like `broker/`, `packaging/`, and `scripts/` are
-> relative to that future repo root, not to this directory's current location
-> inside `omarchy-plugins`. Delete this note once the extraction happens.
-
 # Doorman
 
 **Local, human-approved `sudo` for background AI agents.**

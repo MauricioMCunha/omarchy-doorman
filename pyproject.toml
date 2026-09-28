@@ -1,7 +1,7 @@
 [project]
-name = "omarchy-plugins-lab"
+name = "doorman"
 version = "0.1.0"
-description = "Plugins e serviços locais para Omarchy"
+description = "Local, human-approved sudo for background AI agents — an Omarchy plugin"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
