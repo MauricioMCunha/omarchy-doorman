@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Semantic qmllint against Doorman's QML, resolving Quickshell's own `qs.*`
+# reserved import (which is a Quickshell engine feature, not a standard Qt
+# module path) by shimming it as a real qmldir-matching directory tree.
+#
+# Requires a local Omarchy/Quickshell install (the same one needed to run
+# and test the plugin at all) — there is no Ubuntu/Debian package for
+# Quickshell, so this does not run in GitHub Actions CI. See
+# docs/publishing-security.md for why qmllint stays a local/pre-push check
+# instead of a CI gate.
+
+readonly omarchy_shell="${OMARCHY_SHELL_DIR:-/usr/share/omarchy/shell}"
+readonly qmllint_bin="${QMLLINT_BIN:-/usr/lib/qt6/bin/qmllint}"
+readonly qt_qml_dir="${QT_QML_DIR:-/usr/lib/qt6/qml}"
+
+if [[ ! -d "$omarchy_shell/Ui" || ! -d "$omarchy_shell/Commons" ]]; then
+  echo "qmllint-check: Omarchy shell not found at $omarchy_shell (set OMARCHY_SHELL_DIR)" >&2
+  exit 1
+fi
+if [[ ! -x "$qmllint_bin" ]]; then
+  echo "qmllint-check: qmllint not found at $qmllint_bin (set QMLLINT_BIN, e.g. from qt6-declarative)" >&2
+  exit 1
+fi
+
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly repo_root="$(cd -- "$script_dir/.." && pwd)"
+readonly shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/doorman-qmllint-shim.XXXXXX")"
+trap 'rm -rf "$shim_dir"' EXIT
+
+mkdir -p "$shim_dir/qs"
+ln -s "$omarchy_shell/Ui" "$shim_dir/qs/Ui"
+ln -s "$omarchy_shell/Commons" "$shim_dir/qs/Commons"
+
+# Categories downgraded to `info` below are pervasive, ecosystem-wide
+# patterns that qmllint cannot resolve without full Quickshell C++ type
+# metadata (dynamic Loader.item member access, Process.exited's dropped
+# QProcess::ExitStatus arg, and outer-`id` access from inside a Variants/
+# Component delegate). The same patterns appear throughout Omarchy's own
+# first-party plugins (e.g. omarchy.clock); they are not Doorman-specific
+# bugs, so they stay visible but non-blocking rather than papered over.
+exec "$qmllint_bin" \
+  -I "$qt_qml_dir" \
+  -I "$shim_dir" \
+  --missing-property info \
+  --signal-handler-parameters info \
+  --unqualified info \
+  --uncreatable-type info \
+  "$repo_root/plugins/doorman/BarWidget.qml" \
+  "$repo_root/plugins/doorman/Panel.qml" \
+  "$repo_root/plugins/doorman/SecureOverlay.qml"

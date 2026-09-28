@@ -29,3 +29,32 @@ jobs:
 
       - name: Whitespace and conflict-marker check
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Zero third-party dependencies today (see pyproject.toml) — this is a
+      # trip wire for the day one is added, not a check with anything to
+      # catch right now. Only runs on PRs: it's the only trigger the action
+      # supports, since it diffs the base and head manifests.
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+
+  # qmllint runs locally (scripts/qmllint-check), not here: it needs a real
+  # Quickshell + Omarchy shell install to resolve Quickshell's `qs.*`
+  # reserved import and the `Quickshell`/`Quickshell.Io`/`Quickshell.Wayland`
+  # modules, none of which are packaged for Ubuntu/Debian. Building Quickshell
+  # from source on every CI run would be disproportionate to this project's
+  # size. See docs/publishing-security.md.

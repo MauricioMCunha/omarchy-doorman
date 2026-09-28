@@ -165,7 +165,9 @@ Doorman is in **private beta**: solid enough for the exact workflow it was
 built for (local dev machine, one user, background coding agents), not yet
 reviewed by anyone outside the project. Current gaps before a wider release:
 
-- No `qmllint`/CI pipeline yet — checks run manually (see below).
+- CI runs the Python test suite, a compile check, and a secret scan on every
+  push; `qmllint` still runs manually (see below) — GitHub-hosted runners
+  don't have Quickshell/Omarchy installed, and there's no package for either.
 - No test coverage against a real Quickshell/Omarchy session or real `sudo`,
   only against the broker's own protocol.
 - Threat model and plugin lifecycle haven't had an independent review.
@@ -180,6 +182,7 @@ broker fails closed on anything it can't verify.
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 -m py_compile broker/*.py *.py
 git diff --check
+scripts/qmllint-check  # needs a local Omarchy/Quickshell install
 ```
 
 The test suite covers authentication, invalid origin, missing/mismatched

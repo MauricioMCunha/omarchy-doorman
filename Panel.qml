@@ -1,329 +1,137 @@
 import QtQuick
-import Quickshell
-import Quickshell.Io
 import qs.Ui
 import qs.Commons
-import "NotifyState.js" as NotifyState
 
-Item {
+// Doorman's summary popup: broker status, the currently selected request
+// (if any) and session counters. All state and process management live on
+// the hosting BarWidget.qml — this panel only reads it off `hostWidget`, the
+// same split clock's BarWidget.qml/Panel.qml pair uses.
+//
+// The actual approve/deny prompt is SecureOverlay, owned by BarWidget.qml
+// directly and shown independently of whether this popup is open — it has
+// to be visible (and grab exclusive keyboard focus) even when nobody has
+// clicked the bar icon.
+Panel {
   id: root
+  moduleName: "mauricio.doorman"
+  ipcTarget: "mauricio.doorman"
+  manageIpc: false
 
-  property var bar
-  property string moduleName
-  property var settings
-  property bool open: false
-  property var requests: []
-  property var selected: null
-  property var metrics: ({})
-  property bool brokerOnline: false
-  property bool serviceBusy: false
-  property bool serviceDesired: false
-  property bool decisionBusy: false
-  property string pendingApprovalSecret: ""
-  property string approvalRequestId: ""
-  property string approvalNonce: ""
-  // Id do toast atual (0 = nenhum). Uma retentativa troca o request_id
-  // (dedupado por NotifyState), mas ainda é a mesma fila de notificação
-  // visual — reenviar com -r <id> atualiza o toast existente em vez de
-  // empilhar um segundo, obsoleto, ao lado dele.
-  property int notificationId: 0
-  readonly property string commercialName: "Doorman"
+  property var anchorItem: null
 
-  readonly property color foreground: bar && bar.foreground ? bar.foreground : Color.foreground
-  readonly property string fontFamily: bar && bar.fontFamily ? bar.fontFamily : Style.font.family
-  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy-doorman"
-  readonly property string socketPath: runtimeDir + "/broker.sock"
-  readonly property string tokenPath: runtimeDir + "/token"
-  function localPath(url) {
-    var value = String(url)
-    return value.indexOf("file://") === 0 ? value.slice(7) : value
-  }
-  readonly property string bridgePath: root.localPath(Qt.resolvedUrl("bridge.py"))
+  // The bar tracks the widget mounted in its slot — BarWidget.qml — not this
+  // nested panel. Everything the bar identifies a panel by has to be that
+  // widget, matching clock's Panel.qml.
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
 
-  implicitWidth: 34
-  implicitHeight: bar ? bar.barSize : 26
+  readonly property color contentForeground: hostWidget ? hostWidget.foreground : (bar ? bar.foreground : Color.foreground)
+  readonly property string contentFontFamily: hostWidget ? hostWidget.fontFamily : Style.font.family
 
-  function triggerPress(button) { root.open = !root.open; if (root.open) poll() }
-  function poll() {
-    if (!pollProc.running) pollProc.running = true
-    if (!statsProc.running) statsProc.running = true
-  }
-  function notifyNewRequests(list) {
-    var seen = {}
-    var fresh = []
-    for (var i = 0; i < list.length; i++) {
-      seen[list[i].request_id] = true
-      if (NotifyState.claimOnce(list[i].request_id)) fresh.push(list[i])
-    }
-    NotifyState.forgetExcept(seen)
-    if (fresh.length === 0 || notifyProc.running) return
-    // O título fica fixo mesmo numa retentativa: omarchy-notification-dismiss
-    // casa por título, e é ele quem fecha o toast quando a fila esvazia.
-    var title = fresh.length === 1 ? "Autorização pendente" : (fresh.length + " autorizações pendentes")
-    var body
-    if (fresh.length === 1) {
-      var item = fresh[0]
-      var retry = Number(item.attempt || 1) > 1
-      body = (retry ? "Senha incorreta — tentativa " + item.attempt + "  ·  " : "") +
-        (item.command || "sudo") + "  ·  expira em " + Math.max(0, Math.floor(item.expires_at - Date.now() / 1000)) + "s"
-    } else {
-      body = fresh.map(function (item) { return item.command || "sudo" }).join(", ")
-    }
-    var command = ["/usr/share/omarchy/bin/omarchy-notification-send",
-      "--app-name", root.commercialName, "-g", "󰠚", "-u", "critical", "-p"]
-    if (root.notificationId > 0) command.push("-r", String(root.notificationId))
-    command.push(title, body)
-    notifyProc.command = command
-    notifyProc.running = true
-  }
-  function metric(name) { return Number(root.metrics[name] || 0) }
-  function duration(seconds) {
-    var value = Number(seconds || 0)
-    if (value < 60) return Math.max(0, Math.floor(value)) + "s"
-    return Math.floor(value / 60) + "m " + Math.floor(value % 60) + "s"
-  }
-  function nextExpiry() {
-    if (!root.requests.length) return 0
-    var soonest = Number(root.requests[0].expires_at || 0)
-    for (var i = 1; i < root.requests.length; i++)
-      soonest = Math.min(soonest, Number(root.requests[i].expires_at || soonest))
-    return Math.max(0, Math.floor(soonest - Date.now() / 1000))
-  }
-  function toggleBroker() {
-    if (root.serviceBusy) return
-    root.serviceDesired = !root.brokerOnline
-    serviceProc.command = ["/usr/bin/systemctl", "--user", root.serviceDesired ? "start" : "stop", "omarchy-doorman.service"]
-    serviceProc.running = true
-  }
-  function approveSecret(secret) {
-    if (!root.selected || !secret || root.decisionBusy) return
-    var requestId = root.selected.request_id
-    var nonce = root.selected.nonce
-    root.decisionBusy = true
-    root.approvalRequestId = requestId
-    root.approvalNonce = nonce
-    root.requests = root.requests.filter(function (item) { return item.request_id !== requestId })
-    approveProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-      "--token-file", root.tokenPath, "approve", requestId, nonce]
-    root.pendingApprovalSecret = secret
-    approveProc.running = true
-  }
-  function cancelRequest() {
-    if (!root.selected || root.decisionBusy) return
-    var requestId = root.selected.request_id
-    var nonce = root.selected.nonce
-    root.decisionBusy = true
-    root.requests = root.requests.filter(function (item) { return item.request_id !== requestId })
-    cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-      "--token-file", root.tokenPath, "cancel", requestId, nonce]
-    cancelProc.running = true
+  function open() {
+    if (root.hostWidget) root.hostWidget.poll()
+    root.controller.show()
   }
 
-  Process {
-    id: pollProc
-    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "--token-file", root.tokenPath, "pending"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        try {
-          var value = JSON.parse(text || "{}")
-          var hadPending = root.requests.length > 0
-          root.requests = value.requests || []
-          root.notifyNewRequests(root.requests)
-          if (hadPending && root.requests.length === 0 && !dismissNotifyProc.running) {
-            dismissNotifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-dismiss", "Autorização pendente"]
-            dismissNotifyProc.running = true
-            root.notificationId = 0
-          }
-          if (!root.decisionBusy && root.selected && !root.requests.some(function (item) { return item.request_id === root.selected.request_id })) root.selected = null
-          if (root.requests.length > 0 && !root.selected) root.selected = root.requests[0]
-        } catch (e) { root.requests = [] }
-      }
-    }
-    onExited: pollTimer.restart()
+  function close() {
+    root.controller.hide()
   }
 
-  Process {
-    id: notifyProc
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var value = parseInt(text, 10)
-        if (!isNaN(value) && value > 0) root.notificationId = value
-      }
-    }
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
   }
 
-  Process {
-    id: dismissNotifyProc
-    stdout: StdioCollector {}
-  }
-
-  Process {
-    id: statsProc
-    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "--token-file", root.tokenPath, "stats"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        try {
-          var value = JSON.parse(text || "{}")
-          root.metrics = value
-          root.brokerOnline = value.ok === true
-          if (!root.serviceBusy) root.serviceDesired = root.brokerOnline
-        } catch (e) { root.brokerOnline = false; root.metrics = ({}) }
-      }
-    }
-  }
-
-  Process {
-    id: approveProc
-    stdinEnabled: true
-    stdout: StdioCollector {
-      id: approveOut
-    }
-    onStarted: {
-      write(root.pendingApprovalSecret + "\n")
-      root.pendingApprovalSecret = ""
-    }
-    onExited: function (code) {
-      if (code !== 0 && root.approvalRequestId !== "" && !cancelProc.running) {
-        cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-          "--token-file", root.tokenPath, "cancel", root.approvalRequestId, root.approvalNonce]
-        cancelProc.running = true
-      }
-    }
-  }
-
-  Process {
-    id: cancelProc
-    stdout: StdioCollector {}
-    onExited: root.poll()
-  }
-
-  Process {
-    id: serviceProc
-    onStarted: root.serviceBusy = true
-    onExited: {
-      root.serviceBusy = false
-      root.poll()
-    }
-  }
-
-  SecureOverlay {
-    id: secureOverlay
-    open: root.selected !== null && (root.requests.length > 0 || root.decisionBusy)
-    request: root.selected
-    onApproved: function (secret) { root.approveSecret(secret) }
-    onCancelled: root.cancelRequest()
-    onDecisionFinished: {
-      root.selected = null
-      root.requests = []
-      root.decisionBusy = false
-      root.approvalRequestId = ""
-      root.approvalNonce = ""
-      root.poll()
-    }
-  }
-
-  Timer {
-    id: pollTimer
-    interval: 1500
-    repeat: true
-    running: true
-    onTriggered: root.poll()
-  }
-  Component.onCompleted: root.poll()
-
-  BarIconButton {
-    id: barButton
-    anchors.fill: parent
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
     bar: root.bar
-    text: "󰠚"
-    tooltipText: root.commercialName
-    active: root.open || root.requests.length > 0
-    Accessible.role: Accessible.Button
-    Accessible.name: root.commercialName
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight)
 
-    onPressed: function(mouseButton) {
-      if (mouseButton === Qt.LeftButton) root.triggerPress(mouseButton)
-    }
-  }
-
-  PopupCard {
-    id: popup
-    anchorItem: root
-    bar: root.bar
-    owner: root
-    open: root.open
-    contentWidth: popup.fittedContentWidth(Style.space(380))
-    contentHeight: popup.fittedContentHeight(panelColumn.implicitHeight)
-
-    Column {
-      id: panelColumn
-      width: parent.width
-      spacing: Style.space(12)
-
-      PanelHero {
-        width: parent.width
-        title: "Doorman"
-        meta: root.brokerOnline ? "LOCAL SESSION · ONLINE" : "LOCAL SESSION · OFFLINE"
-        detail: root.requests.length > 0 ? String(root.requests.length) : ""
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        trailingControl: Component {
-          ToggleSwitch {
-            checked: root.serviceDesired
-            busy: root.serviceBusy
-            foreground: root.foreground
-            accent: Color.accent
-            onToggled: root.toggleBroker()
-          }
-        }
-        iconComponent: Component {
-          Text { text: "󰠚"; color: root.requests.length > 0 ? Color.accent : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.display }
-        }
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(t) {
+        if ((t === "r" || t === "R") && root.hostWidget) root.hostWidget.poll()
       }
 
-      PanelSeparator { foreground: root.foreground }
-      PanelSectionHeader { text: root.requests.length > 0 ? "ATTENTION" : "STATUS"; foreground: root.foreground; fontFamily: root.fontFamily }
-
-      Button {
-        width: parent.width
-        leftAlign: true
-        text: root.requests.length > 0
-          ? (root.requests.length + " solicitação" + (root.requests.length > 1 ? "ões" : "") + " · expira em " + root.duration(root.nextExpiry()))
-          : (root.brokerOnline ? "Nenhuma autorização pendente" : "Broker indisponível")
-        iconText: root.requests.length > 0 ? "󰀦" : (root.brokerOnline ? "󰄬" : "󰀪")
-        active: root.requests.length > 0
-        focusable: true
-        onClicked: if (root.requests.length > 0) root.open = false
-      }
-
-      BorderSurface {
-        visible: root.requests.length > 0
-        width: parent.width
-        implicitHeight: requestDetails.implicitHeight + Style.space(12)
-        padding: Style.space(6)
-        color: "transparent"
-        borderSpec: Border.flat(root.foreground, Style.normalBorderWidth)
-        radius: Style.cornerRadius
-        Column {
-          id: requestDetails
-          width: parent.width
-          spacing: Style.space(3)
-          PanelSectionHeader { text: "REQUEST"; foreground: root.foreground; fontFamily: root.fontFamily }
-          Text { width: parent.width; text: root.selected ? root.selected.command : ""; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; elide: Text.ElideMiddle; textFormat: Text.PlainText }
-          Text { width: parent.width; text: root.selected ? ((root.selected.tty || "local session") + "  ·  PID " + root.selected.pid) : ""; color: Qt.darker(root.foreground, 1.4); font.family: root.fontFamily; font.pixelSize: Style.font.caption; elide: Text.ElideRight; textFormat: Text.PlainText }
-        }
-      }
-
-      PanelSeparator { foreground: root.foreground }
-      PanelSectionHeader { text: "SESSION"; foreground: root.foreground; fontFamily: root.fontFamily }
       Column {
+        id: panelColumn
         width: parent.width
-        spacing: Style.space(2)
-        Text { width: parent.width; text: "APPROVED   " + root.metric("approved") + "    CANCELLED   " + root.metric("cancelled"); color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; textFormat: Text.PlainText }
-        Text { width: parent.width; text: "EXPIRED    " + root.metric("expired") + "    UPTIME      " + root.duration(root.metric("uptime")); color: Qt.darker(root.foreground, 1.4); font.family: root.fontFamily; font.pixelSize: Style.font.caption; textFormat: Text.PlainText }
-      }
+        spacing: Style.space(12)
 
-      Button { width: parent.width; text: "Refresh"; iconText: "󰑐"; focusable: true; onClicked: root.poll() }
+        PanelHero {
+          width: parent.width
+          title: "Doorman"
+          meta: root.hostWidget && root.hostWidget.brokerOnline ? "LOCAL SESSION · ONLINE" : "LOCAL SESSION · OFFLINE"
+          detail: root.hostWidget && root.hostWidget.requests.length > 0 ? String(root.hostWidget.requests.length) : ""
+          foreground: root.contentForeground
+          fontFamily: root.contentFontFamily
+          trailingControl: Component {
+            ToggleSwitch {
+              checked: root.hostWidget ? root.hostWidget.serviceDesired : false
+              busy: root.hostWidget ? root.hostWidget.serviceBusy : false
+              foreground: root.contentForeground
+              accent: Color.accent
+              onToggled: if (root.hostWidget) root.hostWidget.toggleBroker()
+            }
+          }
+          iconComponent: Component {
+            Text { text: "󰠚"; color: (root.hostWidget && root.hostWidget.requests.length > 0) ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.display }
+          }
+        }
+
+        PanelSeparator { foreground: root.contentForeground }
+        PanelSectionHeader { text: (root.hostWidget && root.hostWidget.requests.length > 0) ? "ATTENTION" : "STATUS"; foreground: root.contentForeground; fontFamily: root.contentFontFamily }
+
+        Button {
+          width: parent.width
+          leftAlign: true
+          text: root.hostWidget && root.hostWidget.requests.length > 0
+            ? (root.hostWidget.requests.length + " solicitação" + (root.hostWidget.requests.length > 1 ? "ões" : "") + " · expira em " + root.hostWidget.duration(root.hostWidget.nextExpiry()))
+            : (root.hostWidget && root.hostWidget.brokerOnline ? "Nenhuma autorização pendente" : "Broker indisponível")
+          iconText: (root.hostWidget && root.hostWidget.requests.length > 0) ? "󰀦" : ((root.hostWidget && root.hostWidget.brokerOnline) ? "󰄬" : "󰀪")
+          active: root.hostWidget ? root.hostWidget.requests.length > 0 : false
+          focusable: true
+          onClicked: if (root.hostWidget && root.hostWidget.requests.length > 0) root.close()
+        }
+
+        BorderSurface {
+          visible: root.hostWidget ? root.hostWidget.requests.length > 0 : false
+          width: parent.width
+          implicitHeight: requestDetails.implicitHeight + Style.space(12)
+          padding: Style.space(6)
+          color: "transparent"
+          borderSpec: Border.flat(root.contentForeground, Style.normalBorderWidth)
+          radius: Style.cornerRadius
+          Column {
+            id: requestDetails
+            width: parent.width
+            spacing: Style.space(3)
+            PanelSectionHeader { text: "REQUEST"; foreground: root.contentForeground; fontFamily: root.contentFontFamily }
+            Text { width: parent.width; text: (root.hostWidget && root.hostWidget.selected) ? root.hostWidget.selected.command : ""; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body; elide: Text.ElideMiddle; textFormat: Text.PlainText }
+            Text { width: parent.width; text: (root.hostWidget && root.hostWidget.selected) ? ((root.hostWidget.selected.tty || "local session") + "  ·  PID " + root.hostWidget.selected.pid) : ""; color: Qt.darker(root.contentForeground, 1.4); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; elide: Text.ElideRight; textFormat: Text.PlainText }
+          }
+        }
+
+        PanelSeparator { foreground: root.contentForeground }
+        PanelSectionHeader { text: "SESSION"; foreground: root.contentForeground; fontFamily: root.contentFontFamily }
+        Column {
+          width: parent.width
+          spacing: Style.space(2)
+          Text { width: parent.width; text: "APPROVED   " + (root.hostWidget ? root.hostWidget.metric("approved") : 0) + "    CANCELLED   " + (root.hostWidget ? root.hostWidget.metric("cancelled") : 0); color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall; textFormat: Text.PlainText }
+          Text { width: parent.width; text: "EXPIRED    " + (root.hostWidget ? root.hostWidget.metric("expired") : 0) + "    UPTIME      " + (root.hostWidget ? root.hostWidget.duration(root.hostWidget.metric("uptime")) : "0s"); color: Qt.darker(root.contentForeground, 1.4); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; textFormat: Text.PlainText }
+        }
+
+        Button { width: parent.width; text: "Refresh"; iconText: "󰑐"; focusable: true; onClicked: if (root.hostWidget) root.hostWidget.poll() }
+      }
     }
   }
 }

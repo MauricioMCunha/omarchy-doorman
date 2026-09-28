@@ -78,9 +78,14 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
   shells out to for `pending`/`stats`/`approve`/`cancel`. The secret is
   piped over stdin on approval, never passed as an argument (arguments are
   visible to every other process on the machine via `/proc/<pid>/cmdline`).
-- **UI** (`Panel.qml`, `SecureOverlay.qml`): a topbar widget for
-  status/history and a modal `PanelWindow` (Wayland layer-shell, exclusive
-  keyboard focus while open) for the actual decision.
+- **UI** (`BarWidget.qml`, `Panel.qml`, `SecureOverlay.qml`): a topbar icon
+  plus a status/history popup built on Omarchy's own `BarWidget`/`Panel`/
+  `KeyboardPanel` contract (the same pair every first-party bar widget with a
+  popup uses — e.g. `omarchy.clock`), and a separate modal `PanelWindow`
+  (Wayland layer-shell, exclusive keyboard focus while open) for the actual
+  approve/deny decision. The modal is deliberately outside the bar's popout
+  system — SecureOverlay must be able to appear (and grab exclusive keyboard
+  focus) whether or not the status popup is open.
 
 ## 4. Threat model
 
@@ -437,7 +442,7 @@ Two consequences the implementation handles explicitly:
   for expiry.
 - The UI's own desktop notification for the first attempt would otherwise
   stay on screen, stale, next to a second one for the retry.
-  `omarchy-notification-send -p` prints the notification's id; Panel.qml
+  `omarchy-notification-send -p` prints the notification's id; BarWidget.qml
   keeps it and passes it back via `-r <id>` on the next send, updating the
   toast in place instead of stacking a second one. The notification title
   stays constant (`"Autorização pendente"`) so `omarchy-notification-dismiss`

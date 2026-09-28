@@ -7,7 +7,7 @@
   "license": "MIT",
   "description": "Local, human-approved sudo for background agents — the password never reaches the chat, the log, or the agent.",
   "kinds": ["bar-widget"],
-  "entryPoints": {"barWidget": "Panel.qml"},
+  "entryPoints": {"barWidget": "BarWidget.qml"},
   "barWidget": {
     "displayName": "Doorman",
     "description": "Approve or deny privileged commands from background agents in a local prompt only you can see.",
