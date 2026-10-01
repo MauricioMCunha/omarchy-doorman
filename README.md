@@ -75,30 +75,67 @@ we found and fixed while building this.
 
 ## Installing
 
-Doorman has two parts: the **broker**, a `systemd --user` service, and the
-**plugin**, an Omarchy bar widget.
+Doorman has two parts: the **plugin**, an Omarchy bar widget, and the
+**broker**, a `systemd --user` service. `omarchy plugin add` handles the
+first; the broker and the `sudo` wrapper are one step each, by hand.
 
 ```bash
-# 1. Install the plugin (adjust the target path/id to match your Omarchy setup)
-cp -r . ~/.config/omarchy/plugins/mauricio.doorman
+# 1. Add and enable the plugin — validates the manifest, clones it into
+#    ~/.config/omarchy/plugins/mauricio.doorman as a git checkout, and
+#    places the bar widget without a full shell restart.
+omarchy plugin add https://github.com/MauricioMCunha/omarchy-doorman.git --enable
 
-# 2. Install and enable the broker service
-cp packaging/omarchy-doorman.service ~/.config/systemd/user/
+# 2. Install and enable the broker service (omarchy plugin add only manages
+#    the bar widget, not systemd units)
+cp ~/.config/omarchy/plugins/mauricio.doorman/packaging/omarchy-doorman.service \
+  ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-doorman.service
 
-# 3. Reload Omarchy's shell so it picks up the new widget
-omarchy-restart-shell
-
-# 4. Shadow `sudo` for this user so agents pick it up without any
+# 3. Shadow `sudo` for this user so agents pick it up without any
 #    per-agent configuration — see "Wiring up sudo" below for why this
 #    step is the one that actually makes Doorman useful.
-ln -s "$(pwd)/scripts/doorman-sudo" ~/.local/bin/sudo
+ln -s ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo ~/.local/bin/sudo
 ```
 
 Nothing here touches `/usr/share/omarchy/`, replaces `/usr/bin/sudo`, or edits
-`sudoers`. Both steps are explicit and reversible: stop the service and
-delete the plugin directory to remove it completely.
+`sudoers`. Every step is explicit and reversible — see **Activating,
+updating, and removing** below for the inverse of each one.
+
+### Activating, updating, and removing
+
+The plugin and the broker are independent: toggling one doesn't touch the
+other, and nothing below deletes your session token or metrics unless you
+run the removal block at the end.
+
+```bash
+# Toggle the bar widget on/off, without touching the installed files
+omarchy plugin disable mauricio.doorman
+omarchy plugin enable mauricio.doorman
+
+# Stop/resume the broker, without touching the installed files
+systemctl --user stop omarchy-doorman.service
+systemctl --user start omarchy-doorman.service
+
+# Pull the latest plugin code (it's a git checkout) and restart the broker
+# to pick up any broker/ changes — the bar widget's QML hot-reloads on its
+# own, the broker does not.
+omarchy plugin update mauricio.doorman
+systemctl --user restart omarchy-doorman.service
+
+# Remove everything, in order. Check the sudo shadow symlink BEFORE
+# deleting the plugin folder it points into — in case you reused
+# ~/.local/bin/sudo for something else since installing, this only removes
+# it if it's still exactly doorman-sudo.
+[ "$(readlink -f ~/.local/bin/sudo 2>/dev/null)" = "$(readlink -f ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo 2>/dev/null)" ] \
+  && rm -f ~/.local/bin/sudo
+# Disables and unloads the widget, then backs up (or deletes, since this
+# is a git checkout) the plugin folder.
+omarchy plugin remove mauricio.doorman --yes
+systemctl --user disable --now omarchy-doorman.service
+rm -f ~/.config/systemd/user/omarchy-doorman.service
+systemctl --user daemon-reload
+```
 
 ### Wiring up `sudo`
 
@@ -120,7 +157,7 @@ by name rather than by absolute path, the fix is to make sure they resolve
 # ~/.local/bin generally precedes /usr/bin in PATH already (Omarchy ships
 # this by default); this does not touch /usr/bin/sudo, sudoers, or any
 # other user's environment.
-ln -s "$(pwd)/scripts/doorman-sudo" ~/.local/bin/sudo
+ln -s ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo ~/.local/bin/sudo
 ```
 
 With that in place, plain `sudo <command>` — typed by you, or run by an
@@ -162,8 +199,12 @@ reviewed by anyone outside the project. Current gaps before a wider release:
 - CI runs the Python test suite, a compile check, and a secret scan on every
   push; `qmllint` still runs manually (see below) — GitHub-hosted runners
   don't have Quickshell/Omarchy installed, and there's no package for either.
-- No test coverage against a real Quickshell/Omarchy session or real `sudo`,
-  only against the broker's own protocol.
+- Tested live against a real Quickshell/Omarchy session and real `sudo` — bar
+  widget, popup, the approval modal, and a full `sudo` round trip through the
+  wrapper all exercised end to end — but only on an existing, already-set-up
+  account. Not yet tested from a clean one: fresh `omarchy plugin add`,
+  shell reload, broker toggle, approval, cancellation, expiry, removal, and
+  rollback, all on an account that never had Doorman on it before.
 - Threat model and plugin lifecycle haven't had an independent review.
 
 None of that changes what's already true today: the secret never leaves the

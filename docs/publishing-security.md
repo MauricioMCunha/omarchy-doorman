@@ -36,7 +36,14 @@ do projeto e deve acompanhar qualquer submissão.
    popup, coordenação de popout (dismiss-twin no outro monitor) e o
    SecureOverlay (que continua fora desse ciclo de vida, de propósito — ver
    §3 do SPEC) continuam funcionando.
-3. Documentar instalação, ativação, parada e remoção do serviço de usuário.
+3. ~~Documentar instalação, ativação, parada e remoção do serviço de
+   usuário.~~ Feito em 2026-10-01: o README ganhou uma seção "Activating,
+   updating, and removing" usando os comandos oficiais (`omarchy plugin
+   add/enable/disable/update/remove`) em vez de cópia manual de arquivos —
+   `omarchy plugin add` já valida o manifesto, clona como git checkout e
+   posiciona o widget sem restart completo do shell. O passo do broker
+   (serviço `systemd --user`) continua manual, já que `omarchy plugin add`
+   não gerencia units — documentado explicitamente como tal.
 4. Testar em uma conta limpa: instalação, reinício do shell, toggle do broker,
    aprovação, cancelamento, expiração, remoção e rollback.
 5. ~~Adicionar revisão de dependências, `qmllint`, testes Python e inspeção
