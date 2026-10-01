@@ -1,35 +1,36 @@
-# Arquitetura do Omarchy Plugins Lab
+# Doorman architecture
 
-## Camadas
+## Layers
 
-1. **Plugin visual** — executa no Quickshell/Omarchy Shell, apresenta pedidos
-   e coleta consentimento local.
-2. **Broker local** — serviço de usuário com socket Unix privado, nonce,
-   timeout, associação ao processo e limpeza de buffers.
-3. **Helper de autenticação** — integração limitada com `sudo askpass`, sem
-   receber comandos arbitrários do plugin.
-4. **Operação privilegiada** — `sudo` ou `pkexec`, sempre com escopo e origem
-   verificáveis.
+1. **Visual plugin** — runs inside Quickshell/Omarchy Shell, presents
+   requests, and collects local consent.
+2. **Local broker** — a user service with a private Unix socket, nonce,
+   timeout, process binding, and buffer cleanup.
+3. **Authentication helper** — limited integration with `sudo askpass`,
+   never receiving arbitrary commands from the plugin.
+4. **Privileged operation** — `sudo` or `pkexec`, always with a verifiable
+   scope and origin.
 
-## Fluxo inicial
+## Initial flow
 
 ```text
-comando autorizado
+authorized command
     └─ sudo / sudo -A / SUDO_ASKPASS
-         └─ broker local
-              └─ plugin Omarchy
-                   └─ usuário confirma e digita localmente
+         └─ local broker
+              └─ Omarchy plugin
+                   └─ user confirms and types locally
 ```
 
-O conteúdo da senha não retorna ao agente, ao chat, ao clipboard ou ao log.
+The password's content never returns to the agent, the chat, the
+clipboard, or the log.
 
-## Limite da primeira versão
+## First-version limit
 
-A integração não invasiva pode configurar somente `SUDO_ASKPASS`, sem
-substituir `sudo`, alterar `sudoers` ou capturar comandos globalmente. O
-comportamento exato depende da versão/política do sudo; nesta máquina, o
-helper não é chamado sem `-A`, inclusive em execução sem TTY. O wrapper
-opcional acrescenta `-A` apenas quando o usuário o invoca diretamente. O
-launcher `doorman-run` cria um PATH temporário para um único processo,
-permitindo que um executor de LLM use `sudo comando` sem lembrar a flag, sem
-alterar o PATH global do usuário.
+The non-invasive integration can only configure `SUDO_ASKPASS`, without
+replacing `sudo`, changing `sudoers`, or capturing commands globally. The
+exact behavior depends on sudo's version/policy; on this machine, the
+helper isn't called without `-A`, including in a TTY-less run. The optional
+wrapper adds `-A` only when the user invokes it directly. The
+`doorman-run` launcher creates a temporary PATH for a single process,
+letting an LLM runner use `sudo command` without remembering the flag,
+without changing the user's global PATH.

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Broker Unix-socket mínimo para o protótipo doorman.
+"""Minimal Unix-socket broker for the doorman prototype.
 
-O broker mantém o segredo somente durante a resposta da solicitação. Ele não
-faz logging do payload secreto e invalida cada pedido após um único consumo.
+The broker holds the secret only for the duration of the request's response.
+It never logs the secret payload and invalidates each request after a
+single use.
 """
 
 from __future__ import annotations
@@ -25,30 +26,30 @@ from typing import Any
 MAX_LINE = 16 * 1024
 DEFAULT_TIMEOUT = 30.0
 HANDSHAKE_TIMEOUT = 5.0
-# Defesa em profundidade: alguém que já tem o token/capability (um processo
-# comprometido do próprio usuário) ainda poderia abrir muitos pedidos
-# concorrentes, cada um prendendo uma thread por até timeout+1s. Isso não
-# afeta o uso normal, que raramente tem mais de um pedido pendente por vez.
+# Defense in depth: someone who already has the token/capability (a
+# compromised process of the same user) could still open many concurrent
+# requests, each holding a thread for up to timeout+1s. This doesn't affect
+# normal use, which rarely has more than one pending request at a time.
 MAX_PENDING = 20
-# Nome de processo (/proc/<pid>/comm) do processo confiável que pode
-# aprovar/cancelar/listar pedidos. Configurável só para testes — em produção
-# é sempre o Quickshell real. Ver Broker._peer_is_trusted_ui.
+# Process name (/proc/<pid>/comm) of the trusted process allowed to
+# approve/cancel/list requests. Configurable only for tests — in production
+# it's always the real Quickshell. See Broker._peer_is_trusted_ui.
 DEFAULT_TRUSTED_UI_EXE = "quickshell"
-# Quantos saltos de processo pai a mais, além do próprio chamador, o
-# broker segue procurando o executável confiável (bridge.py roda como
-# filho direto do Quickshell — 1 salto basta na prática; a folga cobre um
-# wrapper de shell futuro sem exigir outra mudança).
+# How many extra parent-process hops, beyond the caller itself, the broker
+# follows while looking for the trusted executable (bridge.py runs as a
+# direct child of Quickshell — 1 hop is enough in practice; the slack covers
+# a future shell wrapper without needing another change).
 _TRUSTED_UI_MAX_HOPS = 4
-# Quando o sudo rejeita a senha ele reinvoca o SUDO_ASKPASS num processo
-# filho novo (pid novo a cada tentativa), mas o processo sudo pai é o
-# mesmo durante todo o loop de passwd_tries. O askpass repassa esse pid
-# pai como "sudo_pid"; se dois pedidos chegarem com o mesmo sudo_pid
-# dentro desta janela, o segundo só pode existir porque o sudo pediu de
-# novo — e o sudo só faz isso depois de uma tentativa de senha rejeitada
-# pelo PAM (cancelamento/expiração pelo Doorman fazem o askpass sair sem
-# imprimir nada, o que aborta o sudo em vez de disparar outra tentativa).
-# O broker nunca sabe se a senha em si estava certa — só infere que houve
-# uma tentativa anterior, para a UI poder sinalizar isso ao usuário.
+# When sudo rejects the password it reinvokes SUDO_ASKPASS in a new child
+# process (a new pid on every attempt), but the parent sudo process stays
+# the same for the whole passwd_tries loop. askpass forwards that parent
+# pid as "sudo_pid"; if two requests arrive with the same sudo_pid within
+# this window, the second one can only exist because sudo asked again —
+# and sudo only does that after PAM rejected a password attempt (Doorman's
+# own cancel/expiry make askpass exit without printing anything, which
+# aborts sudo instead of triggering another attempt). The broker never
+# knows whether the password itself was right — it only infers that there
+# was an earlier attempt, so the UI can signal that to the user.
 RETRY_WINDOW_SECONDS = 20.0
 
 
@@ -85,7 +86,7 @@ class Broker:
         self.trusted_ui_exe = trusted_ui_exe
         self.pending: dict[str, PendingRequest] = {}
         # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
-        # Ver RETRY_WINDOW_SECONDS.
+        # See RETRY_WINDOW_SECONDS.
         self._sudo_pid_attempts: dict[int, dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -102,9 +103,9 @@ class Broker:
             existing = None
         if existing is not None:
             if not stat.S_ISSOCK(existing.st_mode):
-                raise RuntimeError(f"caminho do socket não é um socket Unix: {self.socket_path}")
+                raise RuntimeError(f"socket path is not a Unix socket: {self.socket_path}")
             if existing.st_uid != os.getuid():
-                raise RuntimeError("socket Unix pertence a outro usuário")
+                raise RuntimeError("Unix socket belongs to another user")
             self.socket_path.unlink()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(self.socket_path))
@@ -112,7 +113,7 @@ class Broker:
             server.listen(16)
             cleanup = threading.Thread(target=self._cleanup_loop, daemon=True)
             cleanup.start()
-            print(f"doorman broker ouvindo em {self.socket_path}", flush=True)
+            print(f"doorman broker listening on {self.socket_path}", flush=True)
             while not self.stop_event.is_set():
                 try:
                     server.settimeout(1.0)
@@ -127,12 +128,13 @@ class Broker:
 
     def _handle(self, conn: socket.socket) -> None:
         with conn:
-            # Sem timeout aqui, qualquer processo do mesmo usuário (mesmo sem
-            # token) poderia conectar e nunca enviar dados, prendendo esta
-            # thread para sempre. Não há limite de threads concorrentes, então
-            # isso vira exaustão local. O handshake é a única leitura desta
-            # conexão; respostas subsequentes só enviam, então o timeout curto
-            # não afeta a espera longa pela decisão da UI em _create_request.
+            # Without a timeout here, any process of the same user (even
+            # without a token) could connect and never send data, holding
+            # this thread forever. There's no cap on concurrent threads, so
+            # that becomes local exhaustion. The handshake is the only read
+            # on this connection; subsequent responses only send, so the
+            # short timeout doesn't affect the long wait for the UI's
+            # decision in _create_request.
             conn.settimeout(HANDSHAKE_TIMEOUT)
             try:
                 reader = conn.makefile("rb")
@@ -158,15 +160,16 @@ class Broker:
                     return
                 self._create_request(conn, message)
             elif kind in ("approve", "cancel", "pending", "stats"):
-                # Origin=llm + capability só controla quem pode CRIAR um
-                # pedido; approve/cancel/pending/stats só checavam o token de
-                # sessão, e qualquer processo do mesmo usuário que consegue
-                # criar um pedido também consegue ler esse token (é o mesmo
-                # arquivo 0600). Sem esta checagem, um agente comprometido
-                # podia se autoaprovar direto pelo socket, sem UI e sem
-                # humano — confirmado manualmente antes deste fix. SO_PEERCRED
-                # é verificado pelo kernel a partir do processo que chamou
-                # connect(); não é algo que o processo remoto possa forjar.
+                # Origin=llm + capability only controls who can CREATE a
+                # request; approve/cancel/pending/stats used to only check
+                # the session token, and any process of the same user that
+                # can create a request can also read that token (it's the
+                # same 0600 file). Without this check, a compromised agent
+                # could self-approve straight over the socket, with no UI
+                # and no human — confirmed manually before this fix.
+                # SO_PEERCRED is verified by the kernel from the process that
+                # called connect(); it's not something the remote process
+                # can forge.
                 if not self._peer_is_trusted_ui(conn):
                     self._send(conn, {"ok": False, "error": "untrusted_caller"})
                     return
@@ -227,13 +230,13 @@ class Broker:
                         request.attempt = int(previous["attempt"]) + 1
                         stale = self.pending.get(previous["request_id"])
                         if stale is not None and not stale.delivered:
-                            # A tentativa anterior nunca vai ser lida de
-                            # volta: o askpass que a criou já morreu (o sudo
-                            # matou aquele processo e chamou o askpass de
-                            # novo). Sem isso ela ficaria pendurada na lista
-                            # de pendentes até expirar sozinha, e a UI podia
-                            # selecionar essa entrada morta em vez da
-                            # tentativa atual.
+                            # The previous attempt will never be read back:
+                            # the askpass that created it already died (sudo
+                            # killed that process and called askpass again).
+                            # Without this it would sit in the pending list
+                            # until it expired on its own, and the UI could
+                            # end up selecting that dead entry instead of the
+                            # current attempt.
                             stale.delivered = True
                             stale.error = "superseded_by_retry"
                             stale.decision_event.set()
@@ -323,7 +326,7 @@ class Broker:
         if not valid:
             self._send(conn, {"ok": False, "error": "invalid_or_expired_request"})
             return
-        # O segredo só é retornado nesta resposta e nunca é escrito pelo broker.
+        # The secret is returned only in this response and never written by the broker.
         self._send(conn, {"ok": True})
 
     def _cancel(self, conn: socket.socket, message: dict[str, Any]) -> None:
@@ -338,7 +341,7 @@ class Broker:
             )
             if removed:
                 request.delivered = True
-                request.error = "cancelado_pelo_usuario"
+                request.error = "cancelled_by_user"
                 self.metrics["cancelled"] += 1
                 self.last_activity_at = time.time()
                 request.decision_event.set()
@@ -374,26 +377,26 @@ class Broker:
 
     @staticmethod
     def _process_ppid_and_comm(pid: int) -> tuple[int, str] | None:
-        # Comparar /proc/<pid>/exe (o caminho real do binário, não forjável
-        # por argv[0]/prctl) seria mais forte que comm — mas ler o exe de
-        # outro processo, mesmo do mesmo usuário, exige permissão equivalente
-        # a ptrace, e um serviço systemd --user recebe essa permissão negada
-        # (EACCES) mesmo com CAP_SYS_PTRACE concedido e zero hardening extra
-        # (confirmado testando; a mesma leitura funciona normalmente fora do
-        # systemd). /proc/<pid>/comm não exige essa permissão. Isso troca
-        # "impossível de forjar" por "exige um passo deliberado" (renomear o
-        # processo via prctl/argv[0]) — pior que o ideal, mas muito melhor
-        # que aceitar qualquer chamador com o token, que é o que existia
-        # antes deste fix.
+        # Comparing /proc/<pid>/exe (the binary's real path, not forgeable
+        # via argv[0]/prctl) would be stronger than comm — but reading
+        # another process's exe, even from the same user, requires
+        # ptrace-equivalent permission, and a systemd --user service gets
+        # that permission denied (EACCES) even with CAP_SYS_PTRACE granted
+        # and zero extra hardening (confirmed by testing; the same read
+        # works normally outside systemd). /proc/<pid>/comm doesn't require
+        # that permission. This trades "impossible to forge" for "requires
+        # a deliberate step" (renaming the process via prctl/argv[0]) —
+        # worse than ideal, but much better than accepting any caller with
+        # the token, which is what existed before this fix.
         try:
             comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
         except OSError:
             comm = ""
         try:
             stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-            # Mesmo truque de _process_identity: o nome do processo pode ter
-            # espaços/parênteses, então lê os campos após o último ")". Nesse
-            # recorte o ppid é o campo 1 (0-indexado).
+            # Same trick as _process_identity: the process name can contain
+            # spaces/parentheses, so read the fields after the last ")". In
+            # that slice, ppid is field 1 (0-indexed).
             fields = stat_text.rsplit(")", 1)[1].split()
             ppid = int(fields[1])
         except (OSError, IndexError, ValueError):
@@ -405,8 +408,8 @@ class Broker:
         proc = Path(f"/proc/{pid}")
         try:
             stat_text = (proc / "stat").read_text(encoding="utf-8")
-            # O nome do processo pode conter espaços; use os campos após o
-            # último ")" para manter o índice do start time estável.
+            # The process name can contain spaces; use the fields after the
+            # last ")" to keep the start-time index stable.
             fields = stat_text.rsplit(")", 1)[1].split()
             cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(
                 "utf-8", "replace"
@@ -459,7 +462,7 @@ class Broker:
         try:
             conn.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
         except OSError:
-            # O cliente pode ter cancelado a conexão após receber o aceite.
+            # The client may have dropped the connection after receiving the accept.
             pass
 
 
@@ -474,7 +477,7 @@ def main() -> None:
     token = args.token or os.environ.get("DOORMAN_TOKEN")
     capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
     if not token or not capability:
-        parser.error("use --token/DOORMAN_TOKEN e --llm-capability/DOORMAN_LLM_CAPABILITY")
+        parser.error("use --token/DOORMAN_TOKEN and --llm-capability/DOORMAN_LLM_CAPABILITY")
     trusted_ui_exe = (
         args.trusted_ui_exe
         or os.environ.get("DOORMAN_TRUSTED_UI_EXE")

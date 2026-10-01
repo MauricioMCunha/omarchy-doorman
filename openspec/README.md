@@ -1,27 +1,30 @@
-# OpenSpec do Omarchy Plugins Lab
+# Doorman OpenSpec
 
-Esta pasta contém a especificação executável do Doorman.
-Cada requisito tem critérios de aceitação que devem ser cobertos por testes,
-validação estática ou uma verificação manual documentada.
+This folder holds Doorman's executable specification. Every requirement has
+acceptance criteria that must be covered by tests, static validation, or a
+documented manual check.
 
-O sistema entrega uma solicitação de autorização local para uma UI Quickshell
-e devolve um segredo apenas ao processo solicitante, por uma conexão Unix
-privada. Ele não é um cofre, não intercepta prompts arbitrários e não envia
-segredos para o agente, logs, clipboard ou rede.
+The system delivers a local authorization request to a Quickshell UI and
+hands a secret back only to the requesting process, over a private Unix
+connection. It isn't a vault, doesn't intercept arbitrary prompts, and
+doesn't send secrets to the agent, logs, clipboard, or network.
 
-## Fluxo normativo
+## Normative flow
 
-1. O processo autorizado chama o helper `askpass`.
-2. O broker autentica o token de sessão e a capacidade da origem `llm`.
-3. O broker cria um pedido com nonce, prazo e identidade do processo.
-4. A UI lista o pedido e mostra comando, PID, terminal e monitor.
-5. A aprovação ou cancelamento exige o nonce do pedido e é de uso único.
-6. O segredo é entregue somente na conexão bloqueada do helper; depois o
-   pedido é removido.
+1. The authorized process calls the `askpass` helper.
+2. The broker authenticates the session token and the `llm` origin's
+   capability.
+3. The broker creates a request with a nonce, a deadline, and the
+   process's identity.
+4. The UI lists the request and shows the command, PID, terminal, and
+   monitor.
+5. Approval or cancellation requires the request's nonce and is single-use.
+6. The secret is delivered only on the helper's blocked connection; the
+   request is then removed.
 
-## Fora de escopo
+## Out of scope
 
-- credenciais persistentes ou recuperação de senha;
-- operações financeiras ou produção sem revisão de threat model;
-- captura global de teclado, clipboard, PTY ou comandos arbitrários;
-- instalação automática em `/usr/share/omarchy`.
+- persistent credentials or password recovery;
+- financial operations or production without a threat-model review;
+- global keyboard, clipboard, PTY, or arbitrary-command capture;
+- automatic installation under `/usr/share/omarchy`.

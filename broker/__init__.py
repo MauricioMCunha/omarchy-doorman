@@ -1,1 +1,1 @@
-"""Broker local de entrada segura para plugins Omarchy."""
+"""Local secure-input broker for Omarchy plugins."""

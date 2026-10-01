@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge sem segredo em argumentos para a UI do Doorman."""
+"""Secret-free bridge for the Doorman UI."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 try:
     from .client import call
-except ImportError:  # execução direta pelo Process do Quickshell
+except ImportError:  # run directly by Quickshell's Process
     from client import call
 
 

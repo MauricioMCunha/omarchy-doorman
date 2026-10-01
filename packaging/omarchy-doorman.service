@@ -18,8 +18,8 @@ RuntimeDirectoryMode=0700
 ReadWritePaths=%t/omarchy-doorman
 UMask=0077
 
-# Hardening extra: o broker fala apenas Unix socket local e lê /proc do
-# próprio usuário, então pode abrir mão de quase toda outra superfície.
+# Extra hardening: the broker only speaks over a local Unix socket and reads
+# /proc of its own user, so it can give up almost every other surface.
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true

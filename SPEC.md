@@ -180,7 +180,7 @@ exactly one more line:
 ```jsonc
 {"ok": true, "secret": "…"}                              // approved
 {"ok": false, "error": "expired"}                         // no decision within the deadline
-{"ok": false, "error": "cancelado_pelo_usuario"}          // explicit cancel
+{"ok": false, "error": "cancelled_by_user"}               // explicit cancel
 {"ok": false, "error": "superseded_by_retry"}             // a newer request with the same sudo_pid arrived — see §6.10
 ```
 
@@ -442,7 +442,7 @@ Two consequences the implementation handles explicitly:
   `omarchy-notification-send -p` prints the notification's id; BarWidget.qml
   keeps it and passes it back via `-r <id>` on the next send, updating the
   toast in place instead of stacking a second one. The notification title
-  stays constant (`"Autorização pendente"`) so `omarchy-notification-dismiss`
+  stays constant (`"Authorization pending"`) so `omarchy-notification-dismiss`
   — which matches by title — still clears it when the queue empties.
 
 This is a UX heuristic, not a security control: `sudo_pid` is optional and

@@ -1,30 +1,30 @@
-# ADR 0002 — Renomear "Secure Input" para "Doorman"
+# ADR 0002 — Rename "Secure Input" to "Doorman"
 
-## Decisão
+## Decision
 
-Renomear o plugin e todos os identificadores internos (id do manifesto,
-diretório do plugin, pacote Python do broker, unit systemd, diretório de
-runtime, scripts e variáveis de ambiente) de `secure-input`/`SECURE_INPUT`
-para `doorman`/`DOORMAN`.
+Rename the plugin and every internal identifier (manifest id, plugin
+directory, broker's Python package, systemd unit, runtime directory,
+scripts, and environment variables) from `secure-input`/`SECURE_INPUT` to
+`doorman`/`DOORMAN`.
 
-## Motivo
+## Reason
 
-"Secure Input" colide com um termo de segurança de SO já estabelecido
-("Secure Input Mode", proteção de teclado contra keyloggers) que descreve
-algo diferente do que este plugin faz. O nome também era genérico
-comparado aos outros plugins instalados no catálogo (Radio Atlas, Loose
-Ends, Snipper, Port Watch), que tendem a nomes mais distintivos.
+"Secure Input" collides with an already-established OS security term
+("Secure Input Mode", keyboard protection against keyloggers) that
+describes something different from what this plugin does. The name was
+also generic compared to the other plugins installed in the catalog (Radio
+Atlas, Loose Ends, Snipper, Port Watch), which lean toward more
+distinctive names.
 
-"Doorman" descreve a metáfora central do plugin sem ambiguidade: um
-processo bate à porta pedindo `sudo`, e uma pessoa — só ela, numa janela
-local — decide se deixa entrar.
+"Doorman" describes the plugin's central metaphor without ambiguity: a
+process knocks on the door asking for `sudo`, and a person — only them, in
+a local window — decides whether to let it in.
 
-## Consequência
+## Consequence
 
-O id do manifesto muda (`mauricio.secure-input` → `mauricio.doorman`), o
-que faz o Omarchy tratar isso como um plugin diferente do ponto de vista
-do layout da barra: `~/.config/omarchy/shell.json` guarda os widgets
-ativos por id, então a referência antiga precisou ser atualizada
-manualmente para o widget continuar aparecendo na topbar após a
-migração — renomear o id de um plugin não migra automaticamente sua
-posição na barra.
+The manifest id changes (`mauricio.secure-input` → `mauricio.doorman`),
+which makes Omarchy treat this as a different plugin from the bar layout's
+point of view: `~/.config/omarchy/shell.json` stores active widgets by id,
+so the old reference had to be updated by hand for the widget to keep
+showing up on the topbar after the migration — renaming a plugin's id
+doesn't automatically carry over its position on the bar.

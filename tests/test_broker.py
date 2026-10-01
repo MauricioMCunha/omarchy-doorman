@@ -61,7 +61,7 @@ class BrokerTest(unittest.TestCase):
             if self.socket_path.exists():
                 return
             time.sleep(0.02)
-        self.fail("broker não criou o socket")
+        self.fail("broker did not create the socket")
 
     def tearDown(self) -> None:
         self.process.terminate()
@@ -79,16 +79,16 @@ class BrokerTest(unittest.TestCase):
             {
                 "type": "request",
                 "pid": os.getpid(),
-                "command": "comando-ficticio",
+                "command": "fake-command",
                 "cwd": str(ROOT),
-                "tty": "teste-pty",
+                "tty": "test-pty",
                 "origin": "llm",
                 "capability": self.capability,
             },
         )
         self.assertTrue(created["ok"])
         pending = call(self.socket_path, self.token, {"type": "pending"})
-        self.assertEqual(pending["requests"][0]["command"], "comando-ficticio")
+        self.assertEqual(pending["requests"][0]["command"], "fake-command")
         approved = call(
             self.socket_path,
             self.token,
@@ -96,7 +96,7 @@ class BrokerTest(unittest.TestCase):
                 "type": "approve",
                 "request_id": created["request_id"],
                 "nonce": created["nonce"],
-                "secret": "segredo-ficticio",
+                "secret": "fake-secret",
             },
         )
         self.assertEqual(approved, {"ok": True})
@@ -107,7 +107,7 @@ class BrokerTest(unittest.TestCase):
                 "type": "approve",
                 "request_id": created["request_id"],
                 "nonce": created["nonce"],
-                "secret": "nao-deve-ser-aceito",
+                "secret": "must-not-be-accepted",
             },
         )
         self.assertFalse(replay["ok"])
@@ -139,7 +139,7 @@ class BrokerTest(unittest.TestCase):
             {
                 "type": "request",
                 "pid": os.getpid(),
-                "command": "expira",
+                "command": "expires",
                 "origin": "llm",
                 "capability": self.capability,
             },
@@ -152,7 +152,7 @@ class BrokerTest(unittest.TestCase):
                 "type": "approve",
                 "request_id": created["request_id"],
                 "nonce": created["nonce"],
-                "secret": "segredo-ficticio",
+                "secret": "fake-secret",
             },
         )
         self.assertFalse(result["ok"])
@@ -169,7 +169,7 @@ class BrokerTest(unittest.TestCase):
                     self.token,
                     {
                         "pid": os.getpid(),
-                        "command": "sudo -A teste",
+                        "command": "sudo -A test",
                         "prompt": "Password: ",
                         "origin": "llm",
                         "capability": self.capability,
@@ -194,12 +194,12 @@ class BrokerTest(unittest.TestCase):
                 "type": "approve",
                 "request_id": request["request_id"],
                 "nonce": request["nonce"],
-                "secret": "segredo-ficticio",
+                "secret": "fake-secret",
             },
         )
         self.assertEqual(approval, {"ok": True})
         thread.join(timeout=2)
-        self.assertEqual(result, {"ok": True, "secret": "segredo-ficticio"})
+        self.assertEqual(result, {"ok": True, "secret": "fake-secret"})
 
     def test_non_llm_origin_is_rejected(self) -> None:
         result = call(
@@ -212,40 +212,40 @@ class BrokerTest(unittest.TestCase):
     def test_approve_requires_correct_nonce(self) -> None:
         created = call(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "nonce-errado",
+            {"type": "request", "pid": os.getpid(), "command": "wrong-nonce",
              "origin": "llm", "capability": self.capability},
         )
         wrong = call(
             self.socket_path, self.token,
             {"type": "approve", "request_id": created["request_id"],
-             "nonce": "nonce-errado-de-proposito", "secret": "nao-deve-vazar"},
+             "nonce": "deliberately-wrong-nonce", "secret": "must-not-leak"},
         )
         self.assertFalse(wrong["ok"])
         correct = call(
             self.socket_path, self.token,
             {"type": "approve", "request_id": created["request_id"],
-             "nonce": created["nonce"], "secret": "segredo-correto"},
+             "nonce": created["nonce"], "secret": "correct-secret"},
         )
         self.assertTrue(correct["ok"])
 
     def test_idle_unauthenticated_connection_is_closed_after_handshake_timeout(self) -> None:
-        # Regressão: sem timeout no handshake, uma conexão que nunca envia
-        # dados (nem token) prendia a thread do broker para sempre — DoS
-        # local trivial, sem precisar do token, contra qualquer processo do
-        # mesmo usuário. O broker deve fechar a conexão sozinho.
+        # Regression: without a handshake timeout, a connection that never
+        # sends data (not even a token) held the broker's thread forever —
+        # a trivial local DoS, with no token needed, against any process of
+        # the same user. The broker must close the connection on its own.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.connect(str(self.socket_path))
             conn.settimeout(8.0)
             closed = conn.recv(1)
         self.assertEqual(closed, b"")
-        # O broker segue respondendo normalmente a outras conexões.
+        # The broker keeps responding normally to other connections.
         stats = call(self.socket_path, self.token, {"type": "stats"})
         self.assertTrue(stats["ok"])
 
     def test_cancel_requires_nonce(self) -> None:
         created = call(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "cancelável",
+            {"type": "request", "pid": os.getpid(), "command": "cancellable",
              "origin": "llm", "capability": self.capability},
         )
         wrong = call(
@@ -264,7 +264,7 @@ class BrokerTest(unittest.TestCase):
         for i in range(MAX_PENDING):
             result = call(
                 self.socket_path, self.token,
-                {"type": "request", "pid": os.getpid(), "command": f"pedido-{i}",
+                {"type": "request", "pid": os.getpid(), "command": f"request-{i}",
                  "origin": "llm", "capability": self.capability},
             )
             self.assertTrue(result["ok"], result)
@@ -272,12 +272,12 @@ class BrokerTest(unittest.TestCase):
 
         overflow = call(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "excedente",
+            {"type": "request", "pid": os.getpid(), "command": "overflow",
              "origin": "llm", "capability": self.capability},
         )
         self.assertEqual(overflow, {"ok": False, "error": "too_many_pending"})
 
-        # Libera um espaço; um novo pedido deve voltar a ser aceito.
+        # Frees up a slot; a new request should be accepted again.
         cancelled = call(
             self.socket_path, self.token,
             {"type": "cancel", "request_id": accepted[0]["request_id"],
@@ -286,7 +286,7 @@ class BrokerTest(unittest.TestCase):
         self.assertTrue(cancelled["ok"])
         freed = call(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "novo-espaco",
+            {"type": "request", "pid": os.getpid(), "command": "new-slot",
              "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(freed["ok"])
@@ -319,7 +319,7 @@ class BrokerTest(unittest.TestCase):
                         self.socket_path,
                         self.token,
                         {"type": "approve", "request_id": item["request_id"],
-                         "nonce": item["nonce"], "secret": "segredo-ficticio"},
+                         "nonce": item["nonce"], "secret": "fake-secret"},
                     ))
                     return
                 time.sleep(0.02)
@@ -337,13 +337,13 @@ class BrokerTest(unittest.TestCase):
         )
         thread.join(timeout=2)
         self.assertEqual(helper.returncode, 0)
-        self.assertEqual(helper.stdout, "segredo-ficticio\n")
+        self.assertEqual(helper.stdout, "fake-secret\n")
         self.assertEqual(helper.stderr, "")
 
     def test_askpass_survives_approval_slower_than_old_five_second_timeout(self) -> None:
-        # Regressão: request_secret() costumava herdar o timeout de handshake
-        # (5s) para a leitura do resultado, que só chega quando a UI decide.
-        # Uma aprovação humana real é comumente mais lenta que isso.
+        # Regression: request_secret() used to inherit the handshake timeout
+        # (5s) for reading the result, which only arrives once the UI
+        # decides. A real human approval is commonly slower than that.
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         socket_path = Path(temp.name) / "broker-slow.sock"
@@ -377,7 +377,7 @@ class BrokerTest(unittest.TestCase):
                 break
             time.sleep(0.02)
         else:
-            self.fail("broker não criou o socket")
+            self.fail("broker did not create the socket")
 
         import threading
 
@@ -390,7 +390,7 @@ class BrokerTest(unittest.TestCase):
                     self.token,
                     {
                         "pid": os.getpid(),
-                        "command": "sudo -A teste-lento",
+                        "command": "sudo -A slow-test",
                         "prompt": "Password: ",
                         "origin": "llm",
                         "capability": self.capability,
@@ -409,7 +409,7 @@ class BrokerTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertIsNotNone(request)
 
-        time.sleep(6.0)  # excede o antigo SOCKET_TIMEOUT de 5s do cliente
+        time.sleep(6.0)  # exceeds the client's old 5s SOCKET_TIMEOUT
 
         approval = call(
             socket_path,
@@ -418,23 +418,23 @@ class BrokerTest(unittest.TestCase):
                 "type": "approve",
                 "request_id": request["request_id"],
                 "nonce": request["nonce"],
-                "secret": "segredo-lento",
+                "secret": "slow-secret",
             },
         )
         self.assertEqual(approval, {"ok": True})
         thread.join(timeout=2)
-        self.assertEqual(result, {"ok": True, "secret": "segredo-lento"})
+        self.assertEqual(result, {"ok": True, "secret": "slow-secret"})
 
     def test_untrusted_caller_cannot_approve_cancel_pending_or_stats(self) -> None:
-        # Regressão: um processo com o token de sessão válido — qualquer
-        # coisa rodando como o mesmo usuário, já que os arquivos de sessão
-        # são só 0600, incluindo um agente que os leu para criar seu próprio
-        # pedido — conseguia se autoaprovar direto pelo socket, sem UI e sem
-        # humano. Confirmado manualmente antes deste fix. Aqui o broker roda
-        # com o --trusted-ui-exe padrão real ("quickshell"), que o processo
-        # de teste não é, então approve/cancel/pending/stats devem falhar
-        # mesmo com token correto; só "request" (a criação, que é o que um
-        # agente legitimamente precisa fazer) continua funcionando.
+        # Regression: a process with a valid session token — anything
+        # running as the same user, since the session files are only 0600,
+        # including an agent that read them to create its own request —
+        # could self-approve straight over the socket, with no UI and no
+        # human. Confirmed manually before this fix. Here the broker runs
+        # with the real default --trusted-ui-exe ("quickshell"), which the
+        # test process is not, so approve/cancel/pending/stats must fail
+        # even with the correct token; only "request" (creation, which is
+        # what an agent legitimately needs to do) keeps working.
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         socket_path = Path(temp.name) / "broker-untrusted.sock"
@@ -466,11 +466,11 @@ class BrokerTest(unittest.TestCase):
                 break
             time.sleep(0.02)
         else:
-            self.fail("broker não criou o socket")
+            self.fail("broker did not create the socket")
 
         created = call(
             socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "tentativa-de-autoaprovacao",
+            {"type": "request", "pid": os.getpid(), "command": "self-approval-attempt",
              "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(created["ok"], created)
@@ -479,7 +479,7 @@ class BrokerTest(unittest.TestCase):
             {"type": "pending"},
             {"type": "stats"},
             {"type": "approve", "request_id": created["request_id"],
-             "nonce": created["nonce"], "secret": "segredo-forjado"},
+             "nonce": created["nonce"], "secret": "forged-secret"},
             {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
         ):
             result = call(socket_path, self.token, message)
@@ -488,15 +488,15 @@ class BrokerTest(unittest.TestCase):
             )
 
     def test_retry_with_same_sudo_pid_is_tagged_as_new_attempt(self) -> None:
-        # sudo reinvoca o SUDO_ASKPASS (pid novo) sob o mesmo processo sudo
-        # pai quando a senha da tentativa anterior é rejeitada pelo PAM. O
-        # askpass repassa esse pid pai como "sudo_pid"; o broker usa isso só
-        # para rotular a UI ("tentativa 2"), nunca para saber se a senha
-        # estava certa. A tentativa anterior também nunca é lida de volta
-        # pelo askpass que a criou (o sudo já matou aquele processo), então
-        # o broker precisa encerrá-la sozinho quando a nova chega — senão
-        # ela ficava pendurada até expirar, e a UI podia selecionar essa
-        # entrada morta em vez da tentativa atual.
+        # sudo reinvokes SUDO_ASKPASS (a new pid) under the same parent sudo
+        # process when the previous attempt's password is rejected by PAM.
+        # askpass forwards that parent pid as "sudo_pid"; the broker only
+        # uses it to label the UI ("attempt 2"), never to know whether the
+        # password was right. The previous attempt is also never read back
+        # by the askpass that created it (sudo already killed that
+        # process), so the broker has to end it itself when the new one
+        # arrives — otherwise it would sit around until it expired, and the
+        # UI could select that dead entry instead of the current attempt.
         import threading
 
         first_result: dict[str, object] = {}
@@ -535,7 +535,7 @@ class BrokerTest(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(first_result, {"ok": False, "error": "superseded_by_retry"})
 
-        # Um sudo_pid diferente (comando não relacionado) começa do zero.
+        # A different sudo_pid (an unrelated command) starts fresh.
         unrelated = call(
             self.socket_path, self.token,
             {"type": "request", "pid": os.getpid(), "sudo_pid": 999998,
@@ -546,8 +546,8 @@ class BrokerTest(unittest.TestCase):
         by_id = {item["request_id"]: item for item in pending["requests"]}
         self.assertEqual(by_id[unrelated["request_id"]]["attempt"], 1)
 
-        # Um pedido sem sudo_pid (chamador que não manda o campo) nunca
-        # entra na correlação nem quebra o fluxo normal.
+        # A request without sudo_pid (a caller that doesn't send the field)
+        # never enters correlation and never breaks the normal flow.
         no_sudo_pid = call(
             self.socket_path, self.token,
             {"type": "request", "pid": os.getpid(),
@@ -561,7 +561,7 @@ class BrokerTest(unittest.TestCase):
     def test_stats_reports_request_lifecycle(self) -> None:
         created = call(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "métrica",
+            {"type": "request", "pid": os.getpid(), "command": "metric",
              "origin": "llm", "capability": self.capability},
         )
         call(

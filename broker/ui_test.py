@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UI de teste em terminal; usar exclusivamente com segredo fictício."""
+"""Terminal test UI; use only with a fake secret."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 try:
     from .client import call
-except ImportError:  # invocado fora do pacote, com a raiz do repo no PYTHONPATH
+except ImportError:  # invoked outside the package, with the repo root on PYTHONPATH
     from client import call
 
 
@@ -18,21 +18,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--token", required=True)
-    parser.add_argument("--fake-secret", default="teste-nao-usar-em-producao")
+    parser.add_argument("--fake-secret", default="test-do-not-use-in-production")
     args = parser.parse_args()
     response = call(args.socket, args.token, {"type": "pending"})
     requests = response.get("requests", [])
     if not requests:
-        print("nenhuma solicitação pendente")
+        print("no pending request")
         return
     item = requests[0]
-    print(f"Comando: {item['command']}")
+    print(f"Command: {item['command']}")
     print(f"PID: {item['pid']} | TTY: {item['tty']}")
-    print(f"Validade: {max(0, int(item['expires_at'] - time.time()))}s")
+    print(f"Valid for: {max(0, int(item['expires_at'] - time.time()))}s")
     secret = args.fake_secret
-    # getpass só é usado quando explicitamente solicitado para testes locais.
+    # getpass is only used when explicitly requested for local tests.
     if args.fake_secret == "__prompt__":
-        secret = getpass.getpass("Segredo fictício: ")
+        secret = getpass.getpass("Fake secret: ")
     result = call(
         args.socket,
         args.token,
@@ -43,7 +43,7 @@ def main() -> None:
             "secret": secret,
         },
     )
-    print("autorização enviada" if result.get("ok") else f"falha: {result.get('error')}")
+    print("authorization sent" if result.get("ok") else f"failed: {result.get('error')}")
 
 
 if __name__ == "__main__":

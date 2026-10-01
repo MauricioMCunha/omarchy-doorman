@@ -1,47 +1,49 @@
 # OpenSpec: doorman v0.1
 
-## Requisitos funcionais
+## Functional requirements
 
-### R1 — Pedido autenticado
+### R1 — Authenticated request
 
-O broker MUST aceitar pedidos apenas com token de sessão válido, `origin=llm`
-e capacidade correspondente. Pedidos sem PID positivo ou cujo processo não
-exista MUST ser rejeitados.
+The broker MUST accept requests only with a valid session token,
+`origin=llm`, and a matching capability. Requests with no positive PID, or
+whose process doesn't exist, MUST be rejected.
 
-### R2 — Contexto verificável
+### R2 — Verifiable context
 
-O pedido MUST exibir comando, PID, diretório, TTY, prompt, monitor, nonce e
-prazo. O broker MUST capturar e revalidar start time, UID e cmdline do PID no
-momento da aprovação, rejeitando processos encerrados ou reutilizados.
+The request MUST show the command, PID, directory, TTY, prompt, monitor,
+nonce, and deadline. The broker MUST capture and revalidate the PID's start
+time, UID, and cmdline at the moment of approval, rejecting processes that
+have exited or been reused.
 
-### R3 — Uso único e expiração
+### R3 — Single use and expiry
 
-Cada pedido MUST ter `request_id` e nonce criptograficamente aleatórios, prazo
-entre 1 e 300 segundos e estado terminal único: aprovado, cancelado ou expirado.
-Replays MUST fail closed.
+Every request MUST have a cryptographically random `request_id` and nonce,
+a deadline between 1 and 300 seconds, and a single terminal state:
+approved, cancelled, or expired. Replays MUST fail closed.
 
-### R4 — Segredo fora da superfície de observação
+### R4 — Secret outside the observation surface
 
-O segredo MUST NOT aparecer em argumentos, logs, arquivos, clipboard, respostas
-da UI ou mensagens do agente. O helper pode escrevê-lo somente em stdout para
-o consumidor `sudo askpass`.
+The secret MUST NOT appear in arguments, logs, files, clipboard, UI
+responses, or the agent's messages. The helper may write it only to stdout,
+for the `sudo askpass` consumer.
 
-### R5 — Cancelamento autenticado
+### R5 — Authenticated cancellation
 
-Cancelamento MUST exigir request id e nonce válidos. Um cancelamento inválido
-não pode alterar o pedido.
+Cancellation MUST require a valid request id and nonce. An invalid
+cancellation must not change the request.
 
-### R6 — Transporte local
+### R6 — Local transport
 
-O socket MUST ser Unix, criado com `0600`, sob diretório `0700`, e o serviço
-MUST usar `umask 0077`, `NoNewPrivileges` e diretório temporário privado.
+The socket MUST be a Unix socket, created with `0600`, under a `0700`
+directory, and the service MUST use `umask 0077`, `NoNewPrivileges`, and a
+private temporary directory.
 
-## Critérios de aceitação
+## Acceptance criteria
 
-- `python3 -m unittest discover -s tests -p 'test_*.py'` passa;
-- o diagnóstico Graphify não reporta endpoints ausentes, loops ou arestas
-  duplicadas exatas (arestas com relações distintas podem aparecer como uma
-  colisão relacional informativa);
-- testes cobrem token errado, origem inválida, PID ausente, expiração,
-  aprovação, replay e cancelamento com nonce errado/correto;
-- nenhuma alteração de deploy real ocorre sem instalação explícita do unit.
+- `python3 -m unittest discover -s tests -p 'test_*.py'` passes;
+- the Graphify diagnostic reports no missing endpoints, loops, or exact
+  duplicate edges (edges with distinct relations may show up as an
+  informative relational collision);
+- tests cover a wrong token, invalid origin, missing PID, expiry,
+  approval, replay, and cancellation with a wrong/correct nonce;
+- no real deploy change happens without explicitly installing the unit.

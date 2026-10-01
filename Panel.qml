@@ -95,8 +95,8 @@ Panel {
           width: parent.width
           leftAlign: true
           text: root.hostWidget && root.hostWidget.requests.length > 0
-            ? (root.hostWidget.requests.length + " solicitação" + (root.hostWidget.requests.length > 1 ? "ões" : "") + " · expira em " + root.hostWidget.duration(root.hostWidget.nextExpiry()))
-            : (root.hostWidget && root.hostWidget.brokerOnline ? "Nenhuma autorização pendente" : "Broker indisponível")
+            ? (root.hostWidget.requests.length + " request" + (root.hostWidget.requests.length > 1 ? "s" : "") + " · expires in " + root.hostWidget.duration(root.hostWidget.nextExpiry()))
+            : (root.hostWidget && root.hostWidget.brokerOnline ? "No pending authorization" : "Broker unavailable")
           iconText: (root.hostWidget && root.hostWidget.requests.length > 0) ? "󰀦" : ((root.hostWidget && root.hostWidget.brokerOnline) ? "󰄬" : "󰀪")
           active: root.hostWidget ? root.hostWidget.requests.length > 0 : false
           focusable: true

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Helper compatível com sudo askpass.
+"""Helper compatible with sudo's askpass.
 
-O helper imprime somente a resposta aprovada pelo broker. Nunca registra o
-valor recebido.
+The helper prints only the response approved by the broker. It never logs
+the value it received.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 try:
     from .client import request_secret
-except ImportError:  # invocado fora do pacote, com a raiz do repo no PYTHONPATH
+except ImportError:  # invoked outside the package, with the repo root on PYTHONPATH
     from client import request_secret
 
 
@@ -32,11 +32,11 @@ def main() -> int:
             token,
             {
                 "pid": os.getpid(),
-                # sudo faz exec deste script (via o wrapper bash), então o
-                # ppid aqui é o próprio processo sudo, estável durante todo
-                # o loop de passwd_tries — é o que deixa o broker correlacionar
-                # retentativas da mesma solicitação. Ver RETRY_WINDOW_SECONDS
-                # em broker.py.
+                # sudo execs this script (via the bash wrapper), so the ppid
+                # here is sudo's own process, stable for the whole
+                # passwd_tries loop — that's what lets the broker correlate
+                # retries of the same request. See RETRY_WINDOW_SECONDS in
+                # broker.py.
                 "sudo_pid": os.getppid(),
                 "command": os.environ.get("DOORMAN_COMMAND", "sudo askpass"),
                 "cwd": os.getcwd(),

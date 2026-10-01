@@ -9,7 +9,7 @@ from pathlib import Path
 
 try:
     from .client import request_secret
-except ImportError:  # execução direta pelo Process do Quickshell ou sudo askpass
+except ImportError:  # run directly by Quickshell's Process or by sudo askpass
     from client import request_secret
 
 
@@ -37,11 +37,11 @@ def main() -> int:
             token,
             {
                 "pid": os.getpid(),
-                # sudo executa este script diretamente (fork+exec); o ppid é
-                # o próprio processo sudo, estável durante todo o loop de
-                # passwd_tries. É o sinal que o broker usa para saber que
-                # duas solicitações são retentativas do mesmo comando — ver
-                # RETRY_WINDOW_SECONDS em broker.py.
+                # sudo execs this script directly (fork+exec); the ppid is
+                # sudo's own process, stable for the whole passwd_tries loop.
+                # It's the signal the broker uses to tell that two requests
+                # are retries of the same command — see RETRY_WINDOW_SECONDS
+                # in broker.py.
                 "sudo_pid": os.getppid(),
                 "command": os.environ.get("DOORMAN_COMMAND", "sudo"),
                 "cwd": os.getcwd(),

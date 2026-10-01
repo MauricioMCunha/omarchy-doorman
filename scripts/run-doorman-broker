@@ -17,7 +17,7 @@ ensure_private_secret() {
   mode="$(stat -c '%a' -- "$path")"
   owner="$(stat -c '%u' -- "$path")"
   if [[ "$mode" != "600" || "$owner" != "$(id -u)" ]]; then
-    echo "arquivo de sessão inseguro: $path" >&2
+    echo "insecure session file: $path" >&2
     exit 1
   fi
 }

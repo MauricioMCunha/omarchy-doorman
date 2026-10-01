@@ -17,10 +17,10 @@ Item {
   property int secondsRemaining: 0
   property real totalSeconds: 0
   readonly property bool expiringSoon: root.secondsRemaining > 0 && root.secondsRemaining <= 10
-  // Um "attempt" > 1 significa que o sudo rejeitou a senha da tentativa
-  // anterior e pediu de novo (ver RETRY_WINDOW_SECONDS em broker.py). O
-  // Doorman nunca valida a senha em si, só sabe que houve uma tentativa
-  // antes desta com o mesmo processo sudo pai.
+  // An "attempt" > 1 means sudo rejected the previous try's password and
+  // asked again (see RETRY_WINDOW_SECONDS in broker.py). Doorman never
+  // validates the password itself — it only knows there was an earlier
+  // attempt with the same parent sudo process.
   readonly property bool wrongPassword: !!root.request && Number(root.request.attempt || 1) > 1
   signal approved(string secret)
   signal cancelled()
@@ -98,9 +98,9 @@ Item {
     return Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
   }
 
-  // O broker pode não conhecer o monitor do processo. Nesse caso, o modal
-  // deve acompanhar o monitor que Hyprland considera focado, não o primeiro
-  // output enumerado pelo Wayland.
+  // The broker may not know the process's monitor. In that case, the modal
+  // should follow whichever monitor Hyprland considers focused, not just
+  // the first output Wayland happens to enumerate.
   readonly property var targetScreen: screenNamed(root.request ? root.request.screen : "") || fallbackScreen()
 
   Variants {
@@ -143,10 +143,10 @@ Item {
           color: Color.background
           borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
           radius: Style.cornerRadius
-          // Deslocamento imperativo via transform, não via `x`: `x` já tem
-          // um binding vindo de anchors.centerIn, e uma animação de
-          // propriedade sobrescreveria esse binding para sempre depois de
-          // rodar uma vez, descentralizando o card em qualquer resize.
+          // Imperative offset via transform, not via `x`: `x` already has
+          // a binding from anchors.centerIn, and a property animation would
+          // overwrite that binding for good after running once, off-centering
+          // the card on any resize.
           transform: Translate { id: shakeTranslate }
 
           SequentialAnimation {
@@ -197,7 +197,7 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: root.submitting ? "Aguarde" : (root.wrongPassword ? "Senha incorreta" : "Autorização segura")
+                  text: root.submitting ? "Please wait" : (root.wrongPassword ? "Wrong password" : "Secure authorization")
                   color: Color.popups.text
                   font.family: Style.font.family
                   font.pixelSize: Style.font.title
@@ -209,8 +209,8 @@ Item {
                   text: root.submitting
                     ? "WAIT " + root.waitSeconds + "s"
                     : (root.wrongPassword
-                        ? "Tentativa " + root.request.attempt + "  •  expira em " + root.secondsRemaining + "s"
-                        : "LLM local  •  expira em " + root.secondsRemaining + "s")
+                        ? "Attempt " + root.request.attempt + "  •  expires in " + root.secondsRemaining + "s"
+                        : "Local LLM  •  expires in " + root.secondsRemaining + "s")
                   color: root.submitting ? Color.accent : ((root.expiringSoon || root.wrongPassword) ? Color.urgent : Color.accent)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
@@ -246,8 +246,8 @@ Item {
               width: parent.width
               visible: !root.submitting
               text: root.wrongPassword
-                ? "A senha anterior não foi aceita pelo sistema. Revise e tente novamente."
-                : "Revise a solicitação antes de liberar esta credencial."
+                ? "The previous password wasn't accepted by the system. Review it and try again."
+                : "Review the request before releasing this credential."
               color: root.wrongPassword ? Color.urgent : Util.alpha(Color.popups.text, 0.68)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -279,7 +279,7 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: "SOLICITAÇÃO"
+                  text: "REQUEST"
                   color: Util.alpha(Color.popups.text, 0.55)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
@@ -312,7 +312,7 @@ Item {
                 Text {
                   width: parent.width
                   visible: !!root.request && (root.request.tty !== "" || root.request.pid !== "")
-                  text: root.request ? ((root.request.tty || "sessão local") +
+                  text: root.request ? ((root.request.tty || "local session") +
                                         (root.request.pid ? "   •   PID " + root.request.pid : "")) : ""
                   color: Util.alpha(Color.popups.text, 0.58)
                   font.family: Style.font.family
@@ -337,7 +337,7 @@ Item {
             Text {
               width: parent.width
               visible: root.submitting
-              text: "Processando autorização…"
+              text: "Processing authorization…"
               color: Util.alpha(Color.popups.text, 0.68)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -370,7 +370,7 @@ Item {
             Text {
               width: parent.width
               visible: !root.submitting
-              text: root.request && root.request.prompt ? root.request.prompt : "Senha"
+              text: root.request && root.request.prompt ? root.request.prompt : "Password"
               color: Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -388,7 +388,7 @@ Item {
               Keys.priority: Keys.BeforeItem
               password: true
               accent: root.wrongPassword ? Color.urgent : Color.accent
-              placeholderText: "Digite a senha nesta janela segura"
+              placeholderText: "Type the password in this secure window"
               function submitSecret() {
                 if (root.submitting) return
                 root.submitting = true
@@ -404,18 +404,18 @@ Item {
                 root.waitSeconds = 3
                 waitTimer.restart()
                 root.pendingSecret = ""
-                // Cancelamento é uma decisão explícita da pessoa. Não passe
-                // pelo dispatcher da senha: uma string vazia nunca deve ser
-                // interpretada como cancelamento implícito.
+                // Cancelling is an explicit decision by the person. Don't
+                // route it through the password dispatcher: an empty string
+                // must never be interpreted as an implicit cancel.
                 root.cancelled()
               }
               onAccepted: submitSecret()
               Keys.onPressed: function (event) {
-                // O TextInput subjacente aceita toda tecla incondicionalmente
-                // em seu próprio processamento, mesmo sem fazer nada com ela.
-                // Por isso o Escape nunca chegava ao Keys.onPressed da janela
-                // (overlayWindow): precisa ser tratado aqui, no mesmo nível
-                // já usado para o Enter, antes que o TextInput o engula.
+                // The underlying TextInput accepts every key unconditionally
+                // in its own processing, even when it does nothing with it.
+                // That's why Escape never reached overlayWindow's own
+                // Keys.onPressed: it has to be handled here, at the same
+                // level already used for Enter, before TextInput swallows it.
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                   submitSecret()
                   event.accepted = true
@@ -430,7 +430,7 @@ Item {
             Text {
               width: parent.width
               visible: !root.submitting
-              text: "Enter  autoriza    ·    Esc  cancela"
+              text: "Enter  authorizes    ·    Esc  cancels"
               color: Util.alpha(Color.popups.text, 0.56)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption

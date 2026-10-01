@@ -23,10 +23,10 @@ BarWidget {
   property string pendingApprovalSecret: ""
   property string approvalRequestId: ""
   property string approvalNonce: ""
-  // Id do toast atual (0 = nenhum). Uma retentativa troca o request_id
-  // (dedupado por NotifyState), mas ainda é a mesma fila de notificação
-  // visual — reenviar com -r <id> atualiza o toast existente em vez de
-  // empilhar um segundo, obsoleto, ao lado dele.
+  // Id of the current toast (0 = none). A retry changes the request_id
+  // (deduped by NotifyState), but it's still the same visual notification
+  // slot — resending with -r <id> updates the existing toast instead of
+  // stacking a second, stale one next to it.
   property int notificationId: 0
   readonly property string commercialName: "Doorman"
 
@@ -57,15 +57,15 @@ BarWidget {
     }
     NotifyState.forgetExcept(seen)
     if (fresh.length === 0 || notifyProc.running) return
-    // O título fica fixo mesmo numa retentativa: omarchy-notification-dismiss
-    // casa por título, e é ele quem fecha o toast quando a fila esvazia.
-    var title = fresh.length === 1 ? "Autorização pendente" : (fresh.length + " autorizações pendentes")
+    // The title stays fixed even on a retry: omarchy-notification-dismiss
+    // matches by title, and it's what closes the toast once the queue empties.
+    var title = fresh.length === 1 ? "Authorization pending" : (fresh.length + " authorizations pending")
     var body
     if (fresh.length === 1) {
       var item = fresh[0]
       var retry = Number(item.attempt || 1) > 1
-      body = (retry ? "Senha incorreta — tentativa " + item.attempt + "  ·  " : "") +
-        (item.command || "sudo") + "  ·  expira em " + Math.max(0, Math.floor(item.expires_at - Date.now() / 1000)) + "s"
+      body = (retry ? "Wrong password — attempt " + item.attempt + "  ·  " : "") +
+        (item.command || "sudo") + "  ·  expires in " + Math.max(0, Math.floor(item.expires_at - Date.now() / 1000)) + "s"
     } else {
       body = fresh.map(function (item) { return item.command || "sudo" }).join(", ")
     }
@@ -130,7 +130,7 @@ BarWidget {
           root.requests = value.requests || []
           root.notifyNewRequests(root.requests)
           if (hadPending && root.requests.length === 0 && !dismissNotifyProc.running) {
-            dismissNotifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-dismiss", "Autorização pendente"]
+            dismissNotifyProc.command = ["/usr/share/omarchy/bin/omarchy-notification-dismiss", "Authorization pending"]
             dismissNotifyProc.running = true
             root.notificationId = 0
           }

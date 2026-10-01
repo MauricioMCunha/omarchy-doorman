@@ -35,7 +35,7 @@ case "${1:-}" in
 esac
 
 [[ -x "$askpass" || -f "$askpass" ]] || {
-  echo "doorman: askpass não está instalado em $askpass" >&2
+  echo "doorman: askpass is not installed at $askpass" >&2
   exit 1
 }
 

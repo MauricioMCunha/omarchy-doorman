@@ -1,1 +1,1 @@
-"""Testes do Omarchy Plugins Lab."""
+"""Doorman tests."""

@@ -1,11 +1,11 @@
 .pragma library
 
-// Estado compartilhado dentro do processo do Quickshell. O widget do topbar
-// roda uma instância por monitor conectado, todas lendo o mesmo broker; sem
-// isso, cada instância notificaria o mesmo pedido, duplicando a notificação
-// uma vez por monitor. `.pragma library` faz este módulo ser um singleton
-// por engine QML, compartilhado entre as instâncias — ao contrário de estado
-// declarado dentro do próprio Panel.qml, que é por instância.
+// State shared within the Quickshell process. The topbar widget runs one
+// instance per connected monitor, all reading the same broker; without
+// this, each instance would notify the same request, duplicating the
+// notification once per monitor. `.pragma library` makes this module a
+// singleton per QML engine, shared across instances — unlike state declared
+// inside Panel.qml itself, which is per-instance.
 var claimed = ({})
 
 function claimOnce(requestId) {
@@ -14,9 +14,9 @@ function claimOnce(requestId) {
   return true
 }
 
-// Chamado por qualquer instância a cada poll para esquecer pedidos que já
-// saíram da lista do broker (aprovados/cancelados/expirados), senão o
-// conjunto cresce sem limite pela vida do processo do Quickshell.
+// Called by any instance on every poll to forget requests that already left
+// the broker's list (approved/cancelled/expired), or the set would grow
+// without bound for the lifetime of the Quickshell process.
 function forgetExcept(currentIds) {
   for (var id in claimed) {
     if (!currentIds[id]) delete claimed[id]
