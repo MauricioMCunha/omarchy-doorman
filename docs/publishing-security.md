@@ -52,4 +52,18 @@ do projeto e deve acompanhar qualquer submissão.
    localmente (mesma máquina onde já se testa o plugin) e fica documentado
    no README como passo antes de enviar uma mudança de QML.
 
+6. ~~Passar em `omarchy plugin validate <pasta>` — o validador oficial de
+   manifesto/estrutura do catálogo.~~ Feito em 2026-10-01: a extração via
+   `git filter-repo` carregou `broker/client.py` e `broker/bridge.py` como
+   symlinks (apontando pra `../client.py`/`../bridge.py`, um padrão que já
+   existia no monorepo original). `omarchy plugin validate` rejeita qualquer
+   symlink dentro da pasta do plugin — e como `omarchy plugin add` instala a
+   partir da raiz do repositório git, essa raiz inteira é "a pasta do
+   plugin". Corrigido: `broker/askpass.py` e `broker/ui_test.py` agora
+   importam `client` (import absoluto, via o fallback que `askpass.py` da
+   raiz já usava) em vez de `.client` (relativo, que exigia o symlink);
+   `broker/bridge.py` nunca era importado por nada dentro de `broker/` e foi
+   apenas removido. Sem mais symlinks na árvore; `omarchy plugin validate`
+   passa limpo.
+
 Não submeter enquanto qualquer blocker acima estiver aberto.

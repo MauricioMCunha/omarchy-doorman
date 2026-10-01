@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from broker.client import call, request_secret  # noqa: E402
+from client import call, request_secret  # noqa: E402
 from broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
 # approve/cancel/pending/stats now require the caller (or its near ancestry)

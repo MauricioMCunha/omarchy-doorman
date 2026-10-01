@@ -8,7 +8,10 @@ import getpass
 import time
 from pathlib import Path
 
-from .client import call
+try:
+    from .client import call
+except ImportError:  # invocado fora do pacote, com a raiz do repo no PYTHONPATH
+    from client import call
 
 
 def main() -> None:

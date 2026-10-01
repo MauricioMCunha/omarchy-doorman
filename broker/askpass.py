@@ -12,7 +12,10 @@ import os
 import sys
 from pathlib import Path
 
-from .client import request_secret
+try:
+    from .client import request_secret
+except ImportError:  # invocado fora do pacote, com a raiz do repo no PYTHONPATH
+    from client import request_secret
 
 
 def main() -> int:
