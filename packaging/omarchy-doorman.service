@@ -5,8 +5,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/mauriciocunha/DEV/omarchy-plugins
-ExecStart=/home/mauriciocunha/DEV/omarchy-plugins/scripts/run-doorman-broker
+WorkingDirectory=/home/mauriciocunha/DEV/omarchy-doorman
+ExecStart=/home/mauriciocunha/DEV/omarchy-doorman/scripts/run-doorman-broker
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
