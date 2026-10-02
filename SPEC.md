@@ -89,12 +89,13 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
 ### 4.1 In scope
 
 - A malicious or buggy **background agent process** that can set arbitrary
-  metadata (command string, cwd, tty), can read the broker's public
-  responses, and — this was wrong in an earlier draft of this document —
-  *does* have the session token and capability: they live in files under
-  the same UID the agent runs as, exactly like the UI reads them. What the
-  agent cannot do is act as the trusted UI (§6.8) or read the human's
-  keystrokes into the modal.
+  *display* metadata (command string, cwd, tty), can read the broker's
+  public responses, and — this was wrong in an earlier draft of this
+  document — *does* have the session token and capability: they live in
+  files under the same UID the agent runs as, exactly like the UI reads
+  them. What the agent cannot do is claim a `pid` other than its own real
+  one (§6.1), act as the trusted UI (§6.9), or read the human's keystrokes
+  into the modal.
 - **Process identity drift**: the PID a request was opened for exits and is
   reused by an unrelated process before the human approves.
 - **Local resource exhaustion**: another process on the same machine (with
@@ -168,6 +169,7 @@ or, without a second response (connection closes immediately):
 
 ```jsonc
 {"ok": false, "error": "invalid_pid"}          // pid missing or <= 0
+{"ok": false, "error": "pid_mismatch"}         // claimed pid isn't this connection's real peer — see §6.1
 {"ok": false, "error": "process_not_found"}    // /proc/<pid> unreadable or gone
 {"ok": false, "error": "invalid_llm_origin"}   // origin != "llm" or capability mismatch
 {"ok": false, "error": "too_many_pending"}     // MAX_PENDING (20) already open
@@ -236,7 +238,22 @@ the request was correlated to an earlier one via `sudo_pid` (§6.10).
 
 ## 6. Security properties and their rationale
 
-### 6.1 Process identity is re-checked at approval, not just at request time
+### 6.1 Process identity is authenticated at request time, then re-checked at approval
+
+The `pid` field in a `request` message (§5.1) is attacker-controlled input —
+an agent holding the normal `origin=llm` token/capability could otherwise
+claim to be any PID that happens to exist, not even a real sudo/askpass
+process, display a convincing `command`, get a human to approve it, and
+receive the secret itself back on its own connection, since the response
+always goes to whoever is actually connected, never to the claimed pid.
+`_create_request` closes this before doing anything else with the claim: it
+reads the connection's real peer via `SO_PEERCRED` (kernel-verified, not
+something the remote process can forge — the same primitive §6.9 uses for
+the trusted-UI check) and rejects with `pid_mismatch` unless that peer's
+pid equals the claimed `pid` and its uid equals the broker's own. This
+changes nothing for the legitimate flow: askpass.py reports `os.getpid()`,
+its own real pid, so the claim and the connection's real identity are
+always the same process to begin with.
 
 `_process_identity(pid)` reads `/proc/<pid>/stat` (start time, field 22 by
 position after the last `)`, to survive process names containing spaces or

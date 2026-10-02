@@ -195,6 +195,22 @@ class Broker:
         if pid is None:
             self._send(conn, {"ok": False, "error": "invalid_pid"})
             return
+        # The "pid" field above is self-reported in the message payload — an
+        # agent holding the normal request token/capability could otherwise
+        # claim to be any PID that happens to exist (not even a real sudo
+        # process), get a human to approve what looks like a legitimate
+        # request for it, and receive the secret itself on this very
+        # connection, since the response goes back over whoever is actually
+        # connected, not over the claimed pid. Requiring the kernel-verified
+        # peer of this connection to equal the claimed pid closes that: the
+        # only process that can ever receive the secret for a given pid is
+        # that pid's own connection. This is exactly what askpass.py already
+        # does (it reports os.getpid(), its own real pid), so it changes
+        # nothing for the legitimate flow.
+        creds = self._peer_credentials(conn)
+        if creds is None or creds[1] != os.getuid() or creds[0] != pid:
+            self._send(conn, {"ok": False, "error": "pid_mismatch"})
+            return
         identity = self._process_identity(pid)
         if identity is None:
             self._send(conn, {"ok": False, "error": "process_not_found"})
@@ -355,13 +371,26 @@ class Broker:
             return None
         return pid if pid > 0 else None
 
-    def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
+    @staticmethod
+    def _peer_credentials(conn: socket.socket) -> tuple[int, int] | None:
+        # Verified by the kernel from the process that called connect(); not
+        # something the remote process can forge, unlike anything carried in
+        # the message payload itself (see _create_request's pid check).
         try:
             creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         except OSError:
-            return False
+            return None
         pid, uid, _gid = struct.unpack("3i", creds)
-        if pid <= 0 or uid != os.getuid():
+        if pid <= 0:
+            return None
+        return pid, uid
+
+    def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
+        creds = self._peer_credentials(conn)
+        if creds is None:
+            return False
+        pid, uid = creds
+        if uid != os.getuid():
             return False
         for _ in range(_TRUSTED_UI_MAX_HOPS):
             info = self._process_ppid_and_comm(pid)

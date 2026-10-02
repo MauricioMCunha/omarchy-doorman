@@ -298,6 +298,23 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": False, "error": "invalid_pid"})
 
+    def test_request_claiming_a_different_real_pid_is_rejected(self) -> None:
+        # Security review finding: a requester holding the normal request
+        # token/capability could claim any PID that happens to exist (not
+        # even a real sudo process) instead of its own, get a human to
+        # approve what looked like a legitimate request for it, and receive
+        # the secret itself on its own connection — the response always goes
+        # back over whoever is actually connected, never over the claimed
+        # pid. pid 1 (init/systemd) always exists and is never this test
+        # process, so this is exactly that attack. Must be rejected before
+        # ever reaching process-identity lookups.
+        result = call(
+            self.socket_path, self.token,
+            {"type": "request", "pid": 1, "command": "impersonation-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "pid_mismatch"})
+
     def test_askpass_helper_prints_only_approved_secret(self) -> None:
         import os
 
