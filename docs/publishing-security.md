@@ -76,4 +76,20 @@ project and has to go along with any submission.
    imported by anything inside `broker/` and was simply removed. No more
    symlinks in the tree; `omarchy plugin validate` passes clean.
 
+7. ~~Address the marketplace maintainer's security review finding on issue
+   [#9558](https://github.com/omacom/omarchy-plugin-marketplace/issues/9558).~~
+   Done on 2026-10-02: HANCORE-linux found that `_create_request` trusted
+   the self-reported `pid` field in a `request` message with no check that
+   it matched who was actually connected — a requester holding the normal
+   `origin=llm` token/capability could claim any PID that happened to
+   exist, get a human to approve what looked like a legitimate request for
+   it, and receive the secret itself on its own connection. Fixed by
+   binding the claimed `pid` to the connection's real peer via
+   `SO_PEERCRED` (see SPEC.md §6.1), rejecting a mismatch with a new
+   `pid_mismatch` error. Regression test added (`tests/test_broker.py`,
+   claiming PID 1); verified live against the running broker, not just the
+   test suite. This was explicitly a **partial** review — the maintainer's
+   note: "the complete source review is still outstanding" — so more
+   findings may still come back on this same issue.
+
 Don't submit while any blocker above is still open.
