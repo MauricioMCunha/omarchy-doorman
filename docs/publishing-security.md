@@ -91,5 +91,23 @@ project and has to go along with any submission.
    test suite. This was explicitly a **partial** review — the maintainer's
    note: "the complete source review is still outstanding" — so more
    findings may still come back on this same issue.
+8. ~~Address HANCORE-linux's follow-up on the same issue: `pid_mismatch`
+   closed claiming someone else's pid, but not a requester reporting its
+   own real one.~~ Done on 2026-10-02: an agent could still skip sudo
+   entirely, connect directly with its own truthful identity and a
+   convincing `command`, and receive the password itself once a human
+   approved what looked like a legitimate request — exactly the gap the
+   README's "the password never reaches the agent" promise exists to
+   close. Fixed by also requiring the connecting peer's immediate parent
+   process to be a real `sudo` (`comm == "sudo"`, one hop, the same
+   `/proc` primitive §6.9 already used for the trusted-UI check — see
+   SPEC.md §6.1), rejecting otherwise with a new `not_sudo_child` error.
+   Required reworking most of the test suite's request-creation calls to
+   run from real subprocesses instead of the test process itself or a
+   thread, since the check needs a genuine parent/child relationship to
+   verify. Verified live: a direct, non-sudo-spawned connection reporting
+   its own genuine pid is rejected with `not_sudo_child`; a real `sudo`
+   round trip through a diagnostic askpass stand-in and through the actual
+   wrapper both still work end to end. Still only a partial review.
 
 Don't submit while any blocker above is still open.

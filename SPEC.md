@@ -94,8 +94,9 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
   document — *does* have the session token and capability: they live in
   files under the same UID the agent runs as, exactly like the UI reads
   them. What the agent cannot do is claim a `pid` other than its own real
-  one (§6.1), act as the trusted UI (§6.9), or read the human's keystrokes
-  into the modal.
+  one, or create a request at all without a real sudo process as its
+  connection's immediate parent (§6.1), act as the trusted UI (§6.9), or
+  read the human's keystrokes into the modal.
 - **Process identity drift**: the PID a request was opened for exits and is
   reused by an unrelated process before the human approves.
 - **Local resource exhaustion**: another process on the same machine (with
@@ -170,6 +171,7 @@ or, without a second response (connection closes immediately):
 ```jsonc
 {"ok": false, "error": "invalid_pid"}          // pid missing or <= 0
 {"ok": false, "error": "pid_mismatch"}         // claimed pid isn't this connection's real peer — see §6.1
+{"ok": false, "error": "not_sudo_child"}       // peer's parent process isn't sudo — see §6.1
 {"ok": false, "error": "process_not_found"}    // /proc/<pid> unreadable or gone
 {"ok": false, "error": "invalid_llm_origin"}   // origin != "llm" or capability mismatch
 {"ok": false, "error": "too_many_pending"}     // MAX_PENDING (20) already open
@@ -254,6 +256,21 @@ pid equals the claimed `pid` and its uid equals the broker's own. This
 changes nothing for the legitimate flow: askpass.py reports `os.getpid()`,
 its own real pid, so the claim and the connection's real identity are
 always the same process to begin with.
+
+That still leaves the actual case a maintainer's security review flagged
+on the marketplace submission (issue #9558): `pid_mismatch` only stops
+claiming someone *else's* pid — a requester connecting directly and
+reporting its own real pid passed it. Nothing bound the request to a
+genuine sudo/askpass chain, so an agent could skip sudo entirely, connect
+with its own truthful identity and a convincing `command`, and receive the
+password itself once a human approved what looked like a legitimate
+request. `_create_request` also requires the connecting peer's immediate
+parent process to have `comm == "sudo"` (`_peer_is_sudo_child`, same
+`/proc/<pid>/comm` primitive as §6.9, one hop only — sudo forks and execs
+the askpass helper directly, with no shell in between), rejecting with
+`not_sudo_child` otherwise. The only process that can ever receive a
+secret for a given pid is now the process sudo itself just spawned to ask
+for one.
 
 `_process_identity(pid)` reads `/proc/<pid>/stat` (start time, field 22 by
 position after the last `)`, to survive process names containing spaces or

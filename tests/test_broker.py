@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -29,6 +30,80 @@ from broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 # "quickshell" to simulate a trusted caller.
 TEST_TRUSTED_UI_EXE = Path("/proc/self/comm").read_text(encoding="utf-8").strip()
 
+# Broker._peer_is_sudo_child similarly requires a "request" message's
+# connecting peer to have this process's own comm as its immediate parent
+# (standing in for the real sudo), instead of the literal "sudo" it expects
+# in production — same reasoning as TEST_TRUSTED_UI_EXE above, same value.
+TEST_TRUSTED_SUDO_EXE = TEST_TRUSTED_UI_EXE
+
+# Calling the client directly from this test process would make the
+# process's own parent (whatever launched the test runner, not something
+# tests control) the "request" peer's parent — not this test process, which
+# is what the brokers below are told to trust via --trusted-sudo-exe. So
+# every "request" that must succeed is made from a short-lived subprocess
+# instead: its parent is this test process, and the helper fills in its own
+# real pid, exactly like askpass.py already does with os.getpid().
+_SUBPROCESS_CALL_CODE = (
+    "import json, os, sys\n"
+    "from client import call\n"
+    "payload = json.loads(sys.argv[3])\n"
+    "if payload.get('type') == 'request': payload['pid'] = os.getpid()\n"
+    "print(json.dumps(call(sys.argv[1], sys.argv[2], payload)))\n"
+)
+_SUBPROCESS_REQUEST_SECRET_CODE = (
+    "import json, os, sys\n"
+    "from client import request_secret\n"
+    "payload = json.loads(sys.argv[3])\n"
+    "payload['pid'] = os.getpid()\n"
+    "print(json.dumps(request_secret(sys.argv[1], sys.argv[2], payload)))\n"
+)
+
+
+def _call_as_subprocess(socket_path: Path, token: str, payload: dict) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", _SUBPROCESS_CALL_CODE, str(socket_path), token, json.dumps(payload)],
+        cwd=ROOT, capture_output=True, text=True, timeout=15, check=False,
+    )
+    return json.loads(proc.stdout)
+
+
+def _request_secret_subprocess(socket_path: Path, token: str, payload: dict) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _SUBPROCESS_REQUEST_SECRET_CODE, str(socket_path), token, json.dumps(payload)],
+        cwd=ROOT, stdout=subprocess.PIPE, text=True,
+    )
+
+
+# Like _call_as_subprocess, but for a test that approves what it created:
+# _approve() re-validates the claimed pid's process identity (§6.1), so that
+# process has to still be alive when approval happens, not just when the
+# request was created — _call_as_subprocess's subprocess has already exited
+# by then. Writes the "accepted" response as soon as it arrives (so the
+# caller can read request_id/nonce immediately) then keeps the connection
+# — and so the process — open until a final decision arrives, writing that
+# as a second line.
+_SUBPROCESS_REQUEST_AND_HOLD_CODE = (
+    "import json, os, socket, sys\n"
+    "payload = json.loads(sys.argv[3]); payload['pid'] = os.getpid()\n"
+    "msg = {'token': sys.argv[2], 'type': 'request', **payload}\n"
+    "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
+    "    conn.connect(sys.argv[1])\n"
+    "    conn.sendall((json.dumps(msg) + chr(10)).encode())\n"
+    "    reader = conn.makefile('rb')\n"
+    "    for _ in range(2):\n"
+    "        line = reader.readline()\n"
+    "        if not line: break\n"
+    "        sys.stdout.write(line.decode()); sys.stdout.flush()\n"
+)
+
+
+def _request_and_hold(socket_path: Path, token: str, payload: dict) -> tuple[dict, subprocess.Popen]:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SUBPROCESS_REQUEST_AND_HOLD_CODE, str(socket_path), token, json.dumps(payload)],
+        cwd=ROOT, stdout=subprocess.PIPE, text=True,
+    )
+    return json.loads(proc.stdout.readline()), proc
+
 
 class BrokerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -51,6 +126,8 @@ class BrokerTest(unittest.TestCase):
                 "2",
                 "--trusted-ui-exe",
                 TEST_TRUSTED_UI_EXE,
+                "--trusted-sudo-exe",
+                TEST_TRUSTED_SUDO_EXE,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -73,12 +150,10 @@ class BrokerTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_request_approve_is_single_use(self) -> None:
-        created = call(
+        created, holder = _request_and_hold(
             self.socket_path,
             self.token,
             {
-                "type": "request",
-                "pid": os.getpid(),
                 "command": "fake-command",
                 "cwd": str(ROOT),
                 "tty": "test-pty",
@@ -86,6 +161,8 @@ class BrokerTest(unittest.TestCase):
                 "capability": self.capability,
             },
         )
+        self.addCleanup(lambda: holder.stdout and holder.stdout.close())
+        self.addCleanup(holder.wait, timeout=2)
         self.assertTrue(created["ok"])
         pending = call(self.socket_path, self.token, {"type": "pending"})
         self.assertEqual(pending["requests"][0]["command"], "fake-command")
@@ -133,12 +210,11 @@ class BrokerTest(unittest.TestCase):
             self.assertFalse(Broker._identity_matches(request))
 
     def test_expired_request_is_rejected(self) -> None:
-        created = call(
+        created = _call_as_subprocess(
             self.socket_path,
             self.token,
             {
                 "type": "request",
-                "pid": os.getpid(),
                 "command": "expires",
                 "origin": "llm",
                 "capability": self.capability,
@@ -158,27 +234,18 @@ class BrokerTest(unittest.TestCase):
         self.assertFalse(result["ok"])
 
     def test_askpass_like_request_receives_secret_after_ui_approval(self) -> None:
-        import threading
-
-        result: dict[str, object] = {}
-
-        def askpass() -> None:
-            result.update(
-                request_secret(
-                    self.socket_path,
-                    self.token,
-                    {
-                        "pid": os.getpid(),
-                        "command": "sudo -A test",
-                        "prompt": "Password: ",
-                        "origin": "llm",
-                        "capability": self.capability,
-                    },
-                )
-            )
-
-        thread = threading.Thread(target=askpass)
-        thread.start()
+        askpass = _request_secret_subprocess(
+            self.socket_path,
+            self.token,
+            {
+                "command": "sudo -A test",
+                "prompt": "Password: ",
+                "origin": "llm",
+                "capability": self.capability,
+            },
+        )
+        self.addCleanup(lambda: askpass.stdout and askpass.stdout.close())
+        self.addCleanup(askpass.wait, timeout=2)
         request = None
         for _ in range(50):
             pending = call(self.socket_path, self.token, {"type": "pending"})
@@ -198,8 +265,8 @@ class BrokerTest(unittest.TestCase):
             },
         )
         self.assertEqual(approval, {"ok": True})
-        thread.join(timeout=2)
-        self.assertEqual(result, {"ok": True, "secret": "fake-secret"})
+        stdout, _ = askpass.communicate(timeout=2)
+        self.assertEqual(json.loads(stdout), {"ok": True, "secret": "fake-secret"})
 
     def test_non_llm_origin_is_rejected(self) -> None:
         result = call(
@@ -210,11 +277,13 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(result, {"ok": False, "error": "invalid_llm_origin"})
 
     def test_approve_requires_correct_nonce(self) -> None:
-        created = call(
+        created, holder = _request_and_hold(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "wrong-nonce",
+            {"command": "wrong-nonce",
              "origin": "llm", "capability": self.capability},
         )
+        self.addCleanup(lambda: holder.stdout and holder.stdout.close())
+        self.addCleanup(holder.wait, timeout=2)
         wrong = call(
             self.socket_path, self.token,
             {"type": "approve", "request_id": created["request_id"],
@@ -243,9 +312,9 @@ class BrokerTest(unittest.TestCase):
         self.assertTrue(stats["ok"])
 
     def test_cancel_requires_nonce(self) -> None:
-        created = call(
+        created = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "cancellable",
+            {"type": "request", "command": "cancellable",
              "origin": "llm", "capability": self.capability},
         )
         wrong = call(
@@ -262,17 +331,17 @@ class BrokerTest(unittest.TestCase):
     def test_broker_rejects_requests_beyond_max_pending(self) -> None:
         accepted = []
         for i in range(MAX_PENDING):
-            result = call(
+            result = _call_as_subprocess(
                 self.socket_path, self.token,
-                {"type": "request", "pid": os.getpid(), "command": f"request-{i}",
+                {"type": "request", "command": f"request-{i}",
                  "origin": "llm", "capability": self.capability},
             )
             self.assertTrue(result["ok"], result)
             accepted.append(result)
 
-        overflow = call(
+        overflow = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "overflow",
+            {"type": "request", "command": "overflow",
              "origin": "llm", "capability": self.capability},
         )
         self.assertEqual(overflow, {"ok": False, "error": "too_many_pending"})
@@ -284,9 +353,9 @@ class BrokerTest(unittest.TestCase):
              "nonce": accepted[0]["nonce"]},
         )
         self.assertTrue(cancelled["ok"])
-        freed = call(
+        freed = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "new-slot",
+            {"type": "request", "command": "new-slot",
              "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(freed["ok"])
@@ -314,6 +383,48 @@ class BrokerTest(unittest.TestCase):
              "origin": "llm", "capability": self.capability},
         )
         self.assertEqual(result, {"ok": False, "error": "pid_mismatch"})
+
+    def test_request_from_non_sudo_parent_is_rejected(self) -> None:
+        # Security review follow-up (issue #9558): pid_mismatch alone only
+        # stops claiming someone else's pid. A requester reporting its own
+        # real pid passed that check — this is the actual case the reviewer
+        # flagged, since it's exactly what a compromised agent would do: no
+        # spoofing needed, just connect directly instead of going through a
+        # real sudo/askpass chain. This broker, unlike self.process, gets no
+        # --trusted-sudo-exe override, so it requires the real "sudo" as the
+        # peer's parent — which this test's subprocess, spawned directly by
+        # the test process, never has, even though its own identity
+        # (pid/start_time/cmdline/uid) is entirely genuine.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-no-sudo-parent.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        result = _call_as_subprocess(
+            socket_path, self.token,
+            {"type": "request", "command": "direct-connect-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "not_sudo_child"})
 
     def test_askpass_helper_prints_only_approved_secret(self) -> None:
         import os
@@ -379,6 +490,8 @@ class BrokerTest(unittest.TestCase):
                 "20",
                 "--trusted-ui-exe",
                 TEST_TRUSTED_UI_EXE,
+                "--trusted-sudo-exe",
+                TEST_TRUSTED_SUDO_EXE,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -396,27 +509,18 @@ class BrokerTest(unittest.TestCase):
         else:
             self.fail("broker did not create the socket")
 
-        import threading
-
-        result: dict[str, object] = {}
-
-        def askpass() -> None:
-            result.update(
-                request_secret(
-                    socket_path,
-                    self.token,
-                    {
-                        "pid": os.getpid(),
-                        "command": "sudo -A slow-test",
-                        "prompt": "Password: ",
-                        "origin": "llm",
-                        "capability": self.capability,
-                    },
-                )
-            )
-
-        thread = threading.Thread(target=askpass)
-        thread.start()
+        askpass = _request_secret_subprocess(
+            socket_path,
+            self.token,
+            {
+                "command": "sudo -A slow-test",
+                "prompt": "Password: ",
+                "origin": "llm",
+                "capability": self.capability,
+            },
+        )
+        self.addCleanup(lambda: askpass.stdout and askpass.stdout.close())
+        self.addCleanup(askpass.wait, timeout=2)
         request = None
         for _ in range(50):
             pending = call(socket_path, self.token, {"type": "pending"})
@@ -439,8 +543,8 @@ class BrokerTest(unittest.TestCase):
             },
         )
         self.assertEqual(approval, {"ok": True})
-        thread.join(timeout=2)
-        self.assertEqual(result, {"ok": True, "secret": "slow-secret"})
+        stdout, _ = askpass.communicate(timeout=2)
+        self.assertEqual(json.loads(stdout), {"ok": True, "secret": "slow-secret"})
 
     def test_untrusted_caller_cannot_approve_cancel_pending_or_stats(self) -> None:
         # Regression: a process with a valid session token — anything
@@ -468,6 +572,14 @@ class BrokerTest(unittest.TestCase):
                 self.capability,
                 "--timeout",
                 "2",
+                # Deliberately no --trusted-ui-exe override: this test needs
+                # the real default ("quickshell"), which the test process is
+                # not, to confirm the untrusted-caller rejection below.
+                # --trusted-sudo-exe is unrelated to that and still needs
+                # overriding, or even the legitimate "request" creation a
+                # few lines down would fail.
+                "--trusted-sudo-exe",
+                TEST_TRUSTED_SUDO_EXE,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -485,9 +597,9 @@ class BrokerTest(unittest.TestCase):
         else:
             self.fail("broker did not create the socket")
 
-        created = call(
+        created = _call_as_subprocess(
             socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "self-approval-attempt",
+            {"type": "request", "command": "self-approval-attempt",
              "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(created["ok"], created)
@@ -514,21 +626,13 @@ class BrokerTest(unittest.TestCase):
         # process), so the broker has to end it itself when the new one
         # arrives — otherwise it would sit around until it expired, and the
         # UI could select that dead entry instead of the current attempt.
-        import threading
-
-        first_result: dict[str, object] = {}
-
-        def first_askpass() -> None:
-            first_result.update(
-                request_secret(
-                    self.socket_path, self.token,
-                    {"pid": os.getpid(), "sudo_pid": 999999, "command": "sudo -A id",
-                     "origin": "llm", "capability": self.capability},
-                )
-            )
-
-        thread = threading.Thread(target=first_askpass)
-        thread.start()
+        first_askpass = _request_secret_subprocess(
+            self.socket_path, self.token,
+            {"sudo_pid": 999999, "command": "sudo -A id",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.addCleanup(lambda: first_askpass.stdout and first_askpass.stdout.close())
+        self.addCleanup(first_askpass.wait, timeout=2)
         pending = None
         for _ in range(50):
             pending = call(self.socket_path, self.token, {"type": "pending"})
@@ -538,9 +642,9 @@ class BrokerTest(unittest.TestCase):
         self.assertTrue(pending and pending["requests"], pending)
         self.assertEqual(pending["requests"][0]["attempt"], 1)
 
-        second = call(
+        second = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "sudo_pid": 999999,
+            {"type": "request", "sudo_pid": 999999,
              "command": "sudo -A id", "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(second["ok"], second)
@@ -549,13 +653,13 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(pending["requests"][0]["attempt"], 2)
         self.assertEqual(pending["requests"][0]["request_id"], second["request_id"])
 
-        thread.join(timeout=2)
-        self.assertEqual(first_result, {"ok": False, "error": "superseded_by_retry"})
+        first_stdout, _ = first_askpass.communicate(timeout=2)
+        self.assertEqual(json.loads(first_stdout), {"ok": False, "error": "superseded_by_retry"})
 
         # A different sudo_pid (an unrelated command) starts fresh.
-        unrelated = call(
+        unrelated = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "sudo_pid": 999998,
+            {"type": "request", "sudo_pid": 999998,
              "command": "sudo -A whoami", "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(unrelated["ok"], unrelated)
@@ -565,9 +669,9 @@ class BrokerTest(unittest.TestCase):
 
         # A request without sudo_pid (a caller that doesn't send the field)
         # never enters correlation and never breaks the normal flow.
-        no_sudo_pid = call(
+        no_sudo_pid = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(),
+            {"type": "request",
              "command": "sudo -A ls", "origin": "llm", "capability": self.capability},
         )
         self.assertTrue(no_sudo_pid["ok"], no_sudo_pid)
@@ -576,9 +680,9 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(by_id[no_sudo_pid["request_id"]]["attempt"], 1)
 
     def test_stats_reports_request_lifecycle(self) -> None:
-        created = call(
+        created = _call_as_subprocess(
             self.socket_path, self.token,
-            {"type": "request", "pid": os.getpid(), "command": "metric",
+            {"type": "request", "command": "metric",
              "origin": "llm", "capability": self.capability},
         )
         call(

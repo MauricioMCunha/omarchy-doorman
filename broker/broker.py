@@ -35,6 +35,11 @@ MAX_PENDING = 20
 # approve/cancel/list requests. Configurable only for tests — in production
 # it's always the real Quickshell. See Broker._peer_is_trusted_ui.
 DEFAULT_TRUSTED_UI_EXE = "quickshell"
+# Process name (/proc/<pid>/comm) a request's connecting peer's immediate
+# parent must have for the request to be accepted at all. Configurable only
+# for tests — in production it's always the real sudo. See
+# Broker._peer_is_sudo_child.
+DEFAULT_TRUSTED_SUDO_EXE = "sudo"
 # How many extra parent-process hops, beyond the caller itself, the broker
 # follows while looking for the trusted executable (bridge.py runs as a
 # direct child of Quickshell — 1 hop is enough in practice; the slack covers
@@ -78,12 +83,14 @@ class Broker:
         llm_capability: str,
         timeout: float,
         trusted_ui_exe: str = DEFAULT_TRUSTED_UI_EXE,
+        trusted_sudo_exe: str = DEFAULT_TRUSTED_SUDO_EXE,
     ) -> None:
         self.socket_path = socket_path
         self.session_token = session_token
         self.llm_capability = llm_capability
         self.timeout = timeout
         self.trusted_ui_exe = trusted_ui_exe
+        self.trusted_sudo_exe = trusted_sudo_exe
         self.pending: dict[str, PendingRequest] = {}
         # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
         # See RETRY_WINDOW_SECONDS.
@@ -210,6 +217,19 @@ class Broker:
         creds = self._peer_credentials(conn)
         if creds is None or creds[1] != os.getuid() or creds[0] != pid:
             self._send(conn, {"ok": False, "error": "pid_mismatch"})
+            return
+        # Closes the pid_mismatch check's remaining gap: it only stops a
+        # requester from claiming a PID that isn't its own connection —
+        # a process reporting its own real pid still passed. Nothing bound
+        # the displayed operation to a genuine sudo/askpass chain, so an
+        # agent could connect directly with its own truthful pid and a
+        # convincing "command", and receive the password itself once a
+        # human approved what looked like a legitimate request. Requiring
+        # the peer's immediate parent to be a real sudo process means the
+        # only way to ever receive a secret is to be the process sudo
+        # itself just spawned to ask for one — exactly what askpass.py is.
+        if not self._peer_is_sudo_child(conn):
+            self._send(conn, {"ok": False, "error": "not_sudo_child"})
             return
         identity = self._process_identity(pid)
         if identity is None:
@@ -404,6 +424,28 @@ class Broker:
             pid = ppid
         return False
 
+    def _peer_is_sudo_child(self, conn: socket.socket) -> bool:
+        # Deliberately a single hop, not a walk like _peer_is_trusted_ui's:
+        # sudo's askpass mechanism forks and execs the helper directly, with
+        # no shell in between (confirmed in this project's own wrapper
+        # scripts), so the real chain is always exactly peer -> sudo. Walking
+        # further up would accept a caller that merely has sudo somewhere in
+        # its ancestry, not one sudo itself just spawned to ask a password.
+        creds = self._peer_credentials(conn)
+        if creds is None:
+            return False
+        pid, uid = creds
+        if uid != os.getuid():
+            return False
+        info = self._process_ppid_and_comm(pid)
+        if info is None:
+            return False
+        parent_pid, _own_comm = info
+        if parent_pid <= 1:
+            return False
+        parent_info = self._process_ppid_and_comm(parent_pid)
+        return parent_info is not None and parent_info[1] == self.trusted_sudo_exe
+
     @staticmethod
     def _process_ppid_and_comm(pid: int) -> tuple[int, str] | None:
         # Comparing /proc/<pid>/exe (the binary's real path, not forgeable
@@ -502,6 +544,7 @@ def main() -> None:
     parser.add_argument("--llm-capability", default=None)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--trusted-ui-exe", default=None)
+    parser.add_argument("--trusted-sudo-exe", default=None)
     args = parser.parse_args()
     token = args.token or os.environ.get("DOORMAN_TOKEN")
     capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
@@ -512,7 +555,15 @@ def main() -> None:
         or os.environ.get("DOORMAN_TRUSTED_UI_EXE")
         or DEFAULT_TRUSTED_UI_EXE
     )
-    Broker(args.socket, token, capability, max(1.0, min(args.timeout, 300.0)), trusted_ui_exe).serve()
+    trusted_sudo_exe = (
+        args.trusted_sudo_exe
+        or os.environ.get("DOORMAN_TRUSTED_SUDO_EXE")
+        or DEFAULT_TRUSTED_SUDO_EXE
+    )
+    Broker(
+        args.socket, token, capability, max(1.0, min(args.timeout, 300.0)),
+        trusted_ui_exe, trusted_sudo_exe,
+    ).serve()
 
 
 if __name__ == "__main__":
