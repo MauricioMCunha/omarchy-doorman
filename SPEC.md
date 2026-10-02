@@ -268,9 +268,31 @@ request. `_create_request` also requires the connecting peer's immediate
 parent process to have `comm == "sudo"` (`_peer_is_sudo_child`, same
 `/proc/<pid>/comm` primitive as §6.9, one hop only — sudo forks and execs
 the askpass helper directly, with no shell in between), rejecting with
-`not_sudo_child` otherwise. The only process that can ever receive a
-secret for a given pid is now the process sudo itself just spawned to ask
-for one.
+`not_sudo_child` otherwise.
+
+The same maintainer then flagged that `comm` check itself: `/proc/<pid>/comm`
+is just a label a process can set for itself via `prctl(PR_SET_NAME)` (or by
+rewriting `argv[0]`) with no privilege at all, so an agent could rename
+itself `"sudo"`, fork a child, and have that child connect with its own
+real pid — passing the comm check without ever touching a real sudo.
+`_peer_is_sudo_child` now also requires that same parent to show a genuine
+privilege escalation: its effective uid must differ from its own real uid
+(`_process_comm_and_uids`, reading the `Uid:` line of
+`/proc/<pid>/status`). Real sudo is setuid-root and keeps that pairing —
+real uid the invoking user, effective uid 0 — for as long as it's waiting
+on askpass; confirmed live against an actual `sudo -A` invocation. A
+same-user process can't reproduce it without actually executing a genuine
+setuid-root binary, and `exec()` replaces the whole process image, so it
+can't rename itself into `"sudo"` afterwards either — whatever binary it
+execs keeps running that binary's own code, not the attacker's. (The
+broker's own sandboxing remaps a uid it can't resolve in its own user
+namespace — e.g. root's `0` — to the kernel's overflow uid rather than
+denying the read outright; confirmed live that real sudo's effective uid
+shows up here as that overflow value, not literally `0`. Comparing
+real uid against effective uid, instead of effective uid against a
+hardcoded `0`, doesn't care which representation it sees.) The only
+process that can ever receive a secret for a given pid is now one sudo
+itself — genuinely, not just by name — just spawned to ask for one.
 
 `_process_identity(pid)` reads `/proc/<pid>/stat` (start time, field 22 by
 position after the last `)`, to survive process names containing spaces or

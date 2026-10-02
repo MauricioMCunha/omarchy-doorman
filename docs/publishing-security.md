@@ -109,5 +109,27 @@ project and has to go along with any submission.
    its own genuine pid is rejected with `not_sudo_child`; a real `sudo`
    round trip through a diagnostic askpass stand-in and through the actual
    wrapper both still work end to end. Still only a partial review.
+9. ~~Address HANCORE-linux's second follow-up on the same issue:
+   `not_sudo_child` identified sudo solely by its parent's `comm`, which
+   Linux lets a process rename for itself.~~ Done on 2026-10-02: an agent
+   could `prctl(PR_SET_NAME, "sudo")` on itself, fork a child, and have
+   that child connect with its own real pid — passing the comm check
+   without ever touching a real sudo. Fixed by also requiring that parent
+   to show a genuine privilege escalation: its effective uid must differ
+   from its own real uid (`_process_comm_and_uids`, SPEC.md §6.1). Real
+   sudo is setuid-root and keeps exactly that pairing while waiting on
+   askpass; a same-user process can't reproduce it without actually
+   executing a genuine setuid-root binary, and `exec()` replaces the whole
+   process image, so it can't rename itself into `"sudo"` afterwards
+   either. Building this surfaced that the broker's own systemd sandboxing
+   (`ProtectSystem=strict`/`ProtectHome=read-only`) puts it in a minimal
+   user namespace that can't resolve uid 0 — real sudo's effective uid
+   reads back as the kernel's overflow uid instead of literally `0`, so
+   the check compares real uid against effective uid rather than against
+   a hardcoded `0`. Regression test added (`tests/test_broker.py`, a
+   process that renames itself "sudo" without root); verified live by
+   reproducing the maintainer's exact attack (a forked child of a
+   self-renamed "sudo" parent, rejected) and a real `sudo -A` invocation
+   (accepted) against the running broker. Still only a partial review.
 
 Don't submit while any blocker above is still open.

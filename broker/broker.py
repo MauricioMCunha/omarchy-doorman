@@ -40,6 +40,21 @@ DEFAULT_TRUSTED_UI_EXE = "quickshell"
 # for tests — in production it's always the real sudo. See
 # Broker._peer_is_sudo_child.
 DEFAULT_TRUSTED_SUDO_EXE = "sudo"
+# Whether that same parent must also show a genuine privilege escalation
+# (its effective uid differing from its own real uid) to be accepted.
+# /proc/<pid>/comm is just a label any process can set for itself
+# (prctl(PR_SET_NAME), or by rewriting argv[0]) — including renaming itself
+# "sudo" with no privilege at all, so comm alone isn't enough. Real sudo is
+# setuid-root and keeps its real uid as the invoking user while its
+# effective uid is 0 for as long as it's waiting on askpass (confirmed by
+# inspecting a live `sudo -A` invocation). A same-user process can't
+# reproduce that pairing without actually executing a genuine setuid-root
+# binary — and since exec() replaces the whole process image, it can't
+# rename itself afterwards either; whatever binary it execs keeps running
+# its own code, not the attacker's. That's out of this project's threat
+# model (see SPEC.md §6.1) if it ever becomes possible. Always required in
+# production; only tests, which cannot become root, turn it off.
+DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION = True
 # How many extra parent-process hops, beyond the caller itself, the broker
 # follows while looking for the trusted executable (bridge.py runs as a
 # direct child of Quickshell — 1 hop is enough in practice; the slack covers
@@ -84,6 +99,7 @@ class Broker:
         timeout: float,
         trusted_ui_exe: str = DEFAULT_TRUSTED_UI_EXE,
         trusted_sudo_exe: str = DEFAULT_TRUSTED_SUDO_EXE,
+        trusted_sudo_requires_escalation: bool = DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION,
     ) -> None:
         self.socket_path = socket_path
         self.session_token = session_token
@@ -91,6 +107,7 @@ class Broker:
         self.timeout = timeout
         self.trusted_ui_exe = trusted_ui_exe
         self.trusted_sudo_exe = trusted_sudo_exe
+        self.trusted_sudo_requires_escalation = trusted_sudo_requires_escalation
         self.pending: dict[str, PendingRequest] = {}
         # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
         # See RETRY_WINDOW_SECONDS.
@@ -443,8 +460,21 @@ class Broker:
         parent_pid, _own_comm = info
         if parent_pid <= 1:
             return False
-        parent_info = self._process_ppid_and_comm(parent_pid)
-        return parent_info is not None and parent_info[1] == self.trusted_sudo_exe
+        parent = self._process_comm_and_uids(parent_pid)
+        if parent is None:
+            return False
+        parent_comm, parent_real_uid, parent_effective_uid = parent
+        # comm alone was shown to be forgeable (issue #9558): a process can
+        # rename itself "sudo" via prctl with no privilege at all. Pairing it
+        # with a genuine privilege escalation closes that — see
+        # DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION above for why that part
+        # can't be forged by a same-user process.
+        privilege_escalated = parent_effective_uid != parent_real_uid
+        return (
+            parent_comm == self.trusted_sudo_exe
+            and parent_real_uid == os.getuid()
+            and (privilege_escalated or not self.trusted_sudo_requires_escalation)
+        )
 
     @staticmethod
     def _process_ppid_and_comm(pid: int) -> tuple[int, str] | None:
@@ -473,6 +503,32 @@ class Broker:
         except (OSError, IndexError, ValueError):
             return None
         return ppid, comm
+
+    @staticmethod
+    def _process_comm_and_uids(pid: int) -> tuple[str, int, int] | None:
+        # Returns (comm, real_uid, effective_uid). comm is forgeable, as
+        # above; a real_uid/effective_uid mismatch is not — the kernel only
+        # reports one for a process that actually executed a setuid binary.
+        # See DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION. (The broker's own
+        # sandboxing remaps uids it can't resolve in its user namespace to
+        # the kernel's overflow uid rather than denying the read outright —
+        # confirmed live: real sudo's actual "0" effective uid shows up here
+        # as that overflow value, not 0. Comparing real_uid != effective_uid
+        # instead of effective_uid == 0 doesn't care which one it is.)
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+            uid_line = next(
+                line for line in status_text.splitlines() if line.startswith("Uid:")
+            )
+            fields = uid_line.split()
+            real_uid, effective_uid = int(fields[1]), int(fields[2])
+        except (OSError, IndexError, StopIteration, ValueError):
+            return None
+        return comm, real_uid, effective_uid
 
     @staticmethod
     def _process_identity(pid: int) -> dict[str, Any] | None:
@@ -545,6 +601,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--trusted-ui-exe", default=None)
     parser.add_argument("--trusted-sudo-exe", default=None)
+    parser.add_argument(
+        "--trusted-sudo-allow-unprivileged-parent", action="store_true", default=False,
+    )
     args = parser.parse_args()
     token = args.token or os.environ.get("DOORMAN_TOKEN")
     capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
@@ -560,9 +619,13 @@ def main() -> None:
         or os.environ.get("DOORMAN_TRUSTED_SUDO_EXE")
         or DEFAULT_TRUSTED_SUDO_EXE
     )
+    trusted_sudo_requires_escalation = not (
+        args.trusted_sudo_allow_unprivileged_parent
+        or os.environ.get("DOORMAN_TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT") == "1"
+    )
     Broker(
         args.socket, token, capability, max(1.0, min(args.timeout, 300.0)),
-        trusted_ui_exe, trusted_sudo_exe,
+        trusted_ui_exe, trusted_sudo_exe, trusted_sudo_requires_escalation,
     ).serve()
 
 

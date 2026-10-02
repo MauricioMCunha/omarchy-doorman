@@ -36,6 +36,14 @@ TEST_TRUSTED_UI_EXE = Path("/proc/self/comm").read_text(encoding="utf-8").strip(
 # in production — same reasoning as TEST_TRUSTED_UI_EXE above, same value.
 TEST_TRUSTED_SUDO_EXE = TEST_TRUSTED_UI_EXE
 
+# _peer_is_sudo_child also requires that same parent to show a genuine
+# privilege escalation (real sudo is setuid-root — see
+# DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION). The test process can't
+# actually be root, so brokers that need legitimate request creation to
+# succeed pass --trusted-sudo-allow-unprivileged-parent to skip that part
+# of the check while still exercising everything else it does.
+TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT = "--trusted-sudo-allow-unprivileged-parent"
+
 # Calling the client directly from this test process would make the
 # process's own parent (whatever launched the test runner, not something
 # tests control) the "request" peer's parent — not this test process, which
@@ -128,6 +136,7 @@ class BrokerTest(unittest.TestCase):
                 TEST_TRUSTED_UI_EXE,
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -426,6 +435,50 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": False, "error": "not_sudo_child"})
 
+    def test_request_with_spoofed_sudo_comm_but_no_root_privilege_is_rejected(self) -> None:
+        # Security review follow-up (issue #9558): comm alone is forgeable
+        # — /proc/<pid>/comm is just a label any process can set for itself
+        # (prctl(PR_SET_NAME), or by rewriting argv[0]) — so an agent could
+        # rename itself "sudo", then have a child connect with its own real
+        # pid and pass the old check without ever touching a real sudo. This
+        # broker is told to trust this test process's comm as "sudo" (like
+        # self.process already is, for every other test), but — unlike
+        # self.process — gets no --trusted-sudo-allow-unprivileged-parent, so
+        # it still requires the real default: the parent must show a genuine
+        # privilege escalation, which this test process (an ordinary,
+        # non-root process) cannot have without actually becoming root.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-spoofed-comm.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        result = _call_as_subprocess(
+            socket_path, self.token,
+            {"type": "request", "command": "spoofed-comm-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "not_sudo_child"})
+
     def test_askpass_helper_prints_only_approved_secret(self) -> None:
         import os
 
@@ -492,6 +545,7 @@ class BrokerTest(unittest.TestCase):
                 TEST_TRUSTED_UI_EXE,
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -580,6 +634,7 @@ class BrokerTest(unittest.TestCase):
                 # few lines down would fail.
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
