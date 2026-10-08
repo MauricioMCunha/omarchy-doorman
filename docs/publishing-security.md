@@ -132,4 +132,109 @@ project and has to go along with any submission.
    self-renamed "sudo" parent, rejected) and a real `sudo -A` invocation
    (accepted) against the running broker. Still only a partial review.
 
+10. ~~Address HANCORE-linux's third follow-up on the same issue
+    ([#9558](https://github.com/omacom/omarchy-plugin-marketplace/issues/9558)):
+    the uid-escalation fix (item 9) closes who sudo's *parent* must be, but
+    not who the connecting *peer itself* is — sudo lets the caller choose
+    its own `SUDO_ASKPASS` helper, so an agent that invokes real sudo
+    directly (bypassing this project's PATH-shadow wrapper) can point
+    `SUDO_ASKPASS` at code it wrote itself, which still passes every check
+    on its parent, yet is caller-writable code that would receive the
+    plaintext secret.~~ Done on 2026-10-07: proposed fix confirmed in scope
+    and direction by the maintainer in the same thread, with three explicit
+    conditions: the privileged identity must stay confined to trusted
+    (non-caller-writable) code, the displayed operation must be derived
+    from the genuine sudo invocation rather than caller-supplied metadata,
+    and the system must refuse loudly rather than silently fall back when
+    that identity is unavailable.
+
+    First implementation: a dedicated system group (`doorman-askpass`) and
+    a small, dependency-free C binary (`askpass/doorman-askpass.c`),
+    installed once by root as `setgid`, with the broker checking the
+    connecting peer's effective gid via `SO_PEERCRED`. Live verification
+    caught a real problem with this design before it shipped: this
+    project's own hardened systemd unit (`ProtectSystem=strict`/
+    `ProtectHome=read-only`/`PrivateTmp=true`) puts the broker in a
+    private, unprivileged Linux user namespace (confirmed by comparing
+    `/proc/<broker_pid>/ns/user` against the host's) in which any gid
+    outside that namespace's minimal mapping — including the dedicated
+    group's — collapses to the kernel's overflow id for both
+    `SO_PEERCRED` and `/proc/<pid>/status`. The gid check was structurally
+    unable to tell the trusted group apart from any other under the
+    project's own documented production hardening, and relaxing that
+    hardening to fix it would have traded away real filesystem protection
+    for the check.
+
+    Second implementation: having the broker instead compare the
+    connecting peer's own `/proc/<pid>/exe` (device+inode, not the path
+    string) against the installed binary's, resolved once at startup — no
+    gid, no group. This doesn't depend on resolving any credential value,
+    so it looked immune to the problem above. Live verification caught a
+    *second*, different problem before this shipped either: reading
+    *another process's* `/proc/<pid>/exe` needs the same ptrace-equivalent
+    permission that an earlier, unrelated check in this project
+    (`Broker._peer_is_trusted_ui`'s original design) had already run into
+    and left as an open question — a `systemd --user` service is denied
+    it (`PermissionError`), reproduced live for both the real C binary and
+    a disposable Python stand-in with verified-uniform credentials, ruling
+    out a uid/gid mismatch. No fix to that design existed that kept the
+    project's own hardening intact.
+
+    Third mechanism (SPEC.md §6.11): the askpass binary opens its own
+    `/proc/self/exe` and hands that file descriptor to the broker over the
+    request socket via `SCM_RIGHTS`. The broker `fstat()`s the fd it
+    already owns and compares it to the installed binary's resolved
+    identity; this needs no permission over the peer at all, since it's
+    not inspecting the peer, just a file descriptor it was handed. The
+    installed binary's mode changed from `0755` to `0711` (root can read;
+    nobody else can, only execute) so an attacker can't open the trusted
+    path directly and send *that* fd instead of genuinely running it. As
+    first shipped, this assumed opening your own `/proc/self/exe` needs no
+    special permission — live verification caught a *third* problem before
+    this reached users: that assumption is false. Opening it goes through
+    the exact same DAC read check as opening the file by its real path, so
+    mode `0711` blocked the *legitimate* binary from reading itself too,
+    confirmed with a disposable copy chmod'd to the equivalent of `0711`
+    for a non-owner caller (`EACCES`, identical to the real binary's
+    failure for its own non-root invoker).
+
+    Fourth, current fix: same `SCM_RIGHTS`/`fstat()` design, with the
+    installed binary additionally granted the `cap_dac_read_search` Linux
+    file capability (via `setcap`, applied by
+    `scripts/doorman-install-askpass` after `chown`/`chmod` but before the
+    file is moved into place, since writing to a file clears any capability
+    already on it). That capability lets *this exact binary, once exec'd*
+    bypass the one read check it needs to pass on itself, without running
+    as root (deliberately not `setuid`: a memory-safety bug in this C code
+    can then only read a file it shouldn't, not execute arbitrary code as
+    root) and without granting anything to an attacker's own substitute
+    binary (file capabilities apply only at `execve()` of the specific
+    capability-bearing file). `scripts/doorman-install-askpass` also
+    refuses to install onto a `nosuid` mount — that mount option drops file
+    capabilities at exec time the same way it drops `setuid`/`setgid`, and
+    verifies via `getcap` after install that the capability actually stuck
+    rather than assuming `setcap` succeeding means it took effect. Four
+    regression tests (`tests/test_broker.py`): the identity-mismatch
+    rejection, the missing-path loud refusal, the command-derivation check,
+    and the genuine positive path — which needs no root or compiler, since
+    the test peer sends a real fd for `sys.executable`'s own exe over the
+    same socket. The askpass binary itself builds clean under
+    `-Wall -Wextra -Werror -Wpedantic` and under ASan/UBSan, with a
+    hand-tested round trip against a fake broker (including a secret
+    containing `"`, `\`, and an embedded newline) and five adversarial
+    malformed-response cases, all surviving under the sanitizer build with
+    no crash and a clean exit 1.
+
+    Live end-to-end verification, all three cases: the legitimate round
+    trip (real `sudo whoami`, through the real `doorman-sudo` wrapper, the
+    real installed binary, the broker, and a human approving in the real
+    Quickshell modal — `sudo` returned successfully); the attack
+    reproduction (a script posing as `SUDO_ASKPASS`, invoked via real
+    `sudo -A` with the wrapper bypassed entirely, exactly the scenario this
+    item exists to close — rejected `untrusted_askpass_helper`, no secret
+    ever left the broker); and the degraded-state check (the installed
+    binary temporarily removed — every `request` rejected
+    `askpass_identity_unavailable`, confirmed via the real system journal,
+    not silently accepted). Still only a partial review.
+
 Don't submit while any blocker above is still open.

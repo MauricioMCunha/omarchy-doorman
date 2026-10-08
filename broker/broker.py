@@ -9,12 +9,14 @@ single use.
 from __future__ import annotations
 
 import argparse
+import array
 import json
 import os
 import secrets
 import socket
 import stat
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -55,6 +57,37 @@ DEFAULT_TRUSTED_SUDO_EXE = "sudo"
 # model (see SPEC.md §6.1) if it ever becomes possible. Always required in
 # production; only tests, which cannot become root, turn it off.
 DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION = True
+# Fixed, root-installed path (scripts/doorman-install-askpass) the askpass
+# helper's own /proc/self/exe — sent to the broker as a file descriptor over
+# this connection's handshake (SCM_RIGHTS, see _recv_line_with_fd) — must
+# resolve to for the request to be accepted. Even a peer that passes every
+# check above can still be the attacker's own script: sudo lets the
+# *caller* pick the SUDO_ASKPASS helper, so an agent that invokes real sudo
+# directly (bypassing this project's PATH-shadow wrapper) can point
+# SUDO_ASKPASS at code it wrote itself, which is a genuine, genuinely
+# privilege-escalated child of a real sudo — passing pid_mismatch and
+# not_sudo_child — yet is still caller-writable code that would receive the
+# plaintext secret in its own memory once a human approves (issue #9558).
+#
+# This used to be checked by the broker itself stat()-ing the connecting
+# peer's /proc/<pid>/exe. That doesn't work under this project's own
+# systemd hardening: ProtectSystem=strict/ProtectHome=read-only/
+# PrivateTmp=true force the broker into a private, unprivileged Linux user
+# namespace, and reading another process's /proc/<pid>/exe from outside its
+# namespace needs a ptrace-equivalent capability (CAP_SYS_PTRACE) the
+# broker, by design, never has — confirmed live (PermissionError(13) on
+# every attempt, including the legitimate one). Passing the fd instead
+# sidesteps that entirely: the askpass binary opens its *own*
+# /proc/self/exe (always allowed — a process introspecting itself needs no
+# special permission) and hands the broker that exact file descriptor over
+# the socket; the broker just fstat()s an fd it already owns, which needs
+# no cross-process permission at all. The installed binary is also
+# `0711` (execute-only for non-root, see scripts/doorman-install-askpass),
+# so an attacker can't fake this by opening the trusted path directly and
+# sending THAT fd instead — only a process that actually exec'd this exact
+# file can open its own exe link. See SPEC.md §6.11.
+# Configurable only for tests; production always uses this fixed path.
+DEFAULT_TRUSTED_ASKPASS_PATH = "/usr/local/lib/omarchy-doorman/doorman-askpass"
 # How many extra parent-process hops, beyond the caller itself, the broker
 # follows while looking for the trusted executable (bridge.py runs as a
 # direct child of Quickshell — 1 hop is enough in practice; the slack covers
@@ -100,6 +133,8 @@ class Broker:
         trusted_ui_exe: str = DEFAULT_TRUSTED_UI_EXE,
         trusted_sudo_exe: str = DEFAULT_TRUSTED_SUDO_EXE,
         trusted_sudo_requires_escalation: bool = DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION,
+        trusted_askpass_path: str = DEFAULT_TRUSTED_ASKPASS_PATH,
+        trusted_askpass_skip_identity_check: bool = False,
     ) -> None:
         self.socket_path = socket_path
         self.session_token = session_token
@@ -108,6 +143,24 @@ class Broker:
         self.trusted_ui_exe = trusted_ui_exe
         self.trusted_sudo_exe = trusted_sudo_exe
         self.trusted_sudo_requires_escalation = trusted_sudo_requires_escalation
+        self.trusted_askpass_path = trusted_askpass_path
+        # Test-only: lets a test exercise request creation without a real
+        # root-installed fixture at a fixed path. Never set in production —
+        # see DEFAULT_TRUSTED_ASKPASS_PATH above.
+        self.trusted_askpass_skip_identity_check = trusted_askpass_skip_identity_check
+        self._askpass_unavailable_last_logged = 0.0
+        if trusted_askpass_skip_identity_check:
+            self._trusted_askpass_identity: tuple[int, int] | None = None
+            self.askpass_identity_available = True
+        else:
+            try:
+                st = os.stat(trusted_askpass_path)
+                self._trusted_askpass_identity = (st.st_dev, st.st_ino)
+                self.askpass_identity_available = True
+            except OSError:
+                self._trusted_askpass_identity = None
+                self.askpass_identity_available = False
+                self._log_askpass_unavailable()
         self.pending: dict[str, PendingRequest] = {}
         # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
         # See RETRY_WINDOW_SECONDS.
@@ -117,6 +170,19 @@ class Broker:
         self.started_at = time.time()
         self.metrics = {"approved": 0, "cancelled": 0, "expired": 0, "requests": 0}
         self.last_activity_at: float | None = None
+
+    def _log_askpass_unavailable(self) -> None:
+        self._askpass_unavailable_last_logged = time.time()
+        print(
+            f"doorman broker: trusted askpass path {self.trusted_askpass_path!r} "
+            "doesn't exist or isn't reachable by this process — askpass "
+            "requests will be refused (askpass_identity_unavailable) until "
+            "scripts/doorman-install-askpass has been run as root. This is "
+            "deliberate: it's quieter to fail loudly here than to silently "
+            "accept the weaker, pre-#9558 guarantee.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def serve(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,53 +226,100 @@ class Broker:
             # short timeout doesn't affect the long wait for the UI's
             # decision in _create_request.
             conn.settimeout(HANDSHAKE_TIMEOUT)
+            line: bytes | None = None
+            identity_fd: int | None = None
             try:
-                reader = conn.makefile("rb")
-                line = reader.readline(MAX_LINE + 1)
-            except OSError:
-                return
+                line, identity_fd = self._recv_line_with_fd(conn)
             finally:
                 conn.settimeout(None)
-            if not line or len(line) > MAX_LINE:
-                return
             try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                self._send(conn, {"ok": False, "error": "invalid_message"})
-                return
-            if not secrets.compare_digest(str(message.get("token", "")), self.session_token):
-                self._send(conn, {"ok": False, "error": "unauthorized"})
-                return
-            kind = message.get("type")
-            if kind == "request":
-                if not self._valid_llm_origin(message):
-                    self._send(conn, {"ok": False, "error": "invalid_llm_origin"})
+                if not line:
                     return
-                self._create_request(conn, message)
-            elif kind in ("approve", "cancel", "pending", "stats"):
-                # Origin=llm + capability only controls who can CREATE a
-                # request; approve/cancel/pending/stats used to only check
-                # the session token, and any process of the same user that
-                # can create a request can also read that token (it's the
-                # same 0600 file). Without this check, a compromised agent
-                # could self-approve straight over the socket, with no UI
-                # and no human — confirmed manually before this fix.
-                # SO_PEERCRED is verified by the kernel from the process that
-                # called connect(); it's not something the remote process
-                # can forge.
-                if not self._peer_is_trusted_ui(conn):
-                    self._send(conn, {"ok": False, "error": "untrusted_caller"})
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    self._send(conn, {"ok": False, "error": "invalid_message"})
                     return
-                if kind == "approve":
-                    self._approve(conn, message)
-                elif kind == "cancel":
-                    self._cancel(conn, message)
-                elif kind == "pending":
-                    self._pending(conn)
+                if not secrets.compare_digest(str(message.get("token", "")), self.session_token):
+                    self._send(conn, {"ok": False, "error": "unauthorized"})
+                    return
+                kind = message.get("type")
+                if kind == "request":
+                    if not self._valid_llm_origin(message):
+                        self._send(conn, {"ok": False, "error": "invalid_llm_origin"})
+                        return
+                    self._create_request(conn, message, identity_fd)
+                elif kind in ("approve", "cancel", "pending", "stats"):
+                    # Origin=llm + capability only controls who can CREATE a
+                    # request; approve/cancel/pending/stats used to only check
+                    # the session token, and any process of the same user that
+                    # can create a request can also read that token (it's the
+                    # same 0600 file). Without this check, a compromised agent
+                    # could self-approve straight over the socket, with no UI
+                    # and no human — confirmed manually before this fix.
+                    # SO_PEERCRED is verified by the kernel from the process that
+                    # called connect(); it's not something the remote process
+                    # can forge.
+                    if not self._peer_is_trusted_ui(conn):
+                        self._send(conn, {"ok": False, "error": "untrusted_caller"})
+                        return
+                    if kind == "approve":
+                        self._approve(conn, message)
+                    elif kind == "cancel":
+                        self._cancel(conn, message)
+                    elif kind == "pending":
+                        self._pending(conn)
+                    else:
+                        self._stats(conn)
                 else:
-                    self._stats(conn)
-            else:
-                self._send(conn, {"ok": False, "error": "unknown_type"})
+                    self._send(conn, {"ok": False, "error": "unknown_type"})
+            finally:
+                if identity_fd is not None:
+                    os.close(identity_fd)
+
+    def _recv_line_with_fd(self, conn: socket.socket) -> tuple[bytes | None, int | None]:
+        """Reads one '\n'-terminated line, bounded to MAX_LINE — the same
+        contract conn.makefile(...).readline() used to have — but via
+        recvmsg(), so an SCM_RIGHTS fd attached to the handshake (the
+        askpass identity fd, SPEC.md §6.11) is captured instead of silently
+        dropped. Every other caller (approve/cancel/pending/stats from the
+        trusted UI) never attaches one; recvmsg() behaves like a plain recv
+        for them, just with an always-empty ancillary-data list."""
+        buf = bytearray()
+        received_fd: int | None = None
+        ancillary_size = socket.CMSG_SPACE(struct.calcsize("i"))
+        while len(buf) <= MAX_LINE:
+            try:
+                chunk, ancdata, _flags, _addr = conn.recvmsg(
+                    MAX_LINE + 1 - len(buf), ancillary_size
+                )
+            except OSError:
+                chunk = b""
+            for level, cmsg_type, data in ancdata if chunk else ():
+                if level != socket.SOL_SOCKET or cmsg_type != socket.SCM_RIGHTS:
+                    continue
+                fds = array.array("i")
+                fds.frombytes(data[: len(data) - (len(data) % fds.itemsize)])
+                for fd in fds:
+                    if received_fd is None:
+                        received_fd = fd
+                    else:
+                        # Nothing legitimate ever sends more than one; don't
+                        # leak whatever this extra one is.
+                        os.close(fd)
+            if not chunk:
+                if received_fd is not None:
+                    os.close(received_fd)
+                return None, None
+            buf += chunk
+            if b"\n" in chunk:
+                break
+        newline_idx = buf.find(b"\n")
+        if newline_idx == -1 or len(buf) > MAX_LINE:
+            if received_fd is not None:
+                os.close(received_fd)
+            return None, None
+        return bytes(buf[:newline_idx]), received_fd
 
     def _valid_llm_origin(self, message: dict[str, Any]) -> bool:
         return (
@@ -214,7 +327,9 @@ class Broker:
             and secrets.compare_digest(str(message.get("capability", "")), self.llm_capability)
         )
 
-    def _create_request(self, conn: socket.socket, message: dict[str, Any]) -> None:
+    def _create_request(
+        self, conn: socket.socket, message: dict[str, Any], identity_fd: int | None
+    ) -> None:
         pid = self._positive_pid(message.get("pid"))
         if pid is None:
             self._send(conn, {"ok": False, "error": "invalid_pid"})
@@ -245,16 +360,50 @@ class Broker:
         # the peer's immediate parent to be a real sudo process means the
         # only way to ever receive a secret is to be the process sudo
         # itself just spawned to ask for one — exactly what askpass.py is.
-        if not self._peer_is_sudo_child(conn):
+        sudo_parent_pid = self._resolve_sudo_parent_pid(conn)
+        if sudo_parent_pid is None:
             self._send(conn, {"ok": False, "error": "not_sudo_child"})
             return
+        # Closes the not_sudo_child/escalation check's remaining gap: those
+        # only validate the peer's *parent* (that it's a real, escalated
+        # sudo). sudo itself lets the caller pick SUDO_ASKPASS, so the peer
+        # process — the one that actually holds this connection and would
+        # receive the secret — could still be the attacker's own script,
+        # genuinely spawned by a genuine sudo. The askpass binary proves it
+        # is the trusted, root-installed one by handing over an fd to its
+        # own /proc/self/exe (SCM_RIGHTS, captured in _recv_line_with_fd);
+        # fstat()-ing an fd this process already owns needs no permission
+        # over the peer at all, unlike stat()-ing the peer's /proc/<pid>/exe
+        # by path (tried first — doesn't work under this project's own
+        # systemd hardening, see DEFAULT_TRUSTED_ASKPASS_PATH above and
+        # SPEC.md §6.11). The installed binary's own file isn't readable by
+        # this user (0711), only executable, so an attacker can't send the
+        # fd of the trusted path opened directly instead of genuinely
+        # exec'ing it.
+        if not self.trusted_askpass_skip_identity_check:
+            if not self.askpass_identity_available:
+                self._send(conn, {"ok": False, "error": "askpass_identity_unavailable"})
+                return
+            fd_id = self._fd_identity(identity_fd) if identity_fd is not None else None
+            if identity_fd is None or fd_id != self._trusted_askpass_identity:
+                self._send(conn, {"ok": False, "error": "untrusted_askpass_helper"})
+                return
         identity = self._process_identity(pid)
         if identity is None:
             self._send(conn, {"ok": False, "error": "process_not_found"})
             return
+        # The displayed "command" must reflect what will actually run, not
+        # whatever string the caller puts in the request payload — a caller
+        # that controls its own SUDO_ASKPASS also controls this field, and
+        # could show the human a harmless-looking lie while a different
+        # command actually executes (issue #9558). sudo's own cmdline, read
+        # from the verified real sudo parent above, can't be rewritten by
+        # the caller without compromising the real sudo binary itself — see
+        # SPEC.md §6.12.
+        real_command = self._read_proc_cmdline(sudo_parent_pid)
         metadata = {
             "pid": pid,
-            "command": str(message.get("command", ""))[:1000],
+            "command": (real_command or "(unable to read the sudo command)")[:1000],
             "cwd": str(message.get("cwd", ""))[:1000],
             "tty": str(message.get("tty", ""))[:300],
             "prompt": str(message.get("prompt", "Password: "))[:300],
@@ -350,6 +499,7 @@ class Broker:
                     if not request.delivered and request.expires_at > now
                 ),
                 "last_activity_at": self.last_activity_at,
+                "askpass_identity_available": self.askpass_identity_available,
                 **self.metrics,
             }
         self._send(conn, payload)
@@ -422,6 +572,14 @@ class Broker:
             return None
         return pid, uid
 
+    @staticmethod
+    def _fd_identity(fd: int) -> tuple[int, int] | None:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None
+        return st.st_dev, st.st_ino
+
     def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
         creds = self._peer_credentials(conn)
         if creds is None:
@@ -442,27 +600,32 @@ class Broker:
         return False
 
     def _peer_is_sudo_child(self, conn: socket.socket) -> bool:
+        return self._resolve_sudo_parent_pid(conn) is not None
+
+    def _resolve_sudo_parent_pid(self, conn: socket.socket) -> int | None:
         # Deliberately a single hop, not a walk like _peer_is_trusted_ui's:
         # sudo's askpass mechanism forks and execs the helper directly, with
         # no shell in between (confirmed in this project's own wrapper
         # scripts), so the real chain is always exactly peer -> sudo. Walking
         # further up would accept a caller that merely has sudo somewhere in
         # its ancestry, not one sudo itself just spawned to ask a password.
+        # Returns the verified parent pid (so callers can also read its real
+        # cmdline, see _read_proc_cmdline) rather than just True/False.
         creds = self._peer_credentials(conn)
         if creds is None:
-            return False
+            return None
         pid, uid = creds
         if uid != os.getuid():
-            return False
+            return None
         info = self._process_ppid_and_comm(pid)
         if info is None:
-            return False
+            return None
         parent_pid, _own_comm = info
         if parent_pid <= 1:
-            return False
+            return None
         parent = self._process_comm_and_uids(parent_pid)
         if parent is None:
-            return False
+            return None
         parent_comm, parent_real_uid, parent_effective_uid = parent
         # comm alone was shown to be forgeable (issue #9558): a process can
         # rename itself "sudo" via prctl with no privilege at all. Pairing it
@@ -470,11 +633,24 @@ class Broker:
         # DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION above for why that part
         # can't be forged by a same-user process.
         privilege_escalated = parent_effective_uid != parent_real_uid
-        return (
+        if (
             parent_comm == self.trusted_sudo_exe
             and parent_real_uid == os.getuid()
             and (privilege_escalated or not self.trusted_sudo_requires_escalation)
-        )
+        ):
+            return parent_pid
+        return None
+
+    @staticmethod
+    def _read_proc_cmdline(pid: int) -> str | None:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        parts = [part for part in raw.split(b"\0") if part]
+        if not parts:
+            return None
+        return " ".join(part.decode("utf-8", "replace") for part in parts)
 
     @staticmethod
     def _process_ppid_and_comm(pid: int) -> tuple[int, str] | None:
@@ -567,6 +743,11 @@ class Broker:
     def _cleanup_loop(self) -> None:
         while not self.stop_event.wait(1.0):
             now = time.time()
+            if (
+                not self.askpass_identity_available
+                and now - self._askpass_unavailable_last_logged > 60.0
+            ):
+                self._log_askpass_unavailable()
             with self.lock:
                 expired = [rid for rid, req in self.pending.items() if req.expires_at <= now]
                 for rid in expired:
@@ -604,6 +785,10 @@ def main() -> None:
     parser.add_argument(
         "--trusted-sudo-allow-unprivileged-parent", action="store_true", default=False,
     )
+    parser.add_argument("--trusted-askpass-path", default=None)
+    parser.add_argument(
+        "--trusted-askpass-skip-identity-check", action="store_true", default=False,
+    )
     args = parser.parse_args()
     token = args.token or os.environ.get("DOORMAN_TOKEN")
     capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
@@ -623,9 +808,19 @@ def main() -> None:
         args.trusted_sudo_allow_unprivileged_parent
         or os.environ.get("DOORMAN_TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT") == "1"
     )
+    trusted_askpass_path = (
+        args.trusted_askpass_path
+        or os.environ.get("DOORMAN_TRUSTED_ASKPASS_PATH")
+        or DEFAULT_TRUSTED_ASKPASS_PATH
+    )
+    trusted_askpass_skip_identity_check = (
+        args.trusted_askpass_skip_identity_check
+        or os.environ.get("DOORMAN_TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK") == "1"
+    )
     Broker(
         args.socket, token, capability, max(1.0, min(args.timeout, 300.0)),
         trusted_ui_exe, trusted_sudo_exe, trusted_sudo_requires_escalation,
+        trusted_askpass_path, trusted_askpass_skip_identity_check,
     ).serve()
 
 

@@ -30,6 +30,33 @@ jobs:
       - name: Whitespace and conflict-marker check
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
 
+  askpass-helper:
+    # The one piece of new C code parsing untrusted-length data over a
+    # socket (SPEC.md §6.11) — the sanitizer build is a gate, not optional,
+    # mirroring how seriously this project already treats that surface
+    # (gitleaks, dependency-review-action above).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Strict build
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic \
+            -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -o /tmp/doorman-askpass askpass/doorman-askpass.c
+
+      - name: ASan/UBSan build
+        run: |
+          cc -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra \
+            -o /tmp/doorman-askpass-asan askpass/doorman-askpass.c
+
+      - name: Askpass identity round trip (positive path)
+        run: python3 -m unittest tests.test_broker.BrokerTest.test_request_with_real_trusted_askpass_identity_is_accepted -v
+
   security:
     runs-on: ubuntu-latest
     permissions:

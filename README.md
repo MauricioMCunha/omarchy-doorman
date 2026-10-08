@@ -92,15 +92,48 @@ cp ~/.config/omarchy/plugins/mauricio.doorman/packaging/omarchy-doorman.service 
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-doorman.service
 
-# 3. Shadow `sudo` for this user so agents pick it up without any
+# 3. One-time, root-privileged: install the askpass helper that actually
+#    receives the password (SPEC.md §6.11). The broker refuses every sudo
+#    request until this has been run — see "Why this step needs root"
+#    below for what it's protecting against.
+sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass
+
+# 4. Shadow `sudo` for this user so agents pick it up without any
 #    per-agent configuration — see "Wiring up sudo" below for why this
 #    step is the one that actually makes Doorman useful.
 ln -s ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo ~/.local/bin/sudo
 ```
 
-Nothing here touches `/usr/share/omarchy/`, replaces `/usr/bin/sudo`, or edits
-`sudoers`. Every step is explicit and reversible — see **Activating,
-updating, and removing** below for the inverse of each one.
+Nothing here replaces `/usr/bin/sudo`, edits `sudoers`, or touches anything
+under `/usr/share/omarchy/`. Step 3 is the one exception to "everything else
+is unprivileged": it installs one small binary, owned by root and not
+writable by this user, outside this plugin's own git checkout (so `omarchy
+plugin update` never touches it) — see **Why this step needs root** below.
+Every step is explicit and reversible — see **Activating, updating, and
+removing** below for the inverse of each one.
+
+### Why this step needs root
+
+`sudo` lets *whoever calls it* choose the `SUDO_ASKPASS` helper. Nothing
+stops a background agent from invoking real `sudo` directly (bypassing
+Doorman's own `sudo` shadow entirely) and pointing `SUDO_ASKPASS` at a
+script it wrote itself — which would still look, to the broker, exactly
+like a legitimate request, and would receive the real password once a
+human approved it. Closing that needs an identity an ordinary, same-user
+process cannot fake: a binary installed once by root, at a fixed path this
+user cannot write to or even read (only execute), which hands the broker a
+file descriptor for its own executable so the broker can confirm — without
+needing any special permission over the process that sent it — that it
+really is that exact file. The install step also grants that one binary a
+narrow Linux file capability (`cap_dac_read_search`) so it can read its own
+executable content despite not being readable by this user — without it,
+mode `0711` would block the legitimate helper from reading itself, not just
+an attacker's forgery. See
+[`SPEC.md` §6.11](SPEC.md#611-the-askpass-helper-itself-must-carry-an-identity-it-cant-fake)
+for the full reasoning, including why three earlier versions of this check
+(one group-based, one that had the broker inspect the connecting process
+directly, one that assumed reading your own executable needs no
+permission) turned out not to work.
 
 ### Activating, updating, and removing
 
@@ -135,6 +168,12 @@ omarchy plugin remove mauricio.doorman --yes
 systemctl --user disable --now omarchy-doorman.service
 rm -f ~/.config/systemd/user/omarchy-doorman.service
 systemctl --user daemon-reload
+
+# The root-installed askpass helper is the only state that lives outside
+# the plugin folder and the per-user runtime dir — removed separately, and
+# only if you're not keeping Doorman around for another user on this
+# machine.
+sudo rm -rf /usr/local/lib/omarchy-doorman
 ```
 
 ### Wiring up `sudo`
@@ -165,7 +204,11 @@ agent in a background job or a terminal it opened itself — resolves to the
 wrapper, which always forwards to the real `sudo -A` unless the caller
 already passed `-A`/`-S`/`-n`/`--stdin`/`--non-interactive` explicitly. The
 one thing this can't catch is a caller that hardcodes `/usr/bin/sudo` by
-absolute path, bypassing `PATH` resolution entirely — see
+absolute path, bypassing `PATH` resolution entirely — but since the askpass
+identity check (§6.11), that no longer means the secret leaks: a caller
+that bypasses the wrapper still can't make its own `SUDO_ASKPASS` receive
+the password, so the residual gap is UX only (no friendly retry labeling,
+no `DOORMAN_COMMAND` hint) — see
 [`SPEC.md`](SPEC.md#7-known-limitations).
 
 Other integration points still exist for narrower cases:
@@ -174,11 +217,17 @@ Other integration points still exist for narrower cases:
 # One-off, for a single external command, without shadowing sudo at all:
 scripts/doorman-run -- sudo systemctl restart some-service
 
-# Or point SUDO_ASKPASS at the plugin's askpass helper directly, the way
-# a real `sudo -A` invocation (or an agent's own shell) would:
-export SUDO_ASKPASS=~/.config/omarchy/plugins/mauricio.doorman/askpass.py
+# Or point SUDO_ASKPASS at the installed helper directly, the way a real
+# `sudo -A` invocation (or an agent's own shell) would:
+export SUDO_ASKPASS=/usr/local/lib/omarchy-doorman/doorman-askpass
 sudo -A whoami
 ```
+
+That installed path is the only `SUDO_ASKPASS` target the broker will
+accept in production (SPEC.md §6.11) — only root's install step can put a
+file there, not the plain `askpass.py` in the plugin folder. `askpass.py`
+still exists, but only as a dev/test fixture: pointing `SUDO_ASKPASS` at
+it gets `untrusted_askpass_helper`, by design.
 
 ## What Doorman is not
 

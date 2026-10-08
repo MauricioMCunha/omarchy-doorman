@@ -94,10 +94,22 @@ Panel {
         Button {
           width: parent.width
           leftAlign: true
+          // askpass_identity_available (SPEC.md §6.11/§6.12) is false when
+          // the privileged install step was never run, or a nosuid mount
+          // silently stripped the askpass binary's file capability — every
+          // request is refused until that's fixed. Surfaced here rather
+          // than only in the broker's own stderr.
           text: root.hostWidget && root.hostWidget.requests.length > 0
             ? (root.hostWidget.requests.length + " request" + (root.hostWidget.requests.length > 1 ? "s" : "") + " · expires in " + root.hostWidget.duration(root.hostWidget.nextExpiry()))
-            : (root.hostWidget && root.hostWidget.brokerOnline ? "No pending authorization" : "Broker unavailable")
-          iconText: (root.hostWidget && root.hostWidget.requests.length > 0) ? "󰀦" : ((root.hostWidget && root.hostWidget.brokerOnline) ? "󰄬" : "󰀪")
+            : (!root.hostWidget || !root.hostWidget.brokerOnline
+                ? "Broker unavailable"
+                : (root.hostWidget.metric("askpass_identity_available") === 0
+                    ? "Setup incomplete — run doorman-install-askpass"
+                    : "No pending authorization"))
+          iconText: (root.hostWidget && root.hostWidget.requests.length > 0) ? "󰀦"
+            : (root.hostWidget && root.hostWidget.brokerOnline
+                ? (root.hostWidget.metric("askpass_identity_available") === 0 ? "󰀪" : "󰄬")
+                : "󰀪")
           active: root.hostWidget ? root.hostWidget.requests.length > 0 : false
           focusable: true
           onClicked: if (root.hostWidget && root.hostWidget.requests.length > 0) root.close()

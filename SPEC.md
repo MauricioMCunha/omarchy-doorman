@@ -67,10 +67,25 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
   session token and an "LLM capability" string passed as `--token`/
   `--llm-capability` (or `DOORMAN_TOKEN`/`DOORMAN_LLM_CAPABILITY`), both
   generated fresh per session and stored under a private runtime directory.
-- **askpass helper** (`broker/askpass.py`, and a self-contained copy in the
-  plugin directory for when `sudo` invokes it directly with no wrapper):
-  implements the `SUDO_ASKPASS` contract — reads a prompt on argv, writes
-  the secret to stdout, nothing else.
+- **askpass helper** (`askpass/doorman-askpass.c`, compiled and installed by
+  `scripts/doorman-install-askpass`): implements the `SUDO_ASKPASS`
+  contract — reads a prompt on argv, writes the secret to stdout, nothing
+  else. Installed once by root, outside the plugin's own git checkout,
+  owned `root:root`, mode `0711` (executable, not readable, by anyone but
+  root) and not writable by the user — this is what lets the broker tell it
+  apart from caller-written code that also happens to be a genuine child of
+  a genuinely escalated `sudo` (§6.11): the helper hands the broker a file
+  descriptor for its own `/proc/self/exe` over the request socket
+  (`SCM_RIGHTS`), and the broker compares that against this installed path.
+  The binary also carries the `cap_dac_read_search` file capability, set by
+  the install script — needed because opening `/proc/self/exe` isn't
+  privilege-exempt, so mode `0711` alone would block the legitimate binary
+  from reading itself too (§6.11).
+  `broker/askpass.py` (and a self-contained copy, `askpass.py`, for when
+  `sudo` invokes it directly with no wrapper) are the pre-#9558-finding-4
+  Python implementation, kept only as a dev/test fixture — the broker
+  rejects them on the production path (`untrusted_askpass_helper`), since
+  they never attach that fd at all.
 - **bridge** (`bridge.py`): a secret-free CLI the Quickshell `Process` type
   shells out to for `pending`/`stats`/`approve`/`cancel`. The secret is
   piped over stdin on approval, never passed as an argument (arguments are
@@ -89,14 +104,16 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
 ### 4.1 In scope
 
 - A malicious or buggy **background agent process** that can set arbitrary
-  *display* metadata (command string, cwd, tty), can read the broker's
-  public responses, and — this was wrong in an earlier draft of this
-  document — *does* have the session token and capability: they live in
-  files under the same UID the agent runs as, exactly like the UI reads
-  them. What the agent cannot do is claim a `pid` other than its own real
-  one, or create a request at all without a real sudo process as its
-  connection's immediate parent (§6.1), act as the trusted UI (§6.9), or
-  read the human's keystrokes into the modal.
+  *display* metadata (`cwd`, `tty`; `command` is no longer one of these —
+  see §6.12), can read the broker's public responses, and — this was wrong
+  in an earlier draft of this document — *does* have the session token and
+  capability: they live in files under the same UID the agent runs as,
+  exactly like the UI reads them. What the agent cannot do is claim a `pid`
+  other than its own real one, create a request at all without a real sudo
+  process as its connection's immediate parent (§6.1), invoke real `sudo`
+  with its own `SUDO_ASKPASS` and still be the one to receive the secret
+  (§6.11), act as the trusted UI (§6.9), or read the human's keystrokes
+  into the modal.
 - **Process identity drift**: the PID a request was opened for exits and is
   reused by an unrelated process before the human approves.
 - **Local resource exhaustion**: another process on the same machine (with
@@ -172,6 +189,8 @@ or, without a second response (connection closes immediately):
 {"ok": false, "error": "invalid_pid"}          // pid missing or <= 0
 {"ok": false, "error": "pid_mismatch"}         // claimed pid isn't this connection's real peer — see §6.1
 {"ok": false, "error": "not_sudo_child"}       // peer's parent process isn't sudo — see §6.1
+{"ok": false, "error": "askpass_identity_unavailable"} // trusted askpass path not installed — see §6.11
+{"ok": false, "error": "untrusted_askpass_helper"}     // peer didn't hand over a matching identity fd — see §6.11
 {"ok": false, "error": "process_not_found"}    // /proc/<pid> unreadable or gone
 {"ok": false, "error": "invalid_llm_origin"}   // origin != "llm" or capability mismatch
 {"ok": false, "error": "too_many_pending"}     // MAX_PENDING (20) already open
@@ -235,8 +254,14 @@ the request was correlated to an earlier one via `sudo_pid` (§6.10).
 // →
 {"token": "…", "type": "stats"}
 // ←
-{"ok": true, "uptime": 42, "pending": 0, "last_activity_at": 1234567890.1, "approved": 3, "cancelled": 1, "expired": 0, "requests": 4}
+{"ok": true, "uptime": 42, "pending": 0, "last_activity_at": 1234567890.1, "approved": 3, "cancelled": 1, "expired": 0, "requests": 4, "askpass_identity_available": true}
 ```
+
+`askpass_identity_available` is `false` when the trusted askpass path
+can't be `stat`'d (the install step was never run, or the installed file
+was removed — see §6.11) — every `request` is refused with
+`askpass_identity_unavailable` while this is `false`. The UI should
+surface this directly rather than require reading the broker's own stderr.
 
 ## 6. Security properties and their rationale
 
@@ -362,9 +387,25 @@ family), `CapabilityBoundingSet=` (empty — it needs zero Linux
 capabilities), `SystemCallFilter=@system-service`, and a handful of
 `Protect*`/`Restrict*` flags (kernel tunables/modules/logs, control groups,
 clock, hostname, namespaces, realtime scheduling, SUID/SGID,
-`LockPersonality`, `MemoryDenyWriteExecute`). None of these change behavior
-for a pure-Python service that only speaks Unix sockets and reads `/proc`;
-they remove attack surface the broker was never going to use anyway.
+`LockPersonality`, `MemoryDenyWriteExecute`). Almost none of these change
+behavior for a pure-Python service that only speaks Unix sockets and reads
+`/proc`; they remove attack surface the broker was never going to use
+anyway. The one exception: `ProtectSystem=strict`/`ProtectHome=read-only`/
+`PrivateTmp=true` each independently place the broker in a private,
+unprivileged Linux user namespace. Two different things break under this
+deployment shape, discovered one after the other while building §6.11:
+*credential values* (uid/gid) outside the namespace's minimal mapping
+resolve to the kernel's overflow id instead of the real one; and reading
+*another process's* `/proc/<pid>/exe` (or `/maps`, `/mem` — anything
+`ptrace_may_access()`-gated) is denied outright (`PermissionError`), not
+just resolved to the wrong value — the same gate, and the same open
+question about its exact mechanism under `systemd --user`, that §6.9
+already ran into for a different check. Neither affects plain,
+non-ptrace-gated `/proc` reads like `comm`, `status`'s pid/uid lines, or
+`cmdline` — which is why §6.1's checks were never affected, and why each
+successive version of §6.11's fix had to stop depending on resolving a
+value *or* ptrace-reading the peer at all. See §6.9 and §6.11 for the full
+history.
 
 ### 6.8 PATH shadowing is what makes interception actually happen
 
@@ -510,6 +551,200 @@ cancel/expiry don't trigger a `sudo` retry. Getting this wrong only affects
 what the modal *says*; it never changes whether a request needs a real human
 approval, still gated by the exact same checks as any other request.
 
+### 6.11 The askpass helper itself must carry an identity it can't fake
+
+§6.1's checks (`pid_mismatch`, `not_sudo_child`, the privilege-escalation
+requirement) all validate the connecting peer's *parent* — that it's a
+real, genuinely escalated `sudo`. They don't validate the peer itself.
+`sudo` lets the *caller* choose the `SUDO_ASKPASS` helper (there's no
+restriction on what that helper is), so an agent that invokes real `sudo`
+directly — bypassing this project's own PATH-shadow wrapper entirely, §6.8
+— can point `SUDO_ASKPASS` at a script it wrote itself. That script is a
+genuine child of a genuinely escalated real `sudo`, so it passes every
+check §6.1 can make, yet it's still caller-writable code that would receive
+the plaintext secret in its own memory once a human approves — exactly
+what "the password never reaches the agent" promises never happens
+(reported by HANCORE-linux, issue #9558, as a fourth-round follow-up to the
+same request-to-password boundary).
+
+The fix installs the askpass binary (`askpass/doorman-askpass.c`) once, by
+root (`scripts/doorman-install-askpass`), at a fixed path *outside* the
+plugin's own git checkout, owned `root:root`, mode `0711`, and not writable
+or readable by the user the broker and every agent run as (only
+executable). The broker resolves that path's device+inode once at startup.
+For every `request`, the askpass binary opens its own `/proc/self/exe` and
+hands that file descriptor to the broker over the request socket as
+`SCM_RIGHTS` ancillary data, alongside the normal JSON request line
+(`Broker._recv_line_with_fd`). The broker `fstat()`s the received fd and
+compares it against the resolved identity — rejecting a mismatch (or a
+connection that never attached an fd at all) with `untrusted_askpass_helper`,
+in addition to every check that already applied. `fstat()` on an fd this
+process already owns needs no permission over whoever sent it; the only way
+to produce a matching fd is to have genuinely `exec`'d that exact file,
+since mode `0711` means nothing else can `open()` it by path to send a
+substitute.
+
+Opening `/proc/self/exe` is **not** privilege-exempt — confirmed live, the
+hard way (below): it goes through the exact same DAC read check as opening
+the target file by its real path, so mode `0711` that blocks a forged
+`open()`-by-path also blocks the legitimate binary's own self-open. The
+installed binary therefore also carries a file capability,
+`cap_dac_read_search` (applied by `scripts/doorman-install-askpass` via
+`setcap`, after `chown`/`chmod` but before the file is moved into place —
+writing to a file's content clears any capability already set on it, so
+order matters), letting *that exact binary, once exec'd* bypass this one
+read check. Deliberately not `setuid-root`: a memory-safety bug in this
+C code can, at worst, read a file it otherwise couldn't — it can't become
+arbitrary code execution as root. An attacker's own substitute binary never
+inherits this capability (file capabilities only apply at `execve()` of the
+specific capability-bearing file), so `open()`-ing the trusted path
+directly from attacker code is still just as blocked as before.
+
+This compares the **device and inode number**, not the path as a string.
+Two different files can share a path string across different mount
+namespaces (an unprivileged user can create one with `unshare --user
+--mount` and bind-mount something else over the same-looking path, visible
+only to processes in that namespace) without sharing an inode — comparing
+resolved identity rather than a rendered string closes that off without
+needing to reason about which namespace produced which string.
+
+**This replaces three earlier versions of this fix, each caught by live
+verification before shipping.** The first two fail for the same underlying
+reason: this project's own hardened systemd unit (§6.6/§6.7) puts the
+broker in a private, unprivileged Linux user namespace with zero
+capabilities. The third fails for an unrelated reason: a wrong assumption
+about `/proc/self/exe` itself.
+
+The first version used a dedicated system group and a `setgid` bit,
+verified via the connecting peer's effective gid over `SO_PEERCRED`. Sound
+on paper, and initially endorsed by HANCORE-linux — but any uid/gid outside
+the broker's namespace's minimal mapping, including the dedicated group's
+gid, collapses to the kernel's overflow id when the broker tries to
+resolve it (confirmed by comparing `/proc/<broker_pid>/ns/user` against the
+host's). A gid-based check is structurally unable to distinguish the
+trusted group from any other gid under that sandboxing.
+
+The second version, believing the problem was specifically about resolving
+*credential values*, had the broker `stat()` the connecting peer's own
+`/proc/<pid>/exe` directly by path instead — no gid, no group, nothing but
+device+inode. That assumption was wrong: reading *another process's*
+`/proc/<pid>/exe` turns out to need the same ptrace-equivalent permission
+§6.9 already ran into and left as an open question (`ptrace_may_access()`
+gates it, same as `comm`'s rejected `exe`-based alternative) — confirmed
+live here too: every attempt, including the genuinely legitimate one,
+failed with `PermissionError(13)`, reproduced identically for both the
+real C binary and a disposable Python stand-in with verified-uniform
+(real=effective=saved, matching the broker's own) uid/gid credentials —
+ruling out a plain uid/gid mismatch and pointing at the same permission
+gate §6.9 hit. §6.9's own note is the more honest summary: capabilities
+alone don't fully explain it (granting `CAP_SYS_PTRACE` explicitly, with
+every other sandboxing directive stripped to zero, still didn't fix that
+check), and the exact mechanism — something about how `systemd --user`
+services relate to Yama's `ptrace_scope`, as opposed to a plain shell
+process with the same UID — is still an open question for a future
+contributor to chase down. What matters for this fix is simpler than
+explaining why: no version of the broker reading *anything* ptrace-gated
+about the peer has worked, tried twice now for two different checks, so
+the fix below doesn't try a third time on the *broker* side.
+
+The fd-passing design moves the problem to the *askpass* side instead: it
+never asks the broker to resolve a credential value or read anything about
+a process it didn't itself grant an fd to — `fstat()` on an already-owned
+fd is unconditionally allowed, independent of any namespace relationship
+between sender and receiver. That also means the *positive* path can be
+exercised in tests without root or a compiler (see `tests/test_broker.py`).
+But its first shipped version (mode `0711`, nothing else) assumed opening
+`/proc/self/exe` needs no permission at all — plausible-sounding, wrong.
+Confirmed live with a disposable copy of the real binary, `chmod 0100`
+(owner-execute-only, i.e. the same shape of restriction `0711` puts on the
+real binary for its own non-root invoker): `open("/proc/self/exe",
+O_RDONLY)` fails with `EACCES`, identical to the real binary's failure mode
+for the legitimate caller. Opening your own executable's content goes
+through the exact same DAC check as opening it by its real path — the
+kernel has no notion of "this process is exempt because it's reading
+itself." The capability described above (`cap_dac_read_search`, applied
+only to this one binary) is what actually closes that gap; it's a smaller
+grant than either of the two broker-side designs it replaced (no gid
+resolution, no elevated capability on the broker itself, nothing that
+needs to cross the namespace boundary that broke both earlier attempts).
+
+Four things this depends on, each closing a way the fix above could be
+reintroduced by accident, not just in theory:
+
+- **Execute-only, on purpose.** Mode `0711` (not `0755`) is what stops an
+  attacker from `open()`-ing the trusted path directly and sending *that*
+  fd instead of genuinely `exec`-ing it — without it, the fd-passing
+  protocol would authenticate "can read this file" rather than "actually
+  ran this file," which the user who runs every agent can always do
+  regardless.
+
+- **Outside the checkout, on purpose.** `omarchy plugin update` does a
+  `git pull` as the unprivileged user — if the binary lived inside the
+  tracked tree, that pull would silently rewrite its ownership/mode back to
+  something caller-writable on every update, with no error. A fixed,
+  root-owned path the plugin's own update path never touches is required,
+  not just tidier.
+- **Fails loudly, never silently.** If the configured path can't be
+  `stat`'d (the install step was never run, or the file was removed), the
+  broker does not fall back to the pre-fix guarantee. It sets
+  `askpass_identity_available = false`, keeps serving
+  `approve`/`cancel`/`pending`/`stats` (no `request` could have succeeded
+  anyway, so there's no stale-pending-request risk), surfaces the flag
+  through `stats` for the UI to show directly, and rejects every `request`
+  with `askpass_identity_unavailable` until it's fixed.
+
+- **The capability has to actually be there, not silently dropped.**
+  `scripts/doorman-install-askpass` applies `setcap cap_dac_read_search=ep`
+  as the *last* step before the binary is moved into place — writing to a
+  file's content strips any capability already on it, so compiling, then
+  `chown`/`chmod`, then `setcap`, then `mv` is the only safe order. The
+  script also refuses to install onto a `nosuid` mount (that mount option
+  silently drops file capabilities at `execve()` time, the same way it
+  drops `setuid`/`setgid` — failing to notice would reproduce the exact
+  "legitimate caller can't read itself" failure this fix exists to close,
+  just one layer further away) and verifies via `getcap` after install that
+  the capability actually stuck, rather than assuming `setcap` succeeding
+  means it took effect.
+
+Residual trade-off: this only binds *this connection's peer*, the same way
+every other check in §6.1 does — it says nothing about a second, different
+attack path that doesn't involve this socket at all (out of scope, §4.2).
+
+Verified live, 2026-10-07, all three cases: the legitimate round trip (real
+`sudo whoami` → real wrapper → real askpass binary → broker → a human
+approving in the real Quickshell modal → `sudo` returning successfully);
+the attack this section exists to stop (a script posing as `SUDO_ASKPASS`,
+invoked via real `sudo -A` with this project's own PATH-shadow wrapper
+bypassed entirely — rejected `untrusted_askpass_helper`, no secret ever
+left the broker); and the degraded state (the installed binary temporarily
+removed — every `request` rejected `askpass_identity_unavailable`, not
+silently accepted).
+
+### 6.12 The displayed command is derived from the real sudo invocation, not the caller
+
+§6.11 closes who can receive the secret. It doesn't, by itself, stop a
+caller running the genuinely trusted askpass binary (a legitimate
+invocation) from lying about what the human is approving: the request
+payload's `command` field used to be taken verbatim from the caller
+(`str(message.get("command", ""))`), display-only, with nothing tying it to
+what would actually run. A caller that controls its own environment also
+controls this field, and could show a harmless-looking string while a
+different command actually executes once approved.
+
+The fix reuses state §6.1 already resolves: the connecting peer's verified
+immediate parent — the real `sudo` process itself. `sudo`'s own `argv`
+(read from `/proc/<sudo_pid>/cmdline`, the kernel's own record of how that
+process was actually invoked) is what gets shown, not anything the caller
+sends. This can't be rewritten by the caller without compromising the real
+`sudo` binary itself, which is out of scope (§4.2) — the same reasoning
+§6.1 relies on for the escalation check.
+
+Residual trade-off: if that `/proc` read races the parent process exiting
+(the window between the broker verifying it and reading its cmdline), the
+displayed command falls back to a visible placeholder, never to the
+caller-supplied value — a display gap under an unlikely race, not a
+reopened trust boundary.
+
 ## 7. Known limitations
 
 - The trusted-UI check (§6.9) matches on `/proc/<pid>/comm`, which a
@@ -522,10 +757,27 @@ approval, still gated by the exact same checks as any other request.
 - The `~/.local/bin/sudo` shadow (§6.8) does not catch a caller that
   invokes `/usr/bin/sudo` by absolute path, or one running in an
   environment where `~/.local/bin` isn't on `PATH` ahead of `/usr/bin`
-  (non-interactive systemd units, cron, a stripped-down `PATH`).
-- No automated test against a real Quickshell session, real Omarchy, or
-  real `sudo` — the test suite drives the broker's own protocol directly
-  and via the askpass helper, not the full stack end to end.
+  (non-interactive systemd units, cron, a stripped-down `PATH`). Since
+  §6.11, this is a UX gap, not a disclosure one: bypassing the shadow no
+  longer lets a caller's own askpass receive the secret, so the only cost
+  is losing the friendly retry labeling and `DOORMAN_COMMAND` hint that
+  come from going through the wrapper.
+- §6.11's identity check requires a one-time, root-privileged install step
+  (`scripts/doorman-install-askpass`) that didn't exist before — every
+  other install step stays fully unprivileged. If that step is skipped, or
+  the installed file is later removed, the broker is designed to fail
+  loudly (`askpass_identity_unavailable`, surfaced via `stats`), never to
+  fall back silently to the pre-#9558-finding-4 guarantee, but it does mean
+  Doorman simply doesn't function until the install step has been run.
+- No automated test against a real Quickshell session or real Omarchy —
+  the test suite drives the broker's own protocol directly and via the
+  askpass helper (both the Python dev fixture and a real identity-matching
+  peer exercising §6.11's positive path — see
+  `test_request_with_real_trusted_askpass_identity_is_accepted`, which
+  needs no root or compiler and runs in regular CI). A real `sudo` round
+  trip through the installed C binary and a real Quickshell approval still
+  needs to be verified live on the maintainer's own machine, outside
+  automated CI.
 - No `qmllint` or static analysis on the QML yet.
 - The plugin's manifest `id` is load-bearing for Omarchy's bar layout
   (`~/.config/omarchy/shell.json` tracks placed widgets by id) — renaming it
@@ -551,9 +803,20 @@ process ancestry gets `untrusted_caller` on all four of
 approve/cancel/pending/stats, while `request` still succeeds for it, and —
 for §6.10 — that a same-`sudo_pid` retry is tagged `attempt = 2`, supersedes
 the previous pending request, and that unrelated or `sudo_pid`-less requests
-are unaffected.
+are unaffected; for §6.11 — that a peer who doesn't hand over a matching
+identity fd is rejected (`untrusted_askpass_helper`), that a
+missing/unresolvable trusted path fails loudly (`askpass_identity_unavailable`,
+also surfaced via `stats`) rather than silently skipping the check, and
+that a peer whose fd genuinely does match is accepted — no root or
+compiler needed for any of the three, unlike either design this
+replaced; and for §6.12 — that
+the displayed `command` is derived from the real sudo parent's own
+`/proc/<pid>/cmdline`, not from a lying caller-supplied payload field.
 `python3 -m unittest discover -s tests -p 'test_*.py'` must pass before any
-change to `broker/broker.py` is considered done.
+change to `broker/broker.py` is considered done; the askpass helper
+additionally builds clean under `-Wall -Wextra -Werror` and under
+ASan/UBSan (`.github/workflows/ci.yml`'s `askpass-helper` job) before any
+change to `askpass/doorman-askpass.c` is considered done.
 
 ## 9. Glossary
 

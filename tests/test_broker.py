@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 from pathlib import Path
 
@@ -43,6 +44,23 @@ TEST_TRUSTED_SUDO_EXE = TEST_TRUSTED_UI_EXE
 # succeed pass --trusted-sudo-allow-unprivileged-parent to skip that part
 # of the check while still exercising everything else it does.
 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT = "--trusted-sudo-allow-unprivileged-parent"
+
+# Broker._create_request (SPEC.md §6.11) additionally requires the
+# connecting peer to hand over an fd (SCM_RIGHTS) for its own
+# /proc/self/exe, fstat()-ing to a fixed, root-installed path — see
+# DEFAULT_TRUSTED_ASKPASS_PATH in broker.py. Plain client.call()/
+# request_secret() connections never attach one, so every broker below
+# that needs legitimate request creation to succeed also needs this
+# test-only bypass, unless the test is specifically exercising the identity
+# check itself.
+TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK = "--trusted-askpass-skip-identity-check"
+
+# A real file, used by the *mismatch* test below purely as "a path that
+# resolves fine at startup" — the request in that test never attaches an fd
+# at all (ordinary client.call(), like any non-askpass caller), so it's
+# rejected the same way a genuinely mismatched fd would be, without needing
+# root or a compiler.
+_ALWAYS_PRESENT_OTHER_PATH = str(Path(__file__).resolve())
 
 # Calling the client directly from this test process would make the
 # process's own parent (whatever launched the test runner, not something
@@ -113,6 +131,77 @@ def _request_and_hold(socket_path: Path, token: str, payload: dict) -> tuple[dic
     return json.loads(proc.stdout.readline()), proc
 
 
+# Like _SUBPROCESS_REQUEST_AND_HOLD_CODE, but also hands the broker an fd for
+# this process's own /proc/self/exe via SCM_RIGHTS — what the real askpass
+# binary does (SPEC.md §6.11) so the broker can fstat() an fd it owns instead
+# of stat()-ing the peer's /proc/<pid>/exe by path (doesn't work under this
+# project's own systemd hardening — see DEFAULT_TRUSTED_ASKPASS_PATH in
+# broker.py). sys.executable is both the configured trusted path and this
+# subprocess's own exe (spawned as [sys.executable, "-c", ...], not via a
+# shebang), so the fd genuinely matches — no root, no compiler needed.
+_SUBPROCESS_REQUEST_AND_HOLD_WITH_IDENTITY_CODE = (
+    "import array, json, os, socket, sys\n"
+    "payload = json.loads(sys.argv[3]); payload['pid'] = os.getpid()\n"
+    "msg = {'token': sys.argv[2], 'type': 'request', **payload}\n"
+    "line = (json.dumps(msg) + chr(10)).encode()\n"
+    "exe_fd = os.open('/proc/self/exe', os.O_RDONLY)\n"
+    "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
+    "    conn.connect(sys.argv[1])\n"
+    "    cmsg = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [exe_fd]))]\n"
+    "    conn.sendmsg([line], cmsg)\n"
+    "    os.close(exe_fd)\n"
+    "    reader = conn.makefile('rb')\n"
+    "    for _ in range(2):\n"
+    "        resp = reader.readline()\n"
+    "        if not resp: break\n"
+    "        sys.stdout.write(resp.decode()); sys.stdout.flush()\n"
+)
+
+
+def _request_and_hold_with_identity(
+    socket_path: Path, token: str, payload: dict
+) -> tuple[dict, subprocess.Popen]:
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-c", _SUBPROCESS_REQUEST_AND_HOLD_WITH_IDENTITY_CODE,
+            str(socket_path), token, json.dumps(payload),
+        ],
+        cwd=ROOT, stdout=subprocess.PIPE, text=True,
+    )
+    return json.loads(proc.stdout.readline()), proc
+
+
+# For test_command_metadata_is_derived_from_real_sudo_cmdline_not_caller_supplied:
+# forks a child that connects to the broker (the peer), while this process
+# itself stays alive as that child's real immediate parent — standing in
+# for sudo, like TEST_TRUSTED_SUDO_EXE does everywhere else in this file,
+# but with a distinctive, test-controlled cmdline (it's passed "marker" as
+# one of its own argv entries), so the broker's /proc/<pid>/cmdline-derived
+# "command" is something this test can assert on precisely.
+_SUBPROCESS_SUDO_PARENT_CODE = (
+    "import json, os, socket, sys\n"
+    "marker, socket_path, token = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+    # Via env, not argv: the payload (which deliberately carries a lying
+    # "command") must NOT itself appear in this process's own /proc/<pid>/
+    # cmdline, or the test below couldn't tell "derived from the real
+    # parent" apart from "the lie just happened to be passed through".
+    "payload_json = os.environ['DOORMAN_TEST_PAYLOAD']\n"
+    "_ = marker  # only to appear in this process's own /proc/<pid>/cmdline\n"
+    "pid = os.fork()\n"
+    "if pid == 0:\n"
+    "    payload = json.loads(payload_json); payload['pid'] = os.getpid()\n"
+    "    msg = {'token': token, 'type': 'request', **payload}\n"
+    "    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
+    "        conn.connect(socket_path)\n"
+    "        conn.sendall((json.dumps(msg) + chr(10)).encode())\n"
+    "        line = conn.makefile('rb').readline()\n"
+    "        sys.stdout.write(line.decode()); sys.stdout.flush()\n"
+    "    os._exit(0)\n"
+    "else:\n"
+    "    os.waitpid(pid, 0)\n"
+)
+
+
 class BrokerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -137,6 +226,7 @@ class BrokerTest(unittest.TestCase):
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -174,7 +264,13 @@ class BrokerTest(unittest.TestCase):
         self.addCleanup(holder.wait, timeout=2)
         self.assertTrue(created["ok"])
         pending = call(self.socket_path, self.token, {"type": "pending"})
-        self.assertEqual(pending["requests"][0]["command"], "fake-command")
+        # Not "fake-command": the displayed command is now derived from the
+        # real sudo parent's own /proc cmdline (SPEC.md §6.12), not trusted
+        # from the payload — here that "parent" is this test process
+        # itself, standing in for sudo, so it reflects the test runner's own
+        # argv. See test_command_metadata_is_derived_from_real_sudo_cmdline
+        # for the dedicated, precise assertion on that behavior.
+        self.assertTrue(pending["requests"][0]["command"])
         approved = call(
             self.socket_path,
             self.token,
@@ -546,6 +642,7 @@ class BrokerTest(unittest.TestCase):
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -635,6 +732,7 @@ class BrokerTest(unittest.TestCase):
                 "--trusted-sudo-exe",
                 TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -749,6 +847,206 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(stats["requests"], 1)
         self.assertEqual(stats["cancelled"], 1)
         self.assertEqual(stats["approved"], 0)
+
+    def test_request_with_mismatched_askpass_identity_is_rejected(self) -> None:
+        # Issue #9558, 4th finding: not_sudo_child only validates the
+        # peer's *parent* (that it's a real, escalated sudo). sudo lets the
+        # caller pick SUDO_ASKPASS, so the peer itself — the process that
+        # actually holds this connection and would receive the secret —
+        # could still be the attacker's own script, genuinely spawned by a
+        # genuine sudo. The broker only accepts a peer that hands it an fd
+        # (SCM_RIGHTS) whose fstat() matches a fixed, root-installed path;
+        # this test points that path at a real file and — like a plain
+        # client that never attaches an fd at all — doesn't send one, so
+        # there's nothing to match (identity_fd is None): exercising the
+        # same rejection a genuinely mismatched fd would also hit, without
+        # needing root or a compiler (see the next test for the
+        # missing-path case, and the one after for the real positive path).
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-askpass-mismatch.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--trusted-askpass-path", _ALWAYS_PRESENT_OTHER_PATH,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        result = _call_as_subprocess(
+            socket_path, self.token,
+            {"type": "request", "command": "untrusted-askpass-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
+
+    def test_request_is_rejected_when_askpass_path_is_missing(self) -> None:
+        # The install step (scripts/doorman-install-askpass) was never run,
+        # or the installed file was removed — the broker must fail loudly
+        # (askpass_identity_unavailable) rather than silently fall back to
+        # the pre-#9558 guarantee. Also confirms this is surfaced through
+        # `stats`, so the UI can show "Doorman: setup incomplete" instead
+        # of relying on someone to read the broker's own stderr.
+        missing_path = f"/nonexistent/doorman-askpass-test-missing-{uuid.uuid4().hex}"
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-askpass-missing-path.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--trusted-askpass-path", missing_path,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        result = _call_as_subprocess(
+            socket_path, self.token,
+            {"type": "request", "command": "unavailable-path-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "askpass_identity_unavailable"})
+        stats = call(socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats["ok"])
+        self.assertFalse(stats["askpass_identity_available"])
+
+    def test_request_with_real_trusted_askpass_identity_is_accepted(self) -> None:
+        # The genuine positive path: a peer that hands the broker an fd
+        # (SCM_RIGHTS) for its own /proc/self/exe, which really does fstat()
+        # to the configured trusted path. In production that path is the
+        # root-installed C binary; here it's simply sys.executable, and the
+        # connecting peer is spawned as [sys.executable, "-c", ...] (not via
+        # a shebang, which would make the interpreter the exe and the
+        # script just an argument) so its own exe genuinely is that same
+        # interpreter binary — no root, no compiler, and no setgid fixture
+        # needed, unlike the gid-based check this replaced (SPEC.md §6.11).
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-askpass-real-identity.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--trusted-askpass-path", sys.executable,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        payload = {"command": "real-identity-attempt", "origin": "llm", "capability": self.capability}
+        created, proc = _request_and_hold_with_identity(socket_path, self.token, payload)
+        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
+        self.addCleanup(proc.wait, timeout=5)
+        self.assertTrue(created.get("ok"), created)
+
+    def test_command_metadata_is_derived_from_real_sudo_cmdline_not_caller_supplied(self) -> None:
+        # Issue #9558: the displayed "command" must reflect what will
+        # actually run, not whatever the caller puts in the request
+        # payload — a caller that controls its own SUDO_ASKPASS also
+        # controls that field, and could show the human a harmless-looking
+        # lie while a different command actually executes. Spawns a
+        # sudo-parent stand-in with a known, distinctive cmdline, has the
+        # child report a deliberately different, lying "command", and
+        # asserts the broker shows the real one, not the lie.
+        marker = f"doorman-cmdline-marker-{uuid.uuid4().hex[:12]}"
+        lying_command = "deliberately-wrong-command-should-not-be-shown"
+        payload_json = json.dumps(
+            {"command": lying_command, "origin": "llm", "capability": self.capability},
+        )
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-cmdline.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "5",
+                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        env = os.environ.copy()
+        env["DOORMAN_TEST_PAYLOAD"] = payload_json
+        sudo_parent = subprocess.Popen(
+            [
+                sys.executable, "-c", _SUBPROCESS_SUDO_PARENT_CODE,
+                marker, str(socket_path), self.token,
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, text=True, env=env,
+        )
+        self.addCleanup(lambda: sudo_parent.stdout and sudo_parent.stdout.close())
+        created_line = sudo_parent.stdout.readline()
+        sudo_parent.wait(timeout=5)
+        created = json.loads(created_line)
+        self.assertTrue(created.get("ok"), created)
+
+        pending = call(socket_path, self.token, {"type": "pending"})
+        self.assertEqual(len(pending["requests"]), 1, pending)
+        shown_command = pending["requests"][0]["command"]
+        self.assertIn(marker, shown_command)
+        self.assertNotIn(lying_command, shown_command)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,17 @@ set -euo pipefail
 readonly real_sudo="/usr/bin/sudo"
 readonly runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
 readonly plugin_dir="${DOORMAN_PLUGIN_DIR:-${HOME}/.config/omarchy/plugins/mauricio.doorman}"
-readonly askpass="${DOORMAN_ASKPASS:-${plugin_dir}/askpass.py}"
+# The identity-pinned helper installed by scripts/doorman-install-askpass
+# (SPEC.md §6.11) — deliberately a fixed path outside the plugin's own git
+# checkout, owned root:root, mode 0711 (execute-only for this user) plus the
+# cap_dac_read_search file capability (needed to read its own executable
+# content; mode 0711 alone blocks that too). It hands the broker a file
+# descriptor for its own executable over the request socket (SCM_RIGHTS),
+# which the broker fstat()s to confirm it's genuinely this binary.
+# DOORMAN_ASKPASS stays available as an override for development/testing
+# against the plain Python askpass.py, which the broker will reject on the
+# production path (no matching identity fd).
+readonly askpass="${DOORMAN_ASKPASS:-/usr/local/lib/omarchy-doorman/doorman-askpass}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -35,7 +45,8 @@ case "${1:-}" in
 esac
 
 [[ -x "$askpass" || -f "$askpass" ]] || {
-  echo "doorman: askpass is not installed at $askpass" >&2
+  echo "doorman: askpass helper not installed at $askpass — run" \
+       "'sudo scripts/doorman-install-askpass' once first" >&2
   exit 1
 }
 

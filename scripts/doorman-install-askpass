@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One-time, root-privileged install step for the identity-pinned askpass
+# helper (SPEC.md §6.11). Safe to re-run (idempotent) — e.g. after `omarchy
+# plugin update`, which never touches anything installed here since it all
+# lives outside the plugin's own git checkout.
+#
+# Why outside the checkout: `omarchy plugin update` does a `git pull` as the
+# unprivileged user, which would silently rewrite ownership/mode back to a
+# caller-writable file on every update if the binary lived inside the
+# tracked tree — reopening the exact boundary this install step exists to
+# close, with no error. See SPEC.md §6.11 for the full rationale.
+#
+# The askpass binary proves its identity by handing the broker a file
+# descriptor for its own /proc/self/exe (SCM_RIGHTS), which the broker
+# fstat()s and compares (device+inode) against this fixed path. That means
+# this script has to make sure the invoking user can't read the installed
+# file directly and send an fd of *that* open instead of genuinely exec'ing
+# it — hence mode 0711 (root can read/write/execute; everyone else can only
+# execute). But opening your own /proc/self/exe is subject to that exact
+# same read check, confirmed live (EACCES for the legitimate, non-root
+# invoker too) — so the installed binary also carries the file capability
+# cap_dac_read_search, letting it bypass just that one read check without
+# running as root or gaining anything else. Two earlier versions of this
+# fix needed something else entirely: a group membership plus a setgid bit
+# (turned out unobservable by the broker under this project's own hardened
+# systemd unit), then the broker stat()-ing the peer's /proc/<pid>/exe
+# directly by path (same problem, one layer down — needs a ptrace-equivalent
+# capability the broker is denied by design). See SPEC.md §6.11 for the
+# full history.
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "doorman-install-askpass: must be run as root (sudo $0)" >&2
+  exit 1
+fi
+
+readonly install_dir="/usr/local/lib/omarchy-doorman"
+readonly binary_path="${install_dir}/doorman-askpass"
+readonly project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly source_path="${project_dir}/askpass/doorman-askpass.c"
+
+if [[ ! -f "$source_path" ]]; then
+  echo "doorman-install-askpass: source not found at $source_path" >&2
+  exit 1
+fi
+
+mkdir -p "$install_dir"
+chown root:root "$install_dir"
+chmod 0755 "$install_dir"
+
+# nosuid also silently drops file capabilities at exec time (same kernel
+# behavior as for setuid/setgid bits) — fail loudly here rather than let
+# the askpass binary fail mysteriously on every real invocation later.
+mount_opts="$(findmnt -no OPTIONS --target "$install_dir" 2>/dev/null || true)"
+if [[ ",${mount_opts}," == *,nosuid,* ]]; then
+  echo "doorman-install-askpass: $install_dir is on a nosuid mount —" \
+       "file capabilities would be silently dropped at exec time. Install" \
+       "somewhere else or remount without nosuid." >&2
+  exit 1
+fi
+
+if ! command -v setcap >/dev/null 2>&1; then
+  echo "doorman-install-askpass: 'setcap' not found — install libcap" \
+       "(e.g. pacman -S libcap / apt install libcap2-bin)" >&2
+  exit 1
+fi
+
+tmp_binary="$(mktemp "${install_dir}/.doorman-askpass.XXXXXX")"
+trap 'rm -f -- "$tmp_binary"' EXIT
+
+cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic \
+  -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+  -o "$tmp_binary" "$source_path"
+
+chown root:root "$tmp_binary"
+chmod 0711 "$tmp_binary"
+# Must be the last metadata operation before the move: writing to a file's
+# content clears any capability xattr already set on it, so setcap always
+# runs after the compiler has finished writing the binary.
+setcap cap_dac_read_search=ep "$tmp_binary"
+mv -f -- "$tmp_binary" "$binary_path"
+trap - EXIT
+
+installed_caps="$(getcap -- "$binary_path")"
+if [[ "$installed_caps" != *cap_dac_read_search* ]]; then
+  echo "doorman-install-askpass: setcap did not take effect ($installed_caps)" \
+       "— the askpass helper will fail to read its own executable at" \
+       "runtime. Check the filesystem's mount options." >&2
+  exit 1
+fi
+
+echo "doorman-install-askpass: installed $binary_path ($(stat -c '%U:%G %a' -- "$binary_path"), $installed_caps)"
+echo "doorman-install-askpass: done. Restart the broker (systemctl --user restart omarchy-doorman.service) to pick this up."
