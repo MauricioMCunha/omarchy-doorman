@@ -494,6 +494,27 @@ one deliberate `prctl`/`argv[0]` step instead of nothing, not the
 impossible-to-forge guarantee `exe` would have given. Still a large
 improvement over no check at all, which is what shipped first.
 
+**2026-11-05 note, added while writing §6.13:** §6.13 performed a later,
+more precise bisection of this same broker unit file while designing the
+identity-helper, and found that exactly five directives
+(`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=true`,
+`ProtectKernelTunables=true`, `ProtectControlGroups=true`) each
+independently cause this `EACCES`, and that a caller with *none* of those
+five succeeds with no special permission at all — not "stripped to zero"
+as stated two paragraphs above. That's a real tension with this section's
+own claim: if the bisection described here truly reached zero directives
+and still failed, the identity-helper's own unit (which deliberately keeps
+roughly fifteen *other* directives and drops only those five) shouldn't
+work either, yet it does, confirmed live. This section's "stripped to
+zero" characterization may simply have been imprecise, or the bisection
+it describes may have been run under different conditions than §6.13's —
+that wasn't re-verified before this note was written, and re-verifying it
+is out of scope here. Rather than guess which, treat §6.13's
+directive-by-directive bisection as the more rigorous, more precise
+finding on this exact question, and this section's broader "even stripped
+to zero" claim as superseded by it, the same way §6.11's mechanism is
+superseded by §6.13's.
+
 ### 6.10 A rejected password shows up as a retry, not a second, unrelated request
 
 Doorman never validates the password itself — that's `sudo`/PAM's job,
@@ -733,10 +754,11 @@ silently accepted).
 
 ### 6.12 The displayed command is derived from the real sudo invocation, not the caller
 
-§6.11 closes who can receive the secret. It doesn't, by itself, stop a
-caller running the genuinely trusted askpass binary (a legitimate
-invocation) from lying about what the human is approving: the request
-payload's `command` field used to be taken verbatim from the caller
+§6.11 — now superseded by §6.13, which closes the same question with a
+different mechanism — closed who can receive the secret. Neither version,
+by itself, stops a caller running the genuinely trusted askpass binary (a
+legitimate invocation) from lying about what the human is approving: the
+request payload's `command` field used to be taken verbatim from the caller
 (`str(message.get("command", ""))`), display-only, with nothing tying it to
 what would actually run. A caller that controls its own environment also
 controls this field, and could show a harmless-looking string while a
