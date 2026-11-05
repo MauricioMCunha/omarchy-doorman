@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # One-time, root-privileged install step for the identity-pinned askpass
-# helper (SPEC.md §6.11). Safe to re-run (idempotent) — e.g. after `omarchy
+# helper (SPEC.md §6.13). Safe to re-run (idempotent) — e.g. after `omarchy
 # plugin update`, which never touches anything installed here since it all
 # lives outside the plugin's own git checkout.
 #
@@ -10,7 +10,9 @@ set -euo pipefail
 # unprivileged user, which would silently rewrite ownership/mode back to a
 # caller-writable file on every update if the binary lived inside the
 # tracked tree — reopening the exact boundary this install step exists to
-# close, with no error. See SPEC.md §6.11 for the full rationale.
+# close, with no error. See SPEC.md §6.13 for the full rationale (§6.11
+# documents the superseded SCM_RIGHTS/cap_dac_read_search mechanism this
+# script no longer implements).
 #
 # The askpass binary proves its identity purely via /proc/<pid>/exe: the
 # separate identity-helper service inspects the calling process's

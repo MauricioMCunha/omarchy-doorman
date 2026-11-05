@@ -8,16 +8,16 @@ set -euo pipefail
 readonly real_sudo="/usr/bin/sudo"
 readonly runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
 readonly plugin_dir="${DOORMAN_PLUGIN_DIR:-${HOME}/.config/omarchy/plugins/mauricio.doorman}"
-# The identity-pinned helper installed by scripts/doorman-install-askpass
-# (SPEC.md §6.11) — deliberately a fixed path outside the plugin's own git
-# checkout, owned root:root, mode 0711 (execute-only for this user) plus the
-# cap_dac_read_search file capability (needed to read its own executable
-# content; mode 0711 alone blocks that too). It hands the broker a file
-# descriptor for its own executable over the request socket (SCM_RIGHTS),
-# which the broker fstat()s to confirm it's genuinely this binary.
+# The helper installed by scripts/doorman-install-askpass (SPEC.md §6.13)
+# — a fixed path outside the plugin's own git checkout, owned root:root,
+# mode 0755. The binary itself is privilege-free (no file capability, no
+# setuid/setgid, no fd-passing): its identity is instead confirmed by a
+# separate omarchy-doorman-identity-helper.service, which the broker
+# queries synchronously at accept() time, comparing the connecting peer's
+# /proc/<pid>/exe (device+inode) against this installed path.
 # DOORMAN_ASKPASS stays available as an override for development/testing
 # against the plain Python askpass.py, which the broker will reject on the
-# production path (no matching identity fd).
+# production path (identity-helper reports no match).
 readonly askpass="${DOORMAN_ASKPASS:-/usr/local/lib/omarchy-doorman/doorman-askpass}"
 
 for arg in "$@"; do

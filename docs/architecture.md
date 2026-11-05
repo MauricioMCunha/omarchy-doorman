@@ -8,21 +8,26 @@
    timeout, process binding, and buffer cleanup.
 3. **Authentication helper** — a small, dependency-free native binary
    (`askpass/doorman-askpass.c`), installed once by root at a fixed path
-   outside the plugin's own checkout, owned by root and only executable
-   (not readable or writable) by the user. It proves its identity by
-   handing the broker a file descriptor for its own executable
-   (`SCM_RIGHTS`) rather than the broker trying to inspect the connecting
-   process itself — reading another process's `/proc/<pid>/exe` needs a
-   permission this project's own systemd hardening denies the broker, so
-   the fd is passed instead of inspected. Opening its own `/proc/self/exe`
-   isn't privilege-exempt either (same DAC check as opening the file by
-   path), so the binary also carries the `cap_dac_read_search` file
-   capability, applied by the install script, scoped to this one binary
-   only. Limited integration with `sudo
-   askpass`, never receiving arbitrary commands from the plugin — and,
-   since this is the only thing the broker will hand the secret to, never a
-   plain script the agent itself could have written or pointed
-   `SUDO_ASKPASS` at. See `SPEC.md` §6.11.
+   outside the plugin's own checkout, owned by root and not writable by
+   the user. Unlike earlier designs, the binary itself is privilege-free:
+   no file capability, no `setuid`/`setgid`, and it never opens its own
+   `/proc/self/exe` or hands the broker a file descriptor. Instead, a
+   separate systemd `--user` unit — `omarchy-doorman-identity-helper`
+   (`identity_helper/identity_helper.py`), started independently of the
+   broker so it keeps none of the broker's own mount-namespace hardening —
+   answers one question: does a given pid's `/proc/<pid>/exe` identify the
+   same file (device+inode, via `fstat()`, never a path string) as this
+   installed binary? The broker queries that helper synchronously, the
+   instant it accepts a connection and before reading anything the peer
+   sends, holding a `pidfd` and briefly `SIGSTOP`ping the peer for the
+   duration of the query so a process that forks and execs into the
+   trusted binary mid-connection can't be mistaken for the real thing —
+   the peer is always resumed (`SIGCONT`) once the check completes,
+   whatever the answer. Limited integration with `sudo askpass`, never
+   receiving arbitrary commands from the plugin — and, since this is the
+   only thing the broker will hand the secret to, never a plain script the
+   agent itself could have written or pointed `SUDO_ASKPASS` at. See
+   `SPEC.md` §6.13.
 4. **Privileged operation** — `sudo` or `pkexec`, always with a verifiable
    scope and origin.
 

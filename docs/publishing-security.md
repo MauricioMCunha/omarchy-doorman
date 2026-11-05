@@ -237,4 +237,95 @@ project and has to go along with any submission.
     `askpass_identity_unavailable`, confirmed via the real system journal,
     not silently accepted). Still only a partial review.
 
+11. ~~Address HANCORE-linux's reopened finding on the same issue
+    ([#9558](https://github.com/omacom/omarchy-plugin-marketplace/issues/9558)):
+    the identity mechanism shipped for item 10 (`SCM_RIGHTS` + `fstat()` +
+    `cap_dac_read_search`) can be bypassed by sending an `open(trusted_path,
+    O_PATH)` descriptor instead of a genuine self-exe fd — `O_PATH` needs no
+    permission on the target and `fstat()`s identically to a real open,
+    defeating the device+inode pinning regardless of mode bits or
+    capability — plus a second, independently reported finding: the
+    installed helper's `cap_dac_read_search` follows a caller-controlled
+    token-file symlink under a caller-controlled `XDG_RUNTIME_DIR` and sends
+    its contents to a caller-controlled `DOORMAN_SOCKET`, with no sudo and
+    no human approval.~~ Done on 2026-11-05: closing the `O_PATH` finding
+    meant the broker could no longer trust anything the peer handed it as
+    proof of identity. The first candidate tried — have the broker read the
+    connecting peer's own `/proc/<pid>/exe` directly via the pid
+    `SO_PEERCRED` already gives it, the same approach item 10's "second
+    implementation" had already tried and failed at — was killed again, now
+    for two fully-understood reasons instead of the open question item 10
+    left behind: bisecting the broker's own unit file directive-by-directive
+    (via `systemd-run --user` against an ordinary sibling process) showed
+    `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=true`,
+    `ProtectKernelTunables=true`, and `ProtectControlGroups=true` **each
+    independently** block reading another process's `/proc/<pid>/exe` —
+    the broker's own mount namespace, not Yama's `ptrace_scope` as item 10
+    speculated — and, independent of that, `SO_PEERCRED`'s pid is captured
+    once at `connect()` time, so a forked sibling of the connecting process
+    can inherit the live socket and drive the protocol while the original
+    process execs into the trusted binary purely to fool a check performed
+    any time after the connection is accepted.
+
+    Shipped mechanism: a new, separate systemd `--user` unit,
+    `omarchy-doorman-identity-helper` (`identity_helper/identity_helper.py`),
+    started independently of the broker so it keeps none of its
+    mount-namespace-creating hardening directives. It answers one question
+    over a small `AF_UNIX` protocol — does a pid's `/proc/<pid>/exe` match
+    the trusted installed binary by device+inode — and the broker queries it
+    synchronously, for every accepted connection, immediately in `_handle`,
+    before reading anything from the peer. Discovered mid-implementation,
+    not anticipated in the original design: a same-process identity check
+    performed immediately at `accept()` does defeat the fork-then-exec
+    bypass (confirmed by an earlier live probe), but the real design's check
+    necessarily leaves the broker's process — it has to ask the separate
+    helper over its own IPC round trip, measured ~1.0–1.6ms, and
+    `fork()`+`execve()` into `/usr/bin/true` reliably won that race,
+    reproduced 3/3 times against the real identity-helper. The fix:
+    `os.kill(peer_pid, signal.SIGSTOP)`, sent before the pidfd and before
+    the helper query, using the POSIX uid-based signal permission model — a
+    different kernel path from `ptrace_may_access()`, unaffected by the
+    broker's sandboxing, confirmed live under the broker's full real
+    hardening stack via `systemd-run --user`. A stopped process can't fork
+    or exec no matter how long the query takes, so this isn't a race at
+    all; reproduced 5/5 safe with the fix (`SIGSTOP` delivered 0.02–0.03ms
+    after `accept()`) versus 3/3 vulnerable without it. The peer is always
+    resumed via `SIGCONT` in a `finally` block regardless of match outcome
+    — never `SIGKILL`, caught before it reached the implementer: an earlier
+    draft killed the peer on no-match, which would have killed every
+    trusted-UI (`approve`/`cancel`/`pending`/`stats`) connection, since
+    Quickshell/bridge.py legitimately never matches the askpass identity.
+    `pidfd_open()`, held for the query's duration, separately pins the pid
+    against kernel reuse during the IPC hop — a narrower race than the
+    fork/exec one, closed independently.
+
+    The askpass binary (`askpass/doorman-askpass.c`) goes back to being
+    privilege-free: no file capability, no `setuid`/`setgid`, no
+    `SCM_RIGHTS`, no self-exe open. `scripts/doorman-install-askpass` lost
+    the `setcap`/`nosuid`-check/`getcap`-verification logic entirely, and
+    the installed mode reverted from `0711` to `0755`. Independently, the
+    binary's token/capability reads now open with `O_NOFOLLOW` and verify
+    the resolved path via `/proc/self/fd/<fd>` against the expected
+    canonical path before trusting the content, closing the symlink finding
+    directly; and the production path stopped trusting `XDG_RUNTIME_DIR`/
+    `DOORMAN_SOCKET` from the environment at all, deriving both from
+    `getuid()` instead, since an attacker who invokes `/usr/bin/sudo`
+    directly with `SUDO_ASKPASS` set controls exactly that environment and
+    could otherwise aim the canonical-path check at a base directory of
+    their own choosing.
+
+    Nine new/updated regression tests across `tests/test_identity_helper.py`
+    and `tests/test_broker.py`, plus three in `tests/test_doorman_askpass_c.py`
+    covering the `O_NOFOLLOW`/canonical-path check and both environment
+    variables being ignored in production. Live-validated during design and
+    implementation (not simulated): the mount-namespace bisection above, the
+    confirmation that a `systemd --user` unit can't be granted
+    `AmbientCapabilities` at all, and the fork-timing reproduction against
+    the real, shipped identity-helper (3/3 vulnerable without `SIGSTOP`,
+    5/5 safe with it). Full end-to-end live verification against the real
+    systemd units and a real `sudo` round trip — not just the test suite —
+    is tracked separately and had not yet been run as of this writing; see
+    `docs/superpowers/plans/2026-11-05-askpass-identity-6th-design.md`'s
+    final task. Still only a partial review.
+
 Don't submit while any blocker above is still open.
