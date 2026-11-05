@@ -1,40 +1,42 @@
 /* Doorman's askpass helper.
  *
  * This is the only thing allowed to receive the plaintext secret from the
- * broker on the production path. sudo lets the *caller* choose the
- * SUDO_ASKPASS helper (there is no restriction on what that helper is), so
- * an agent that invokes real sudo directly can point SUDO_ASKPASS at code
- * it wrote itself — a genuine child of a genuinely privilege-escalated real
- * sudo, which passes every check the broker can make about that parent
- * (issue #9558). The broker closes that by also requiring the *peer
- * itself* — this process — to prove it actually is this exact file: it
- * opens its own /proc/self/exe and hands that file descriptor to the
- * broker over the request socket via SCM_RIGHTS ancillary data, alongside
- * the normal JSON request line. The broker fstat()s the fd it receives —
- * comparing device+inode, not any path string — against the fixed,
- * root-owned path this binary is installed at once by root
- * (scripts/doorman-install-askpass), outside this project's user-writable
- * git checkout. That installed file is also mode 0711 (executable, not
- * readable, by anyone but root): an attacker can't open() it by path and
- * send *that* fd instead, so the only way to produce a matching fd at all
- * is to have genuinely exec'd this exact file.
+ * broker on the production path. It is a privilege-free binary: no file
+ * capability, no setuid, no ambient permission beyond whatever its
+ * invoking user already has. Identity of the connecting peer is no longer
+ * this binary's concern — as of the askpass-identity 6th design, that
+ * question is answered by a separate identity-helper service the broker
+ * queries directly (see broker/broker.py and identity_helper/), so this
+ * binary no longer opens its own /proc/self/exe or sends any file
+ * descriptor to the broker. It talks to the broker over a single Unix
+ * socket using only the plain JSON-line protocol: one request line out,
+ * one decision line back.
  *
- * Opening our own /proc/self/exe is NOT privilege-exempt — it is subject
- * to the exact same DAC read check as opening the target file by its real
- * path, confirmed live (EACCES on every attempt under plain mode 0711 as
- * the non-root invoking user, legitimate caller included). So the
- * installed binary also carries a file capability, cap_dac_read_search
- * (set by the install script via setcap, never by this binary itself),
- * which lets *this process* bypass that one read check without running as
- * root or gaining any other privilege — unlike setuid-root, a
- * memory-safety bug here can't turn into arbitrary code execution as
- * root, only into reading something it otherwise couldn't. See SPEC.md
- * §6.11 for the full history, including why this isn't just a plain
- * stat() of the *peer's* /proc/<pid>/exe by the broker (the first thing
- * tried — needs a ptrace-equivalent capability the broker's own hardened
- * systemd unit denies it by design), and why that in turn replaced an
- * earlier setgid-plus-SO_PEERCRED-gid design (the broker's own sandboxing
- * couldn't reliably resolve the peer's gid either).
+ * Paths are pinned, not trusted from the environment. In production this
+ * binary derives its runtime directory from getuid() alone
+ * (/run/user/<uid>/omarchy-doorman) and never reads XDG_RUNTIME_DIR or
+ * DOORMAN_SOCKET — a 2026-10-25 finding (#9558) showed that trusting
+ * either from this process's environment lets an attacker who controls
+ * the invocation environment (which is most of what SUDO_ASKPASS callers
+ * control) redirect the token/capability reads and the socket connect to
+ * files and listeners of their own choosing, exfiltrating the broker
+ * token or spoofing a decision. Two environment variables,
+ * DOORMAN_RUNTIME_DIR_DEV_OVERRIDE and DOORMAN_SOCKET_DEV_OVERRIDE, exist
+ * solely for this binary's own test suite (tests/test_doorman_askpass_c.py)
+ * and are never set by anything in production (scripts/doorman-sudo,
+ * packaging/ service units).
+ *
+ * The token and capability files are read with an additional
+ * canonical-path check (read_file_trim_canonical, below) as defense in
+ * depth against symlink-based redirection, independent of the runtime
+ * directory already being pinned via getuid().
+ *
+ * Linking decision: kept dynamically linked. Removing the capability
+ * means this binary gains no privilege boundary an LD_PRELOAD could cross
+ * that the attacker (same uid, already controls the whole invocation
+ * environment) didn't already have over any other program they could run
+ * instead; static linking would add build complexity and lose automatic
+ * libc security patches for no closed threat.
  *
  * Deliberately self-contained: no exec, no libraries beyond libc, one
  * source file. Nothing here execs anything else, so there's no second
@@ -55,17 +57,7 @@
 
 #define MAX_LINE (16 * 1024)
 
-static char *read_file_trim(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    char *buf = malloc(MAX_LINE + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t n = fread(buf, 1, MAX_LINE, f);
-    fclose(f);
-    buf[n] = '\0';
+static void trim_in_place(char *buf, size_t n) {
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
                       buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
         buf[--n] = '\0';
@@ -76,6 +68,46 @@ static char *read_file_trim(const char *path) {
         start++;
     }
     if (start > 0) memmove(buf, buf + start, n - start + 1);
+}
+
+/* Opens path with O_NOFOLLOW (blocks the final path component being a
+ * symlink), then reads back the fd's own resolved path via
+ * /proc/self/fd/<fd> (reflects exactly what was opened — no re-lookup, so
+ * no TOCTOU window) and refuses to trust the content unless that resolved
+ * path exactly matches expected_path. Closes the 2026-10-25 finding
+ * (symlink-following read under an attacker-controlled base directory)
+ * independently of runtime_dir already being pinned via getuid() below —
+ * defense in depth, not redundant: this also catches an intermediate
+ * directory component being a symlink, which O_NOFOLLOW alone does not. */
+static char *read_file_trim_canonical(const char *path, const char *expected_path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    char fd_path[64], resolved[800];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(fd_path, resolved, sizeof(resolved) - 1);
+    if (n < 0) {
+        close(fd);
+        return NULL;
+    }
+    resolved[n] = '\0';
+    if (strcmp(resolved, expected_path) != 0) {
+        close(fd);
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    char *buf = malloc(MAX_LINE + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t len = fread(buf, 1, MAX_LINE, f);
+    fclose(f);
+    buf[len] = '\0';
+    trim_in_place(buf, len);
     return buf;
 }
 
@@ -90,43 +122,6 @@ static ssize_t write_all(int fd, const char *buf, size_t len) {
         off += (size_t)w;
     }
     return (ssize_t)len;
-}
-
-/* Sends buf like write_all(), except the first write() is a sendmsg()
- * carrying identity_fd as SCM_RIGHTS ancillary data — see the top comment
- * for why: this is how the broker learns the connecting peer really did
- * exec the trusted binary, without needing any permission over this
- * process from the broker's side. The rare case of a short first write
- * (the request line is a few hundred bytes, well under a socket buffer,
- * so in practice this never happens) falls back to a plain write() for
- * the remainder — the fd has already been delivered by then. */
-static ssize_t send_request_with_identity(int sockfd, const char *buf,
-                                            size_t len, int identity_fd) {
-    struct iovec iov = {.iov_base = (void *)buf, .iov_len = len};
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    memset(cmsgbuf, 0, sizeof(cmsgbuf));
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsgbuf;
-    msg.msg_controllen = sizeof(cmsgbuf);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &identity_fd, sizeof(int));
-
-    for (;;) {
-        ssize_t n = sendmsg(sockfd, &msg, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if ((size_t)n == len) return n;
-        return write_all(sockfd, buf + n, len - (size_t)n) < 0 ? -1 : (ssize_t)len;
-    }
 }
 
 /* Reads one '\n'-terminated line, bounded to buf_size - 1 bytes (matching
@@ -300,10 +295,10 @@ static int parse_string_field(const char *line, const char *key, char *out,
 int main(int argc, char **argv) {
     const char *prompt = (argc > 1) ? argv[1] : "Password: ";
 
-    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    const char *runtime_override = getenv("DOORMAN_RUNTIME_DIR_DEV_OVERRIDE");
     char runtime_dir[768];
-    if (xdg && *xdg) {
-        snprintf(runtime_dir, sizeof(runtime_dir), "%s/omarchy-doorman", xdg);
+    if (runtime_override && *runtime_override) {
+        snprintf(runtime_dir, sizeof(runtime_dir), "%s", runtime_override);
     } else {
         snprintf(runtime_dir, sizeof(runtime_dir), "/run/user/%d/omarchy-doorman",
                   (int)getuid());
@@ -313,18 +308,18 @@ int main(int argc, char **argv) {
     snprintf(token_path, sizeof(token_path), "%s/token", runtime_dir);
     snprintf(cap_path, sizeof(cap_path), "%s/llm-capability", runtime_dir);
 
-    char *token = read_file_trim(token_path);
-    char *capability = read_file_trim(cap_path);
+    char *token = read_file_trim_canonical(token_path, token_path);
+    char *capability = read_file_trim_canonical(cap_path, cap_path);
     if (!token || !*token || !capability || !*capability) {
         free(token);
         free(capability);
         return 2;
     }
 
-    const char *socket_env = getenv("DOORMAN_SOCKET");
+    const char *socket_override = getenv("DOORMAN_SOCKET_DEV_OVERRIDE");
     char socket_path[800];
-    if (socket_env && *socket_env) {
-        snprintf(socket_path, sizeof(socket_path), "%s", socket_env);
+    if (socket_override && *socket_override) {
+        snprintf(socket_path, sizeof(socket_path), "%s", socket_override);
     } else {
         snprintf(socket_path, sizeof(socket_path), "%s/broker.sock", runtime_dir);
     }
@@ -394,22 +389,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int identity_fd = open("/proc/self/exe", O_RDONLY);
-    if (identity_fd < 0) {
-        fprintf(stderr,
-                "doorman-askpass: cannot read own executable (open "
-                "/proc/self/exe: %s) — is cap_dac_read_search set? run "
-                "scripts/doorman-install-askpass as root\n",
-                strerror(errno));
+    if (write_all(fd, request, (size_t)n) < 0) {
         close(fd);
         return 1;
     }
-    if (send_request_with_identity(fd, request, (size_t)n, identity_fd) < 0) {
-        close(identity_fd);
-        close(fd);
-        return 1;
-    }
-    close(identity_fd);
 
     char line[MAX_LINE + 1];
     if (read_line(fd, line, sizeof(line)) < 0) {
