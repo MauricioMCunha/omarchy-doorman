@@ -14,3 +14,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Isolated worktrees for subagent-driven implementation work
+.worktrees/
