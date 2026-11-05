@@ -909,6 +909,66 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertTrue(result["ok"], result)
 
+    def test_trusted_ui_call_succeeds_through_sigstop_sigcont_round_trip(self) -> None:
+        # _check_peer_identity now SIGSTOPs every connecting peer before
+        # querying the identity-helper, then SIGCONTs it in a finally —
+        # including trusted-UI connections (approve/cancel/pending/stats),
+        # which will always come back "no_match" (Quickshell/bridge.py is
+        # never the askpass binary) but must still complete normally: the
+        # cached outcome is only ever consulted for kind == "request" (see
+        # _handle). Every other test either skips the identity check
+        # entirely (TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK, which never calls
+        # _check_peer_identity/SIGSTOP at all) or leaves the helper
+        # unreachable, so none of them actually exercise "helper is up,
+        # genuinely answers no_match, caller is still SIGSTOP'd+SIGCONT'd
+        # and still gets its response" for a UI-type call. This test's own
+        # connection *is* the peer that gets SIGSTOP'd+SIGCONT'd — if that
+        # round trip ever failed to resume it (the exact bug the plan's
+        # SIGSTOP addendum calls out — a crash between SIGSTOP and SIGCONT
+        # leaves the peer stopped forever), this test would hang and time
+        # out rather than merely fail an assertion.
+        helper_socket = self._start_identity_helper("/usr/bin/true")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-ui-sigstop.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+                "--identity-helper-socket", str(helper_socket),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        # This call's own connection is the one that gets SIGSTOP'd and
+        # SIGCONT'd by the broker, synchronously, before it ever reads this
+        # message — a hang here (bounded by the socket's own timeout in
+        # client.call) rather than a clean response would mean the resume
+        # path is broken.
+        pending = call(socket_path, self.token, {"type": "pending"})
+        self.assertTrue(pending["ok"], pending)
+        stats = call(socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats["ok"], stats)
+        # The helper was reachable at startup — this is about the helper
+        # being up and genuinely answering "no_match" for this UI call, not
+        # about the degraded-helper case (see
+        # test_request_is_rejected_when_identity_helper_is_unreachable).
+        self.assertTrue(stats["askpass_identity_available"])
+
     def test_request_with_mismatched_askpass_identity_is_rejected(self) -> None:
         # Issue #9558, 4th finding: not_sudo_child only validates the
         # peer's *parent* (that it's a real, escalated sudo). sudo lets the

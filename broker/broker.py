@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import secrets
+import signal
 import socket
 import stat
 import struct
@@ -542,28 +543,79 @@ class Broker:
 
     def _check_peer_identity(self, conn: socket.socket) -> str:
         # Called unconditionally for every accepted connection, immediately
-        # in _handle, before any data is read from the peer — a check
-        # performed any later can be fooled by a fork()+exec() on the same
-        # connection. See docs/superpowers/specs/
+        # in _handle, before any data is read from the peer. A check
+        # performed any later, OR any check that merely races the query
+        # against the peer's own fork()+exec(), can be fooled — confirmed
+        # live, 2026-11-05, against the real identity-helper (3/3
+        # vulnerable without the SIGSTOP below; the broker<->helper round
+        # trip measured ~1-1.6ms, comfortably enough for an attacker's
+        # fork()+execve() to complete first). See docs/superpowers/specs/
         # 2026-11-05-askpass-identity-6th-design.md, "Validated findings"
-        # item 3.
+        # item 3 and its Addendum.
         creds = self._peer_credentials(conn)
         if creds is None or creds[1] != os.getuid():
             return "no_match"
         pid = creds[0]
         try:
-            # Pins this exact pid against kernel reuse for the duration of
-            # the broker<->helper round trip (pidfd_open(2)); without this,
-            # a pid reused by an unrelated process mid-query would be a
-            # narrower version of the same bug this whole design exists to
-            # close.
-            pidfd = os.pidfd_open(pid, 0)
+            # Freezes the peer before it can call fork()/execve() at all —
+            # not a speed race, since SIGSTOP cannot be caught, blocked, or
+            # ignored by the target (POSIX). Uses the uid-based signal
+            # permission model, a different kernel path from
+            # ptrace_may_access() (which finding 1 showed the broker's own
+            # sandboxing blocks) — confirmed live under the broker's full
+            # real hardening stack: sending SIGSTOP/SIGCONT to an ordinary
+            # sibling process needs no special permission and raises
+            # nothing. Must happen before pidfd_open and before the helper
+            # query, in that order, every time.
+            #
+            # IMPORTANT: the peer is ALWAYS resumed via SIGCONT below,
+            # regardless of whether the identity matched — never killed
+            # here. This connection may be a trusted-UI connection
+            # (approve/cancel/pending/stats), whose own exe is
+            # Quickshell/bridge.py and will legitimately never match the
+            # askpass trusted path; killing on "no_match" would kill the UI
+            # on every single interaction. The security property this buys
+            # is simpler than "kill the attacker": it just guarantees the
+            # *snapshot* taken before resuming is the peer's true,
+            # pre-fork/exec identity, which the cached outcome then
+            # persists for _handle to act on once the message's kind is
+            # known. What happens to the peer process *after* being
+            # resumed is irrelevant — the broker's decision was already
+            # made.
+            os.kill(pid, signal.SIGSTOP)
         except OSError:
             return "no_match"
         try:
-            return self._query_identity_helper(pid)
+            try:
+                # Pins this exact pid against kernel reuse for the duration
+                # of the broker<->helper round trip (pidfd_open(2));
+                # without this, a pid reused by an unrelated process
+                # mid-query would be a narrower version of the same bug
+                # this whole design exists to close. The peer is already
+                # stopped by now, so this isn't closing the fork/exec race
+                # — just the separate pid-reuse one.
+                pidfd = os.pidfd_open(pid, 0)
+            except OSError:
+                return "no_match"
+            try:
+                return self._query_identity_helper(pid)
+            finally:
+                os.close(pidfd)
         finally:
-            os.close(pidfd)
+            # MUST run no matter how the block above exits (return, or an
+            # exception neither try above caught) — a stopped peer that's
+            # never resumed hangs forever. Confirmed the hard way: an
+            # unrelated bug in this mitigation's own validation harness
+            # crashed the query step after SIGSTOP had already been sent,
+            # and the test process hung permanently stopped until
+            # something external killed it. Always SIGCONT, never SIGKILL
+            # here — see the comment above the SIGSTOP call for why
+            # killing on "no_match" would be wrong (it would kill every
+            # legitimate UI connection).
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass  # ESRCH (peer already gone) — nothing left to resume
 
     def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
         creds = self._peer_credentials(conn)
