@@ -1,0 +1,41 @@
+[Unit]
+Description=Omarchy Doorman Identity Helper
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mauriciocunha/DEV/omarchy-doorman
+ExecStart=/home/mauriciocunha/DEV/omarchy-doorman/scripts/run-doorman-identity-helper
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+RuntimeDirectory=omarchy-doorman-identity-helper
+RuntimeDirectoryMode=0700
+ReadWritePaths=%t/omarchy-doorman-identity-helper
+UMask=0077
+
+# Deliberately omits PrivateTmp=, ProtectSystem=, ProtectHome=,
+# ProtectKernelTunables=, ProtectControlGroups= — each one independently
+# blocks reading another process's /proc/<pid>/exe by putting this unit in
+# its own private mount namespace (2026-11-05 "Validated findings" item 1,
+# docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md). Keeps
+# every other directive confirmed in that same finding not to break the
+# check.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RemoveIPC=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target
