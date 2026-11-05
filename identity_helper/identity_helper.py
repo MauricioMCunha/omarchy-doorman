@@ -67,18 +67,21 @@ class IdentityHelper:
     def _handle(self, conn: socket.socket) -> None:
         with conn:
             conn.settimeout(3.0)
-            try:
-                line = self._recv_line(conn)
-            except OSError:
-                return
-            if not line:
-                return
-            try:
-                message = json.loads(line)
-                pid = int(message["pid"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                return
-            self._send(conn, {"ok": self._identifies_trusted_askpass(pid)})
+            self._send(conn, {"ok": self._answer(conn)})
+
+    def _answer(self, conn: socket.socket) -> bool:
+        try:
+            line = self._recv_line(conn)
+        except OSError:
+            return False
+        if not line:
+            return False
+        try:
+            message = json.loads(line)
+            pid = int(message["pid"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return False
+        return self._identifies_trusted_askpass(pid)
 
     @staticmethod
     def _recv_line(conn: socket.socket) -> bytes | None:

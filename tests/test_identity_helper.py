@@ -14,6 +14,14 @@ def _query(socket_path: Path, pid: int) -> dict:
         line = conn.makefile("rb").readline(256)
     return json.loads(line)
 
+def _raw_query(socket_path: Path, payload: bytes) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(3.0)
+        conn.connect(str(socket_path))
+        conn.sendall(payload)
+        line = conn.makefile("rb").readline(256)
+    return json.loads(line)
+
 class IdentityHelperTest(unittest.TestCase):
     def _start(self, trusted_path: str) -> Path:
         temp = tempfile.TemporaryDirectory()
@@ -61,6 +69,19 @@ class IdentityHelperTest(unittest.TestCase):
             conn.connect(str(socket_path))
             conn.sendall(b"not json at all\n")
         self.assertEqual(_query(socket_path, os.getpid()), {"ok": False})
+
+    def test_oversized_message_does_not_crash_helper(self) -> None:
+        # Trusted path is this interpreter and the payload names our own pid, so a
+        # missing size bound would answer {"ok": True}; the bound must answer False.
+        socket_path = self._start(sys.executable)
+        oversized = (
+            b'{"pid": ' + str(os.getpid()).encode()
+            + b', "pad": "' + b"x" * 600 + b'"}'
+        )
+        for payload in (oversized + b"\n", oversized):
+            with self.subTest(trailing_newline=payload.endswith(b"\n")):
+                self.assertEqual(_raw_query(socket_path, payload), {"ok": False})
+                self.assertEqual(_query(socket_path, os.getpid()), {"ok": True})
 
     def test_missing_trusted_path_rejects_everything_without_crashing(self) -> None:
         socket_path = self._start("/nonexistent/doorman-fixture-missing")
