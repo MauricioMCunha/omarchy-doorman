@@ -131,6 +131,68 @@ real configuration — not assumed.
    deferred check is unsafe even independent of the fork trick: the
    process backing a pid is not a stable thing to inspect "later.")
 
+## Addendum (2026-11-05, discovered during Task 2 implementation): finding 3 above does not survive the real architecture, and the fix for that
+
+Finding 3's probe performed the identity check **in-process**, directly after
+`accept()`, with a single `readlink()` syscall — essentially free. The actual
+design in this document cannot do that: the broker is barred from reading
+`/proc/<pid>/exe` itself (finding 1), so the check must cross to a second
+process, the identity-helper, over its own `AF_UNIX` round trip. Task 2's
+implementer built the real broker-side query against the real,
+already-shipped identity-helper and found it loses the race **deterministically
+(3/3 runs)**: the real round trip measured ~1.0–1.6ms, and `fork()`+`execve()`
+into `/usr/bin/true` reliably completes faster than that. Finding 3, as
+written, is true only for a same-process check and does not transfer to this
+design's actual, necessarily cross-process one. `pidfd_open()` pinning
+(already specified below) closes a different, narrower race (pid reuse
+*during* a slow IPC hop) — it does nothing about the identity-helper simply
+not getting to look in time.
+
+4. **`os.kill(pid, signal.SIGSTOP)`, sent immediately upon `accept()` before
+   anything else, closes this gap — validated live, same day, against the
+   real identity-helper and the real attack.** Signal delivery uses the
+   POSIX uid-based permission model (`kill(2)`: real/effective uid of sender
+   must match a real/effective/saved uid of the target, or `CAP_KILL`) — a
+   completely different kernel code path from `ptrace_may_access()`, which is
+   what finding 1 showed is blocked by the broker's own sandboxing. Confirmed
+   live: a sender replicating the broker's full hardening stack via
+   `systemd-run --user` (every directive in `packaging/omarchy-doorman.service`)
+   successfully `SIGSTOP`'d and `SIGCONT`'d an ordinary sibling process with
+   no special permission and no exception — this path is not subject to the
+   mount-namespace confinement finding 1 identified.
+
+   Reproduced the exact attack against the real, shipped
+   `identity_helper.identity_helper` module (not a simulated delay): **3/3
+   vulnerable without the mitigation** (helper replies `match` after the
+   attacker's parent completes its `execve()` into the trusted-path fixture
+   before the ~1–1.6ms round trip finishes), **5/5 safe with it** (`SIGSTOP`
+   sent in 0.02–0.03ms after `accept()` — before the attacker's own `fork()`
+   call could possibly have returned — then the real helper round trip
+   proceeds at its own pace, arbitrarily slower, with zero effect on the
+   outcome, because the frozen process cannot advance to `execve()` no matter
+   how long the query takes). `SIGSTOP`/`SIGCONT` cannot be caught, blocked,
+   or ignored by the target process (POSIX), so this does not depend on
+   winning a speed race at all — only on delivering one syscall before the
+   attacker's `fork()` returns, which a single local syscall always wins by a
+   wide margin. Also confirmed: a genuinely matching peer (no attack) is
+   correctly resumed via `SIGCONT` and its data flows through normally, total
+   added latency ≈1ms, imperceptible to a human.
+
+   **Discovered implementation requirement, not optional:** the
+   stop → query → resume sequence **must** be wrapped so that any failure in
+   the query step (exception, helper down, timeout) still resumes the
+   peer — never leaves it permanently stopped. Found this the hard way: an
+   unrelated test-harness bug crashed the query step after `SIGSTOP` had
+   already been sent, and the test process hung forever, stopped, because
+   nothing ever called `SIGCONT`. A bare `try/finally` around the query,
+   unconditionally calling `SIGCONT` in the `finally` (never `SIGKILL` —
+   this connection may be a legitimate trusted-UI connection that will
+   never match the askpass identity by design; see the resolved item below
+   for why killing on no-match is wrong), closes this. "Fail closed" here
+   means the *cached outcome* defaults to "no match" and is acted on later
+   when `_handle` knows the message's `kind` — not that the peer process
+   itself gets killed.
+
 ## Design
 
 ### New component: `omarchy-doorman-identity-helper`
@@ -167,6 +229,36 @@ finding 1 not to break the `/proc/<pid>/exe` read**. Deliberately omits
   for the whole exchange, independent of how long the IPC hop takes. The
   helper itself still just does `fstat()`-based device+inode comparison on
   `/proc/<pid>/exe` using that (now-safe) pid.
+- **The fork()+exec() timing attack itself (not just pid reuse during the
+  IPC hop) — see the Addendum above.** `pidfd_open` pinning does not stop the
+  attacker's own process from calling `execve()` while the broker↔helper
+  round trip is in flight; validated live (2026-11-05) that it doesn't need
+  to, because a stronger, independently-validated mechanism closes it
+  instead: immediately after capturing `SO_PEERCRED` in `_handle` — before
+  the pidfd, before the helper query, before anything else — the broker
+  calls `os.kill(peer_pid, signal.SIGSTOP)`. This uses the POSIX signal
+  permission model (matching uid), not `ptrace_may_access()`, so it is
+  unaffected by the broker's own sandboxing (confirmed live under the full
+  real hardening stack). A stopped process cannot call `fork()` or
+  `execve()` no matter how long the subsequent helper query takes, so the
+  query's latency (measured ~1–1.6ms against the real helper) stops being a
+  race at all. **The broker always resumes the peer with `SIGCONT` once the
+  check completes — regardless of match or no-match — never `SIGKILL`.**
+  This connection may be a trusted-UI connection (`approve`/`cancel`/
+  `pending`/`stats`), whose own exe is Quickshell/bridge.py and will
+  legitimately never match the askpass trusted path; killing on "no_match"
+  would kill the UI process on every single interaction — caught and fixed
+  before this reached the implementer, by re-examining the mitigation
+  against the unconditional-check design just below. The security property
+  comes entirely from the *snapshot* being taken before the resume, not
+  from anything done to the peer afterward: the cached match/no-match
+  outcome persists for `_handle` to act on (reject the eventual `request`
+  message, exactly as the unconditional-check design already specified)
+  once the message's `kind` is known, independent of whatever the resumed
+  peer process does next. The `SIGCONT` call **must** execute in a
+  `finally` block around the query, or a crashed/erroring query leaves the
+  peer permanently stopped (confirmed the hard way: this happened to the
+  validation harness itself before the `finally` was added).
 - **Does the accept-time check actually run before the peer's message type
   is known, without breaking UI (`approve`/`cancel`/`pending`/`stats`)
   connections?** It must not be hooked inside `_create_request` as
