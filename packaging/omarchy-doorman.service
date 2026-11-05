@@ -1,6 +1,8 @@
 [Unit]
 Description=Omarchy Doorman Broker
 After=graphical-session.target
+Wants=omarchy-doorman-identity-helper.service
+After=omarchy-doorman-identity-helper.service
 PartOf=graphical-session.target
 
 [Service]

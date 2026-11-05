@@ -45,21 +45,20 @@ TEST_TRUSTED_SUDO_EXE = TEST_TRUSTED_UI_EXE
 # of the check while still exercising everything else it does.
 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT = "--trusted-sudo-allow-unprivileged-parent"
 
-# Broker._create_request (SPEC.md §6.11) additionally requires the
-# connecting peer to hand over an fd (SCM_RIGHTS) for its own
-# /proc/self/exe, fstat()-ing to a fixed, root-installed path — see
-# DEFAULT_TRUSTED_ASKPASS_PATH in broker.py. Plain client.call()/
-# request_secret() connections never attach one, so every broker below
-# that needs legitimate request creation to succeed also needs this
-# test-only bypass, unless the test is specifically exercising the identity
-# check itself.
+# Broker._handle (SPEC.md §6.11) additionally requires the connecting
+# peer's real /proc/<pid>/exe — resolved out-of-process by the
+# identity-helper, never by the broker itself — to match a fixed,
+# root-installed path. Plain client.call()/request_secret() connections are
+# ordinary Python processes, not that binary, so every broker below that
+# needs legitimate request creation to succeed also needs this test-only
+# bypass, unless the test is specifically exercising the identity check
+# itself.
 TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK = "--trusted-askpass-skip-identity-check"
 
-# A real file, used by the *mismatch* test below purely as "a path that
-# resolves fine at startup" — the request in that test never attaches an fd
-# at all (ordinary client.call(), like any non-askpass caller), so it's
-# rejected the same way a genuinely mismatched fd would be, without needing
-# root or a compiler.
+# A real file, used as the identity-helper's configured trusted path in
+# tests that want the helper reachable but every real peer to mismatch it —
+# no process's /proc/<pid>/exe ever resolves to this test file, so the
+# helper always answers "no match" without needing root or a compiler.
 _ALWAYS_PRESENT_OTHER_PATH = str(Path(__file__).resolve())
 
 # Calling the client directly from this test process would make the
@@ -131,44 +130,58 @@ def _request_and_hold(socket_path: Path, token: str, payload: dict) -> tuple[dic
     return json.loads(proc.stdout.readline()), proc
 
 
-# Like _SUBPROCESS_REQUEST_AND_HOLD_CODE, but also hands the broker an fd for
-# this process's own /proc/self/exe via SCM_RIGHTS — what the real askpass
-# binary does (SPEC.md §6.11) so the broker can fstat() an fd it owns instead
-# of stat()-ing the peer's /proc/<pid>/exe by path (doesn't work under this
-# project's own systemd hardening — see DEFAULT_TRUSTED_ASKPASS_PATH in
-# broker.py). sys.executable is both the configured trusted path and this
-# subprocess's own exe (spawned as [sys.executable, "-c", ...], not via a
-# shebang), so the fd genuinely matches — no root, no compiler needed.
-_SUBPROCESS_REQUEST_AND_HOLD_WITH_IDENTITY_CODE = (
-    "import array, json, os, socket, sys\n"
-    "payload = json.loads(sys.argv[3]); payload['pid'] = os.getpid()\n"
-    "msg = {'token': sys.argv[2], 'type': 'request', **payload}\n"
-    "line = (json.dumps(msg) + chr(10)).encode()\n"
-    "exe_fd = os.open('/proc/self/exe', os.O_RDONLY)\n"
-    "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
-    "    conn.connect(sys.argv[1])\n"
-    "    cmsg = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [exe_fd]))]\n"
-    "    conn.sendmsg([line], cmsg)\n"
-    "    os.close(exe_fd)\n"
-    "    reader = conn.makefile('rb')\n"
-    "    for _ in range(2):\n"
-    "        resp = reader.readline()\n"
-    "        if not resp: break\n"
-    "        sys.stdout.write(resp.decode()); sys.stdout.flush()\n"
+# For test_fork_then_exec_on_connecting_peer_is_rejected: connects, then
+# forks — the parent immediately execve()s into a stand-in "trusted" binary
+# (standing in for "becomes the trusted askpass exe"), while the child
+# sleeps briefly and then drives the rest of the protocol on the same,
+# shared, already-connected socket. This is the exact live-tested attack
+# from docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md,
+# "Validated findings" item 3: SO_PEERCRED's pid is captured once at
+# connect() time and never updates, so a check performed any later than
+# accept()-time (before any data is read) would see this pid's post-exec
+# identity, not the real one that opened the connection.
+_SUBPROCESS_FORK_EXEC_ATTACK_CODE = (
+    "import json, os, socket, sys, time\n"
+    "socket_path, token, payload_json = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+    "payload = json.loads(payload_json)\n"
+    "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+    "s.connect(socket_path)\n"
+    "pid = os.fork()\n"
+    "if pid == 0:\n"
+    "    time.sleep(0.3)\n"
+    "    payload['pid'] = os.getppid()\n"
+    "    msg = {'token': token, 'type': 'request', **payload}\n"
+    "    s.sendall((json.dumps(msg) + chr(10)).encode())\n"
+    "    line = s.makefile('rb').readline()\n"
+    "    sys.stdout.write(line.decode()); sys.stdout.flush()\n"
+    "    os._exit(0)\n"
+    "else:\n"
+    "    os.execv('/usr/bin/true', ['/usr/bin/true'])\n"
 )
 
-
-def _request_and_hold_with_identity(
-    socket_path: Path, token: str, payload: dict
-) -> tuple[dict, subprocess.Popen]:
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-c", _SUBPROCESS_REQUEST_AND_HOLD_WITH_IDENTITY_CODE,
-            str(socket_path), token, json.dumps(payload),
-        ],
-        cwd=ROOT, stdout=subprocess.PIPE, text=True,
-    )
-    return json.loads(proc.stdout.readline()), proc
+# For test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe:
+# the broker no longer has any SCM_RIGHTS-handling code at all (Task 2's own
+# point — the identity-helper query replaced it), so a peer that still tries
+# the old trick — attaching an fd for some other, real, root-owned-looking
+# path via SCM_RIGHTS — gets nothing special: the fd is simply never read,
+# and the connecting peer's own real /proc/<pid>/exe (this Python
+# interpreter) is what the identity-helper is asked about, which mismatches
+# the broker's configured trusted path regardless of what was attached.
+_SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE = (
+    "import array, json, os, socket, sys\n"
+    "socket_path, token, trusted_path, payload_json = sys.argv[1:5]\n"
+    "payload = json.loads(payload_json); payload['pid'] = os.getpid()\n"
+    "msg = {'token': token, 'type': 'request', **payload}\n"
+    "line = (json.dumps(msg) + chr(10)).encode()\n"
+    "foreign_fd = os.open(trusted_path, os.O_PATH)\n"
+    "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
+    "    conn.connect(socket_path)\n"
+    "    cmsg = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [foreign_fd]))]\n"
+    "    conn.sendmsg([line], cmsg)\n"
+    "    os.close(foreign_fd)\n"
+    "    resp = conn.makefile('rb').readline()\n"
+    "    sys.stdout.write(resp.decode()); sys.stdout.flush()\n"
+)
 
 
 # For test_command_metadata_is_derived_from_real_sudo_cmdline_not_caller_supplied:
@@ -208,6 +221,11 @@ class BrokerTest(unittest.TestCase):
         self.socket_path = Path(self.temp.name) / "broker.sock"
         self.token = "test-token-only"
         self.capability = "test-llm-capability"
+        # Never started — pairs with TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK
+        # below to prove the skip path never even tries to reach a helper,
+        # not just that it happens to succeed because one is running. See
+        # test_skip_identity_check_never_contacts_identity_helper.
+        self.unstarted_identity_helper_socket = Path(self.temp.name) / "never-started-helper.sock"
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -227,6 +245,8 @@ class BrokerTest(unittest.TestCase):
                 TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
                 TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+                "--identity-helper-socket",
+                str(self.unstarted_identity_helper_socket),
             ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -247,6 +267,25 @@ class BrokerTest(unittest.TestCase):
         if self.process.stderr:
             self.process.stderr.close()
         self.temp.cleanup()
+
+    def _start_identity_helper(self, trusted_path: str) -> Path:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "helper.sock"
+        process = subprocess.Popen(
+            [sys.executable, "-m", "identity_helper.identity_helper",
+             "--socket", str(socket_path), "--trusted-askpass-path", trusted_path],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                return socket_path
+            time.sleep(0.02)
+        self.fail("identity helper did not create its socket")
 
     def test_request_approve_is_single_use(self) -> None:
         created, holder = _request_and_hold(
@@ -510,6 +549,11 @@ class BrokerTest(unittest.TestCase):
                 "--token", self.token,
                 "--llm-capability", self.capability,
                 "--timeout", "2",
+                # Irrelevant to what this test exercises (not_sudo_child);
+                # without it, the identity check — now run unconditionally
+                # before the sudo checks — would fail first against the
+                # default, unreachable production identity-helper socket.
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
             ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -554,6 +598,11 @@ class BrokerTest(unittest.TestCase):
                 "--llm-capability", self.capability,
                 "--timeout", "2",
                 "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                # Irrelevant to what this test exercises (not_sudo_child);
+                # without it, the identity check — now run unconditionally
+                # before the sudo checks — would fail first against the
+                # default, unreachable production identity-helper socket.
+                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
             ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -848,20 +897,31 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(stats["cancelled"], 1)
         self.assertEqual(stats["approved"], 0)
 
+    def test_skip_identity_check_never_contacts_identity_helper(self) -> None:
+        # self.process already runs with TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK
+        # and an --identity-helper-socket that was never started (no helper
+        # process at all) — if a request still succeeds, the broker never
+        # tried to reach it.
+        result = _call_as_subprocess(
+            self.socket_path, self.token,
+            {"type": "request", "command": "skip-check-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertTrue(result["ok"], result)
+
     def test_request_with_mismatched_askpass_identity_is_rejected(self) -> None:
         # Issue #9558, 4th finding: not_sudo_child only validates the
         # peer's *parent* (that it's a real, escalated sudo). sudo lets the
         # caller pick SUDO_ASKPASS, so the peer itself — the process that
         # actually holds this connection and would receive the secret —
         # could still be the attacker's own script, genuinely spawned by a
-        # genuine sudo. The broker only accepts a peer that hands it an fd
-        # (SCM_RIGHTS) whose fstat() matches a fixed, root-installed path;
-        # this test points that path at a real file and — like a plain
-        # client that never attaches an fd at all — doesn't send one, so
-        # there's nothing to match (identity_fd is None): exercising the
-        # same rejection a genuinely mismatched fd would also hit, without
-        # needing root or a compiler (see the next test for the
-        # missing-path case, and the one after for the real positive path).
+        # genuine sudo. The broker now settles that by asking the
+        # identity-helper whether the connecting peer's own real
+        # /proc/<pid>/exe matches the trusted path; here the helper is
+        # pointed at a real file that no process's exe ever resolves to, so
+        # a perfectly ordinary client (no SCM_RIGHTS, no trickery at all)
+        # is rejected the same way a genuinely mismatched peer would be.
+        helper_socket = self._start_identity_helper(_ALWAYS_PRESENT_OTHER_PATH)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         socket_path = Path(temp.name) / "broker-askpass-mismatch.sock"
@@ -874,7 +934,7 @@ class BrokerTest(unittest.TestCase):
                 "--timeout", "2",
                 "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--trusted-askpass-path", _ALWAYS_PRESENT_OTHER_PATH,
+                "--identity-helper-socket", str(helper_socket),
             ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -896,14 +956,18 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
 
-    def test_request_is_rejected_when_askpass_path_is_missing(self) -> None:
+    def test_request_is_rejected_when_helper_has_no_matching_trusted_path(self) -> None:
         # The install step (scripts/doorman-install-askpass) was never run,
-        # or the installed file was removed — the broker must fail loudly
-        # (askpass_identity_unavailable) rather than silently fall back to
-        # the pre-#9558 guarantee. Also confirms this is surfaced through
-        # `stats`, so the UI can show "Doorman: setup incomplete" instead
-        # of relying on someone to read the broker's own stderr.
+        # or the installed file was removed — the identity-helper itself
+        # (Task 1) always answers "no match" in that case rather than
+        # erroring, so from the broker's point of view this looks exactly
+        # like any other mismatched peer: untrusted_askpass_helper, not a
+        # distinct "unavailable" error. (Degraded-helper-process case is
+        # test_request_is_rejected_when_identity_helper_is_unreachable,
+        # below — that's the one that still needs its own error code and
+        # its own `stats` surfacing.)
         missing_path = f"/nonexistent/doorman-askpass-test-missing-{uuid.uuid4().hex}"
+        helper_socket = self._start_identity_helper(missing_path)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         socket_path = Path(temp.name) / "broker-askpass-missing-path.sock"
@@ -914,10 +978,9 @@ class BrokerTest(unittest.TestCase):
                 "--token", self.token,
                 "--llm-capability", self.capability,
                 "--timeout", "2",
-                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
                 "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--trusted-askpass-path", missing_path,
+                "--identity-helper-socket", str(helper_socket),
             ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -934,24 +997,68 @@ class BrokerTest(unittest.TestCase):
 
         result = _call_as_subprocess(
             socket_path, self.token,
-            {"type": "request", "command": "unavailable-path-attempt",
+            {"type": "request", "command": "unavailable-trusted-path-attempt",
              "origin": "llm", "capability": self.capability},
         )
-        self.assertEqual(result, {"ok": False, "error": "askpass_identity_unavailable"})
+        self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
+
+    def test_request_is_rejected_when_identity_helper_is_unreachable(self) -> None:
+        # Degraded-state check (SPEC.md's own design item 5): the
+        # identity-helper unit is stopped or never started at all — the
+        # broker must refuse every request loudly (identity_helper_unreachable)
+        # rather than silently falling back to accepting, and must surface
+        # that through `stats` too. UI-style calls (pending/stats) are
+        # unaffected: they never consult the identity-helper at all.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-helper-down.sock"
+        missing_helper_socket = Path(temp.name) / "no-such-helper.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path), "--token", self.token,
+                "--llm-capability", self.capability, "--timeout", "2",
+                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--identity-helper-socket", str(missing_helper_socket),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        result = _call_as_subprocess(
+            socket_path, self.token,
+            {"type": "request", "command": "helper-down-attempt",
+             "origin": "llm", "capability": self.capability},
+        )
+        self.assertEqual(result, {"ok": False, "error": "identity_helper_unreachable"})
         stats = call(socket_path, self.token, {"type": "stats"})
-        self.assertTrue(stats["ok"])
         self.assertFalse(stats["askpass_identity_available"])
+        # UI-style calls still work while the helper is down.
+        pending = call(socket_path, self.token, {"type": "pending"})
+        self.assertTrue(pending["ok"])
 
     def test_request_with_real_trusted_askpass_identity_is_accepted(self) -> None:
-        # The genuine positive path: a peer that hands the broker an fd
-        # (SCM_RIGHTS) for its own /proc/self/exe, which really does fstat()
-        # to the configured trusted path. In production that path is the
-        # root-installed C binary; here it's simply sys.executable, and the
-        # connecting peer is spawned as [sys.executable, "-c", ...] (not via
-        # a shebang, which would make the interpreter the exe and the
-        # script just an argument) so its own exe genuinely is that same
-        # interpreter binary — no root, no compiler, and no setgid fixture
-        # needed, unlike the gid-based check this replaced (SPEC.md §6.11).
+        # The genuine positive path: a peer whose own real /proc/<pid>/exe
+        # really does match the identity-helper's configured trusted path.
+        # In production that path is the root-installed C binary; here it's
+        # simply sys.executable, and the connecting peer is spawned as
+        # [sys.executable, "-c", ...] (not via a shebang, which would make
+        # the interpreter the exe and the script just an argument) so its
+        # own exe genuinely is that same interpreter binary — no root, no
+        # compiler, and no SCM_RIGHTS fd needed at all, unlike the mechanism
+        # this replaced (SPEC.md §6.11).
+        helper_socket = self._start_identity_helper(sys.executable)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         socket_path = Path(temp.name) / "broker-askpass-real-identity.sock"
@@ -964,7 +1071,7 @@ class BrokerTest(unittest.TestCase):
                 "--timeout", "2",
                 "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
                 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--trusted-askpass-path", sys.executable,
+                "--identity-helper-socket", str(helper_socket),
             ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -980,10 +1087,107 @@ class BrokerTest(unittest.TestCase):
             self.fail("broker did not create the socket")
 
         payload = {"command": "real-identity-attempt", "origin": "llm", "capability": self.capability}
-        created, proc = _request_and_hold_with_identity(socket_path, self.token, payload)
+        created, proc = _request_and_hold(socket_path, self.token, payload)
         self.addCleanup(lambda: proc.stdout and proc.stdout.close())
         self.addCleanup(proc.wait, timeout=5)
         self.assertTrue(created.get("ok"), created)
+
+    def test_fork_then_exec_on_connecting_peer_is_rejected(self) -> None:
+        # Live-tested attack from docs/superpowers/specs/
+        # 2026-11-05-askpass-identity-6th-design.md, "Validated findings"
+        # item 3: the connecting process forks right after connect(), the
+        # parent immediately execve()s into a stand-in trusted binary while
+        # the forked child drives the rest of the protocol on the same,
+        # already-connected socket. SO_PEERCRED's pid is captured once at
+        # connect() time and never updates, so this would fool any identity
+        # check performed after data is read from the peer. The broker's
+        # own check runs at accept()-time, before any read, and sees the
+        # real, pre-exec identity (this Python interpreter) — which doesn't
+        # match "/usr/bin/true" regardless.
+        helper_socket = self._start_identity_helper("/usr/bin/true")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-fork-exec-attack.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--identity-helper-socket", str(helper_socket),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        payload = json.dumps({"command": "fork-exec-attack", "origin": "llm", "capability": self.capability})
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SUBPROCESS_FORK_EXEC_ATTACK_CODE,
+             str(socket_path), self.token, payload],
+            cwd=ROOT, stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
+        self.addCleanup(proc.wait, timeout=3)
+        out = proc.stdout.readline()
+        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
+
+    def test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe(self) -> None:
+        # The broker no longer has any SCM_RIGHTS-handling code at all —
+        # this is Task 2's own point. A peer that still tries the old
+        # trick (attaching an fd for some other real path via SCM_RIGHTS)
+        # gets nothing special from it: the fd is simply never read, and
+        # the connecting peer's own real /proc/<pid>/exe (this Python
+        # interpreter, not /usr/bin/true) is what's actually checked.
+        helper_socket = self._start_identity_helper("/usr/bin/true")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-opath-bypass.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--identity-helper-socket", str(helper_socket),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        payload = json.dumps({"command": "opath-bypass-attempt", "origin": "llm", "capability": self.capability})
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE,
+             str(socket_path), self.token, "/usr/bin/true", payload],
+            cwd=ROOT, stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
+        self.addCleanup(proc.wait, timeout=3)
+        out = proc.stdout.readline()
+        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
 
     def test_command_metadata_is_derived_from_real_sudo_cmdline_not_caller_supplied(self) -> None:
         # Issue #9558: the displayed "command" must reflect what will
