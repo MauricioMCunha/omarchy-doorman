@@ -250,6 +250,72 @@ per-connection thread — negligible (a single local syscall) and not a new
 serialization concern, since nothing slow (the helper round trip) runs
 there.
 
+## Finding 5 (2026-11-08, found independently during the architecture-decision debate): Task 3/4 reopened a direct ptrace-memory-read of the plaintext secret — confirmed live, fixed, validated
+
+While dispatching independent reviewers to debate the fork-exec race (Finding
+4/Addendum 2), one raised an unverified hypothesis: Task 3's removal of
+`cap_dac_read_search` (closing the symlink-exfiltration finding) may have
+left the askpass binary **dumpable** again, since a Linux process's
+"dumpable" flag is automatically cleared to 0 by the kernel when it gains a
+file capability or a setuid/setgid bit at `execve()` — which the old,
+capability-bearing design did, as an unplanned side effect, and the new,
+privilege-free design (mode `0755`, no capability, no setuid/setgid) does
+not. A non-dumpable process cannot be `ptrace`'d by anyone lacking
+`CAP_SYS_PTRACE`, *regardless of process relationship*; a dumpable one can
+be `ptrace`'d by a genuine ancestor even under this machine's restricted
+Yama `ptrace_scope=1`, which exempts real ancestor-descendant relationships
+from its extra restriction (it only blocks unrelated same-uid attach
+attempts).
+
+**This matters here specifically because the real askpass process's own
+ancestry is attacker-controlled by construction:** the attacking agent
+invokes `sudo` directly with its own chosen `SUDO_ASKPASS`, making the agent
+a genuine ancestor (grandparent: agent → sudo → askpass) of the exact
+process that will hold the plaintext secret in memory. If that process is
+dumpable, **no identity check, no timing, no race of any kind is needed at
+all** — the agent can simply `PTRACE_ATTACH` its own legitimately-spawned
+descendant and read the secret directly out of its memory the instant it
+arrives from the broker. This is independent of, and substantially more
+severe than, Finding 4/Addendum 2's fork-exec race: it requires fooling
+nothing.
+
+**Confirmed live, this session:** compiled the real, as-shipped
+`askpass/doorman-askpass.c` (no capability, mode `0755`-equivalent) and
+built a process tree matching the real ancestry exactly (agent → "sudo"
+stand-in → "askpass" stand-in holding a known secret string in a local
+buffer, no `exec` needed to reproduce the vulnerable property). The
+top-level "agent" process successfully `PTRACE_ATTACH`'d its grandchild
+(`errno=0`) and recovered the exact secret bytes via `PTRACE_PEEKDATA`.
+Separately confirmed `/proc/<pid>/mem` access is denied for an *unrelated*
+same-uid sibling (gated by the stricter `PTRACE_MODE_ATTACH`, which Yama
+does restrict for non-ancestors) while `/proc/<pid>/environ` succeeds for
+that same unrelated sibling (gated by the weaker `PTRACE_MODE_READ`, which
+Yama does not additionally restrict) — neither of which is the relevant
+path here; the relevant path is the ancestor relationship, which Yama
+explicitly permits.
+
+**Validated fix, same session:** a single `prctl(PR_SET_DUMPABLE, 0)` call
+at the very start of `askpass/doorman-askpass.c`'s `main()`, before doing
+anything else. Needs no capability, no setuid/setgid bit, no architecture
+change — consistent with this design's goal of zero special permission bits
+anywhere. Confirmed live, same process-tree reproduction: with this one
+`prctl()` call added, the identical `PTRACE_ATTACH` attempt from the
+identical ancestor fails with `EPERM`. This should be treated as an
+independent, urgent fix — unlike Finding 4's race, it is 100% reliable (no
+race, no "N out of 20") and is a regression from this project's own recently
+shipped, reviewed, and approved Task 3 work, not a pre-existing accepted
+limitation.
+
+Note for whichever design direction Finding 4 lands on: if the eventual
+fix for the fork-exec race involves making the askpass binary `setgid` to a
+dedicated group again (as more than one candidate design under discussion
+proposes), that would *also* force the process non-dumpable as a side
+effect — but given this project was burned once already by relying on an
+side-effect of a mechanism rather than stating the requirement explicitly
+(§6.11's capability-grants-non-dumpable history), the explicit `prctl()`
+call should be added regardless, as defense-in-depth that doesn't depend on
+whatever the final identity-binding mechanism turns out to be.
+
 ## Design
 
 ### New component: `omarchy-doorman-identity-helper`
