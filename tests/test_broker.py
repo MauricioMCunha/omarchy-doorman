@@ -159,6 +159,34 @@ _SUBPROCESS_FORK_EXEC_ATTACK_CODE = (
     "    os.execv('/usr/bin/true', ['/usr/bin/true'])\n"
 )
 
+# For test_fork_before_connect_on_connecting_peer_is_rejected: forks BEFORE
+# calling connect() at all, so the parent's post-connect() critical path is
+# execve() alone, with no fork() call in it to pay for. This is the
+# "Addendum 2" (2026-11-08) attack: the original SIGSTOP mitigation ran
+# inside _handle, which only starts after serve()'s main accept loop has
+# already spawned a new thread for the connection — that thread-dispatch
+# latency alone was enough for this faster attacker to win the race. See
+# docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md,
+# "Addendum 2".
+_SUBPROCESS_PRECONNECT_FORK_ATTACK_CODE = (
+    "import json, os, socket, sys, time\n"
+    "socket_path, token, payload_json = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+    "payload = json.loads(payload_json)\n"
+    "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+    "pid = os.fork()\n"  # fork BEFORE connect() -- this is the point
+    "if pid == 0:\n"
+    "    time.sleep(0.3)\n"
+    "    payload['pid'] = os.getppid()\n"
+    "    msg = {'token': token, 'type': 'request', **payload}\n"
+    "    s.sendall((json.dumps(msg) + chr(10)).encode())\n"
+    "    line = s.makefile('rb').readline()\n"
+    "    sys.stdout.write(line.decode()); sys.stdout.flush()\n"
+    "    os._exit(0)\n"
+    "else:\n"
+    "    s.connect(socket_path)\n"
+    "    os.execv('/usr/bin/true', ['/usr/bin/true'])\n"
+)
+
 # For test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe:
 # the broker no longer has any SCM_RIGHTS-handling code at all (Task 2's own
 # point — the identity-helper query replaced it), so a peer that still tries
@@ -1203,6 +1231,58 @@ class BrokerTest(unittest.TestCase):
         out = proc.stdout.readline()
         self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
 
+    def test_fork_before_connect_on_connecting_peer_is_rejected(self) -> None:
+        # "Addendum 2" (2026-11-08, final whole-branch review): a faster
+        # attacker forks BEFORE calling connect(), so their post-connect()
+        # critical path is execve() alone — no fork() call left to pay for.
+        # The original SIGSTOP mitigation sent SIGSTOP from inside _handle,
+        # which only starts running after serve()'s main accept loop has
+        # already spawned a new thread for this connection; that
+        # thread-dispatch latency alone was enough for this attack to win
+        # the race (confirmed live, 5/5 vulnerable). The fix moves the
+        # SIGSTOP into serve()'s own main accept loop, synchronously,
+        # before any thread is spawned — see
+        # _stop_peer_for_identity_check and docs/superpowers/specs/
+        # 2026-11-05-askpass-identity-6th-design.md, "Addendum 2".
+        helper_socket = self._start_identity_helper("/usr/bin/true")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        socket_path = Path(temp.name) / "broker-preconnect-fork-attack.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--identity-helper-socket", str(helper_socket),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        payload = json.dumps({"command": "preconnect-fork-attack", "origin": "llm", "capability": self.capability})
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SUBPROCESS_PRECONNECT_FORK_ATTACK_CODE,
+             str(socket_path), self.token, payload],
+            cwd=ROOT, stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
+        self.addCleanup(proc.wait, timeout=3)
+        out = proc.stdout.readline()
+        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
+
     def test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe(self) -> None:
         # The broker no longer has any SCM_RIGHTS-handling code at all —
         # this is Task 2's own point. A peer that still tries the old
@@ -1311,6 +1391,71 @@ class BrokerTest(unittest.TestCase):
         shown_command = pending["requests"][0]["command"]
         self.assertIn(marker, shown_command)
         self.assertNotIn(lying_command, shown_command)
+
+    def test_stats_reflects_identity_helper_becoming_available_after_startup(self) -> None:
+        # self.askpass_identity_available used to be set once, at __init__
+        # time, by pinging the identity-helper — if the broker started
+        # before the helper's socket existed (a real possibility: the
+        # helper unit is Type=simple, so After= only orders process start,
+        # not socket readiness), the flag stayed stuck False for the whole
+        # session even once the helper came up. Fix: _stats() now re-pings
+        # live on every call. This starts a broker pointed at a helper
+        # socket that doesn't exist yet, confirms stats reports False, then
+        # starts the helper at that same path and confirms a later stats
+        # call reports True — proving the flag isn't just the __init__-time
+        # snapshot anymore.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        helper_socket_path = Path(temp.name) / "late-starting-helper.sock"
+        socket_path = Path(temp.name) / "broker-late-helper.sock"
+        process = subprocess.Popen(
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--token", self.token,
+                "--llm-capability", self.capability,
+                "--timeout", "2",
+                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+                "--identity-helper-socket", str(helper_socket_path),
+            ],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: process.stderr and process.stderr.close())
+        self.addCleanup(lambda: process.stdout and process.stdout.close())
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(process.terminate)
+        for _ in range(50):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("broker did not create the socket")
+
+        stats_before = call(socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats_before["ok"], stats_before)
+        self.assertFalse(stats_before["askpass_identity_available"])
+
+        # Now bring the helper up at the exact path the broker was told
+        # about, without restarting the broker.
+        helper_process = subprocess.Popen(
+            [sys.executable, "-m", "identity_helper.identity_helper",
+             "--socket", str(helper_socket_path), "--trusted-askpass-path", "/usr/bin/true"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: helper_process.stderr and helper_process.stderr.close())
+        self.addCleanup(lambda: helper_process.stdout and helper_process.stdout.close())
+        self.addCleanup(helper_process.wait, timeout=2)
+        self.addCleanup(helper_process.terminate)
+        for _ in range(50):
+            if helper_socket_path.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("identity helper did not create its socket")
+
+        stats_after = call(socket_path, self.token, {"type": "stats"})
+        self.assertTrue(stats_after["ok"], stats_after)
+        self.assertTrue(stats_after["askpass_identity_available"])
 
 
 if __name__ == "__main__":

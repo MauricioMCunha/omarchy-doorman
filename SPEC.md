@@ -1076,6 +1076,14 @@ reproduction against the real, shipped identity-helper.
   caller could claim an arbitrary `sudo_pid` to make an unrelated request
   falsely show as "attempt 2", or vice versa. Cosmetic only: it never
   changes which checks gate approval.
+- Nothing authenticates the identity-helper's own socket beyond filesystem
+  permissions — the same model the broker's own socket already relies on.
+  A same-uid process could stop the real identity-helper and bind a fake
+  one at the same path that always answers `{"ok": true}`, defeating
+  §6.11's identity check entirely. Accepted, not fixed: an attacker already
+  running at that privilege level has equivalent-or-greater options (for
+  instance, replacing the broker itself), so this doesn't lower the bar
+  below what same-uid code can already do.
 
 ## 8. Acceptance criteria
 
