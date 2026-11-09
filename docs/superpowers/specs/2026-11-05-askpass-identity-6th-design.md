@@ -193,6 +193,63 @@ not getting to look in time.
    when `_handle` knows the message's `kind` — not that the peer process
    itself gets killed.
 
+## Addendum 2 (2026-11-08, discovered during final whole-branch review): the SIGSTOP mitigation itself was raced, by a faster attacker, not a slower helper
+
+The final whole-branch review (`superpowers:requesting-code-review`, dispatched
+after Tasks 1-5 were each individually complete and clean) found that the
+shipped `_check_peer_identity` — SIGSTOP, then pidfd_open, then the helper
+query, all inside the per-connection thread `_handle` runs in — does not
+close the fork()+exec() timing attack after all. Finding 4 and its validation
+above tested an attacker who calls `fork()` **after** `connect()`; a faster
+attacker calls `fork()` **before** `connect()` instead, so the only thing
+left in their post-`connect()` critical path is `execve()` alone, with no
+`fork()` call in it at all. `connect()` on an `AF_UNIX` socket returns to the
+caller as soon as the kernel queues the connection in the listener's accept
+backlog — it does not wait for the server to call `accept()`. On the broker
+side, `_handle` only starts running (and only then does `_check_peer_identity`
+call `os.kill(..., SIGSTOP)`) after `serve()`'s main loop has already
+returned from `accept()` **and** spawned a new thread for this connection
+and that thread has actually been scheduled. That thread-dispatch overhead —
+confirmed live to be the deciding margin, not an theoretical concern — is
+enough window for a bare `execve()` (no `fork()` in the way) to complete
+first.
+
+**Confirmed live, independently, by both the reviewer and this document's
+author, against the real, shipped broker and identity-helper (not a
+simulation):** a two-process attacker — process A creates the socket, forks
+process B (which inherits the *unconnected* socket), then A alone calls
+`connect()` and immediately `execve()`s into a trusted-path stand-in while B
+drives the actual request over the now-connected, shared fd — got a real
+`request` accepted by the real broker (`{"ok":true,"request_id":...}`)
+5/5 times. An isolated probe that reproduces only the variable that matters
+— SIGSTOP sent from inside a freshly-spawned thread (mirroring `_handle`'s
+real structure) vs. SIGSTOP sent synchronously in the main accept loop
+*before* any thread is spawned — was 5/5 vulnerable in the first shape and
+8/8 safe in the second, isolating thread-dispatch latency (not helper
+latency, not anything the attacker does after `connect()`) as the actual
+deciding factor. The original Addendum's claim that "a single local syscall
+always wins by a wide margin" was true only when compared against an
+attacker still paying for a `fork()` call in their own critical path — it
+doesn't hold once that cost is removed.
+
+**Validated fix:** split `_check_peer_identity` in two. `SIGSTOP` moves into
+`serve()`'s own main accept loop, run synchronously, immediately after
+`accept()` returns and **before** `threading.Thread(...).start()` for that
+connection — there is no thread-dispatch gap left to exploit, because no
+thread exists yet at the point the signal is sent. Everything that can
+safely be slow — `pidfd_open`, the identity-helper round trip, the eventual
+`SIGCONT` — stays in the per-connection thread exactly as before, taking the
+already-stopped pid as a parameter instead of re-deriving it. Confirmed live,
+8/8, that this closes the pre-connect-fork variant with the same margin the
+original (now-shown-insufficient) design claimed for the post-connect-fork
+variant.
+
+This also means every connection now pays a few microseconds of `SIGSTOP`
+latency in the broker's single-threaded accept loop itself, not just in a
+per-connection thread — negligible (a single local syscall) and not a new
+serialization concern, since nothing slow (the helper round trip) runs
+there.
+
 ## Design
 
 ### New component: `omarchy-doorman-identity-helper`
