@@ -70,19 +70,10 @@ Panel {
         PanelHero {
           width: parent.width
           title: "Doorman"
-          meta: root.hostWidget && root.hostWidget.brokerOnline ? "LOCAL SESSION · ONLINE" : "LOCAL SESSION · OFFLINE"
+          meta: root.hostWidget && root.hostWidget.brokerOnline ? "SYSTEM SERVICE · ONLINE" : "SYSTEM SERVICE · OFFLINE"
           detail: root.hostWidget && root.hostWidget.requests.length > 0 ? String(root.hostWidget.requests.length) : ""
           foreground: root.contentForeground
           fontFamily: root.contentFontFamily
-          trailingControl: Component {
-            ToggleSwitch {
-              checked: root.hostWidget ? root.hostWidget.serviceDesired : false
-              busy: root.hostWidget ? root.hostWidget.serviceBusy : false
-              foreground: root.contentForeground
-              accent: Color.accent
-              onToggled: if (root.hostWidget) root.hostWidget.toggleBroker()
-            }
-          }
           iconComponent: Component {
             Text { text: "󰠚"; color: (root.hostWidget && root.hostWidget.requests.length > 0) ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.display }
           }
@@ -94,15 +85,16 @@ Panel {
         Button {
           width: parent.width
           leftAlign: true
-          // askpass_identity_available (SPEC.md §6.11/§6.12) is false when
-          // the privileged install step was never run, or a nosuid mount
-          // silently stripped the askpass binary's file capability — every
-          // request is refused until that's fixed. Surfaced here rather
-          // than only in the broker's own stderr.
+          // askpass_identity_available is false when the privileged install
+          // step was never run (or the askpass binary lost its setgid
+          // ownership) — every request is refused until that's fixed.
+          // Surfaced here rather than only in the broker's own stderr.
+          // This widget is status-only: the system service is managed with
+          // systemctl, not from the UI.
           text: root.hostWidget && root.hostWidget.requests.length > 0
             ? (root.hostWidget.requests.length + " request" + (root.hostWidget.requests.length > 1 ? "s" : "") + " · expires in " + root.hostWidget.duration(root.hostWidget.nextExpiry()))
             : (!root.hostWidget || !root.hostWidget.brokerOnline
-                ? "Broker unavailable"
+                ? "Broker unavailable — sudo systemctl enable --now omarchy-doorman.service"
                 : (root.hostWidget.metric("askpass_identity_available") === 0
                     ? "Setup incomplete — run doorman-install-askpass"
                     : "No pending authorization"))

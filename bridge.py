@@ -17,7 +17,6 @@ except ImportError:  # run directly by Quickshell's Process
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
-    parser.add_argument("--token-file", type=Path, required=True)
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("pending")
     sub.add_parser("stats")
@@ -28,16 +27,15 @@ def main() -> int:
     cancel.add_argument("request_id")
     cancel.add_argument("nonce")
     args = parser.parse_args()
-    token = args.token_file.read_text(encoding="utf-8").strip()
     if args.action == "pending":
-        result = call(args.socket, token, {"type": "pending"})
+        result = call(args.socket, {"type": "pending"})
     elif args.action == "stats":
-        result = call(args.socket, token, {"type": "stats"})
+        result = call(args.socket, {"type": "stats"})
     elif args.action == "cancel":
-        result = call(args.socket, token, {"type": "cancel", "request_id": args.request_id, "nonce": args.nonce})
+        result = call(args.socket, {"type": "cancel", "request_id": args.request_id, "nonce": args.nonce})
     else:
         secret = sys.stdin.readline().rstrip("\n")
-        result = call(args.socket, token, {"type": "approve", "request_id": args.request_id, "nonce": args.nonce, "secret": secret})
+        result = call(args.socket, {"type": "approve", "request_id": args.request_id, "nonce": args.nonce, "secret": secret})
     sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     return 0 if result.get("ok") else 1
 

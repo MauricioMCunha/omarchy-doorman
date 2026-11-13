@@ -17,8 +17,6 @@ BarWidget {
   property var selected: null
   property var metrics: ({})
   property bool brokerOnline: false
-  property bool serviceBusy: false
-  property bool serviceDesired: false
   property bool decisionBusy: false
   property string pendingApprovalSecret: ""
   property string approvalRequestId: ""
@@ -32,9 +30,8 @@ BarWidget {
 
   readonly property color foreground: bar && bar.foreground ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar && bar.fontFamily ? bar.fontFamily : Style.font.family
-  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy-doorman"
-  readonly property string socketPath: runtimeDir + "/broker.sock"
-  readonly property string tokenPath: runtimeDir + "/token"
+  // Control socket of the system broker (doorman-ui group ACL; no token).
+  readonly property string socketPath: "/run/doorman/control.sock"
   function localPath(url) {
     var value = String(url)
     return value.indexOf("file://") === 0 ? value.slice(7) : value
@@ -89,12 +86,6 @@ BarWidget {
       soonest = Math.min(soonest, Number(root.requests[i].expires_at || soonest))
     return Math.max(0, Math.floor(soonest - Date.now() / 1000))
   }
-  function toggleBroker() {
-    if (root.serviceBusy) return
-    root.serviceDesired = !root.brokerOnline
-    serviceProc.command = ["/usr/bin/systemctl", "--user", root.serviceDesired ? "start" : "stop", "omarchy-doorman.service"]
-    serviceProc.running = true
-  }
   function approveSecret(secret) {
     if (!root.selected || !secret || root.decisionBusy) return
     var requestId = root.selected.request_id
@@ -103,8 +94,7 @@ BarWidget {
     root.approvalRequestId = requestId
     root.approvalNonce = nonce
     root.requests = root.requests.filter(function (item) { return item.request_id !== requestId })
-    approveProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-      "--token-file", root.tokenPath, "approve", requestId, nonce]
+    approveProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "approve", requestId, nonce]
     root.pendingApprovalSecret = secret
     approveProc.running = true
   }
@@ -114,14 +104,13 @@ BarWidget {
     var nonce = root.selected.nonce
     root.decisionBusy = true
     root.requests = root.requests.filter(function (item) { return item.request_id !== requestId })
-    cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-      "--token-file", root.tokenPath, "cancel", requestId, nonce]
+    cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "cancel", requestId, nonce]
     cancelProc.running = true
   }
 
   Process {
     id: pollProc
-    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "--token-file", root.tokenPath, "pending"]
+    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "pending"]
     stdout: StdioCollector {
       onStreamFinished: {
         try {
@@ -159,14 +148,13 @@ BarWidget {
 
   Process {
     id: statsProc
-    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "--token-file", root.tokenPath, "stats"]
+    command: ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "stats"]
     stdout: StdioCollector {
       onStreamFinished: {
         try {
           var value = JSON.parse(text || "{}")
           root.metrics = value
           root.brokerOnline = value.ok === true
-          if (!root.serviceBusy) root.serviceDesired = root.brokerOnline
         } catch (e) { root.brokerOnline = false; root.metrics = ({}) }
       }
     }
@@ -184,8 +172,7 @@ BarWidget {
     }
     onExited: function (code) {
       if (code !== 0 && root.approvalRequestId !== "" && !cancelProc.running) {
-        cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath,
-          "--token-file", root.tokenPath, "cancel", root.approvalRequestId, root.approvalNonce]
+        cancelProc.command = ["/usr/bin/python3", root.bridgePath, "--socket", root.socketPath, "cancel", root.approvalRequestId, root.approvalNonce]
         cancelProc.running = true
       }
     }
@@ -195,15 +182,6 @@ BarWidget {
     id: cancelProc
     stdout: StdioCollector {}
     onExited: root.poll()
-  }
-
-  Process {
-    id: serviceProc
-    onStarted: root.serviceBusy = true
-    onExited: {
-      root.serviceBusy = false
-      root.poll()
-    }
   }
 
   SecureOverlay {

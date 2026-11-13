@@ -12,14 +12,20 @@ project and has to go along with any submission.
 - The plugin doesn't capture global keyboard, PTY, clipboard, or arbitrary
   commands.
 - The secret never enters arguments, files, logs, or the agent's messages.
-- The UI only approves a request authenticated by token, nonce, deadline,
-  and process identity.
-- The broker only accepts `origin=llm` with a valid session capability.
-- The socket and the session files are private to the user (`0700`/`0600`).
+- The UI only approves a request bound to its nonce, deadline, process
+  identity and the configured owner uid, and only over the control socket.
+- The broker only accepts a request from a process carrying the
+  `doorman-askpass` effective gid (the root-installed setgid askpass
+  binary), read from `SO_PEERCRED`. There is no session token, `origin`, or
+  capability (SPEC.md §6.9, §6.13).
+- Two sockets in `/run/doorman`, owned by the system user `doorman`, mode
+  `0660`, groups `doorman-askpass` and `doorman-ui`; no session files exist.
 - The UI calls absolute executables and the bridge ships alongside the
   plugin; there's no path override via environment variable.
 - The service is explicit and reversible; the plugin doesn't silently
-  install a service or package.
+  install a service or package. The broker is a system service installed by
+  one explicit root step (`scripts/doorman-install-askpass`, with
+  `--uninstall`), not a `systemd --user` unit.
 
 ## Blockers before submission
 
@@ -45,7 +51,10 @@ project and has to go along with any submission.
    as a git checkout, and places the widget without a full shell restart.
    The broker step (the `systemd --user` service) stays manual, since
    `omarchy plugin add` doesn't manage units — documented explicitly as
-   such.
+   such. *(Superseded 2026-11: the broker is now a system service installed
+   by `scripts/doorman-install-askpass` and started with
+   `systemctl enable --now`; the README documents that flow and its
+   `--uninstall` counterpart. Item 12 tracks that change.)*
 4. Test on a clean account: installation, shell restart, toggling the
    broker, approval, cancellation, expiry, removal, and rollback.
 5. ~~Add dependency review, `qmllint`, Python tests, and secret inspection
@@ -236,5 +245,131 @@ project and has to go along with any submission.
     binary temporarily removed — every `request` rejected
     `askpass_identity_unavailable`, confirmed via the real system journal,
     not silently accepted). Still only a partial review.
+
+11. ~~Address HANCORE-linux's reopened finding on the same issue
+    ([#9558](https://github.com/omacom/omarchy-plugin-marketplace/issues/9558)):
+    the identity mechanism shipped for item 10 (`SCM_RIGHTS` + `fstat()` +
+    `cap_dac_read_search`) can be bypassed by sending an `open(trusted_path,
+    O_PATH)` descriptor instead of a genuine self-exe fd — `O_PATH` needs no
+    permission on the target and `fstat()`s identically to a real open,
+    defeating the device+inode pinning regardless of mode bits or
+    capability — plus a second, independently reported finding: the
+    installed helper's `cap_dac_read_search` follows a caller-controlled
+    token-file symlink under a caller-controlled `XDG_RUNTIME_DIR` and sends
+    its contents to a caller-controlled `DOORMAN_SOCKET`, with no sudo and
+    no human approval.~~ Done on 2026-11-05: closing the `O_PATH` finding
+    meant the broker could no longer trust anything the peer handed it as
+    proof of identity. The first candidate tried — have the broker read the
+    connecting peer's own `/proc/<pid>/exe` directly via the pid
+    `SO_PEERCRED` already gives it, the same approach item 10's "second
+    implementation" had already tried and failed at — was killed again, now
+    for two fully-understood reasons instead of the open question item 10
+    left behind: bisecting the broker's own unit file directive-by-directive
+    (via `systemd-run --user` against an ordinary sibling process) showed
+    `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=true`,
+    `ProtectKernelTunables=true`, and `ProtectControlGroups=true` **each
+    independently** block reading another process's `/proc/<pid>/exe` —
+    the broker's own mount namespace, not Yama's `ptrace_scope` as item 10
+    speculated — and, independent of that, `SO_PEERCRED`'s pid is captured
+    once at `connect()` time, so a forked sibling of the connecting process
+    can inherit the live socket and drive the protocol while the original
+    process execs into the trusted binary purely to fool a check performed
+    any time after the connection is accepted.
+
+    Shipped mechanism: a new, separate systemd `--user` unit,
+    `omarchy-doorman-identity-helper` (`identity_helper/identity_helper.py`),
+    started independently of the broker so it keeps none of its
+    mount-namespace-creating hardening directives. It answers one question
+    over a small `AF_UNIX` protocol — does a pid's `/proc/<pid>/exe` match
+    the trusted installed binary by device+inode — and the broker queries it
+    synchronously, for every accepted connection, immediately in `_handle`,
+    before reading anything from the peer. Discovered mid-implementation,
+    not anticipated in the original design: a same-process identity check
+    performed immediately at `accept()` does defeat the fork-then-exec
+    bypass (confirmed by an earlier live probe), but the real design's check
+    necessarily leaves the broker's process — it has to ask the separate
+    helper over its own IPC round trip, measured ~1.0–1.6ms, and
+    `fork()`+`execve()` into `/usr/bin/true` reliably won that race,
+    reproduced 3/3 times against the real identity-helper. The fix:
+    `os.kill(peer_pid, signal.SIGSTOP)`, sent before the pidfd and before
+    the helper query, using the POSIX uid-based signal permission model — a
+    different kernel path from `ptrace_may_access()`, unaffected by the
+    broker's sandboxing, confirmed live under the broker's full real
+    hardening stack via `systemd-run --user`. A stopped process can't fork
+    or exec no matter how long the query takes, so this isn't a race at
+    all; reproduced 5/5 safe with the fix (`SIGSTOP` delivered 0.02–0.03ms
+    after `accept()`) versus 3/3 vulnerable without it. The peer is always
+    resumed via `SIGCONT` in a `finally` block regardless of match outcome
+    — never `SIGKILL`, caught before it reached the implementer: an earlier
+    draft killed the peer on no-match, which would have killed every
+    trusted-UI (`approve`/`cancel`/`pending`/`stats`) connection, since
+    Quickshell/bridge.py legitimately never matches the askpass identity.
+    `pidfd_open()`, held for the query's duration, separately pins the pid
+    against kernel reuse during the IPC hop — a narrower race than the
+    fork/exec one, closed independently.
+
+    The askpass binary (`askpass/doorman-askpass.c`) goes back to being
+    privilege-free: no file capability, no `setuid`/`setgid`, no
+    `SCM_RIGHTS`, no self-exe open. `scripts/doorman-install-askpass` lost
+    the `setcap`/`nosuid`-check/`getcap`-verification logic entirely, and
+    the installed mode reverted from `0711` to `0755`. Independently, the
+    binary's token/capability reads now open with `O_NOFOLLOW` and verify
+    the resolved path via `/proc/self/fd/<fd>` against the expected
+    canonical path before trusting the content, closing the symlink finding
+    directly; and the production path stopped trusting `XDG_RUNTIME_DIR`/
+    `DOORMAN_SOCKET` from the environment at all, deriving both from
+    `getuid()` instead, since an attacker who invokes `/usr/bin/sudo`
+    directly with `SUDO_ASKPASS` set controls exactly that environment and
+    could otherwise aim the canonical-path check at a base directory of
+    their own choosing.
+
+    Nine new/updated regression tests across `tests/test_identity_helper.py`
+    and `tests/test_broker.py`, plus three in `tests/test_doorman_askpass_c.py`
+    covering the `O_NOFOLLOW`/canonical-path check and both environment
+    variables being ignored in production. Live-validated during design and
+    implementation (not simulated): the mount-namespace bisection above, the
+    confirmation that a `systemd --user` unit can't be granted
+    `AmbientCapabilities` at all, and the fork-timing reproduction against
+    the real, shipped identity-helper (3/3 vulnerable without `SIGSTOP`,
+    5/5 safe with it). Full end-to-end live verification against the real
+    systemd units and a real `sudo` round trip — not just the test suite —
+    is tracked separately and had not yet been run as of this writing; see
+    `docs/superpowers/plans/2026-11-05-askpass-identity-6th-design.md`'s
+    final task. Still only a partial review. *(The mechanism in this item
+    was itself replaced; see item 12.)*
+
+12. **OPEN** — Shape B ("7th design") for the #9558 identity findings:
+    implemented, **not yet verified live, and #9558 is not reopened.** What
+    changed, as shipped in the code and described in SPEC.md §6.13: the
+    broker became a system service (`User=doorman`) with two sockets
+    (`askpass.sock`, group `doorman-askpass`; `control.sock`, group
+    `doorman-ui`); the askpass binary is installed `root:doorman-askpass`
+    `2755` and non-dumpable (`PR_SET_DUMPABLE`); the broker admits a
+    `request` only if the peer's effective gid from `SO_PEERCRED` is
+    `doorman-askpass`; each socket serves only its own verbs
+    (`wrong_socket`); every uid comparison is against the configured
+    `--owner-uid` and `approve`/`cancel` are bound to the request's owner uid;
+    and the whole token/capability/`origin=llm` layer was removed. The
+    identity-helper, `SIGSTOP`, `pidfd` and `/proc/<pid>/exe` mechanisms of
+    item 11 no longer exist in the code. Closed by design, live
+    verification pending: the `O_PATH` fd bypass (nothing is read from the
+    peer), the symlink/environment exfiltration (no file read, fixed socket
+    path), the fork-exec race (identity is the connect-time egid), and the
+    same-uid ptrace/memory read of the secret (non-dumpable). Confirmed live
+    so far: only the four kernel assumptions in the design record's spike.
+    Still to do, by a human with root (Task 12 of
+    `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`): the
+    real-unit end-to-end round trip, setgid surviving real `sudo -A`, the
+    socket ACL, §6.1's cross-uid `/proc` reads under the system unit, the
+    ptrace attempt against the real binary, the symlink/environment
+    reproduction, both fork-exec variants 20/20, the second-user
+    rejection, and the degraded-state check. Open deployment item: the
+    broker's code lives in the user's home, which `doorman` may not be able
+    to read under `ProtectHome=read-only`; it may need to be installed
+    outside `/home`. Also unresolved: the `/run/doorman` directory is
+    `0750 doorman:doorman`, and that the askpass binary and the UI can
+    traverse it to their sockets is unverified. Items 10 and 11 above are
+    kept as the record of the earlier designs; the mechanisms they describe
+    were replaced.
 
 Don't submit while any blocker above is still open.

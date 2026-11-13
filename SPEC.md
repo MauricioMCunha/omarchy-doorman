@@ -21,8 +21,8 @@ Three components:
 
 | Component | What it is | Trust level |
 |---|---|---|
-| **Broker** | A `systemd --user` Python service owning a private Unix socket | Trusted — holds the session token/capability, mediates every decision |
-| **UI (plugin)** | A Quickshell bar widget + modal | Trusted — the only thing that can approve/cancel, runs as the same user |
+| **Broker** | A **system** service (`omarchy-doorman.service`, user `doorman`) owning two Unix sockets (§6.13) | Trusted — mediates every decision; holds no token or capability |
+| **UI (plugin)** | A Quickshell bar widget + modal | Trusted — the only thing that can approve/cancel, runs as the login user, reaches the broker through the `doorman-ui` group socket |
 | **Requesting process** | Whatever called `sudo -A` (an agent's shell, a script) | Untrusted input — supplies metadata, never sees the secret |
 
 ## 2. Goals and non-goals
@@ -47,47 +47,48 @@ Three components:
   edit — interception is a per-user `PATH` shadow (§6.8), scoped to this
   user's own shells, not a machine-wide change.
 - Not protection against a compromised UI process itself, or against an
-  attacker who already has an interactive session as the same user and is
-  willing to guess a 256-bit token (see §4.3).
-- Not multi-user or networked — the socket is local, single-user, and the
-  project has no plan to change that.
+  attacker who already has an interactive session as the same user and
+  chooses to forge the trusted UI's process name (see §7).
+- Not multi-user or networked — the sockets are local and the broker is
+  pinned to exactly one login user (`--owner-uid`, §6.1); the project has no
+  plan to change that.
 
 ## 3. Architecture
 
 ```
 authorized command (sudo / sudo -A / SUDO_ASKPASS)
-    └─ askpass helper
-         └─ broker (Unix socket, private runtime dir)
-              └─ Quickshell plugin (topbar widget + modal)
-                   └─ human types the password locally
+    └─ askpass helper (setgid doorman-askpass, non-dumpable)
+         └─ /run/doorman/askpass.sock ──► broker (system service, user `doorman`)
+                                              ▲
+Quickshell plugin ─ bridge.py ─ /run/doorman/control.sock ┘
+   (topbar widget + modal)            (doorman-ui group)
+        └─ human types the password locally
 ```
 
 - **Broker** (`broker/broker.py`): single Python process, one thread per
-  connection, in-memory state only. Started by `systemd --user` with a
-  session token and an "LLM capability" string passed as `--token`/
-  `--llm-capability` (or `DOORMAN_TOKEN`/`DOORMAN_LLM_CAPABILITY`), both
-  generated fresh per session and stored under a private runtime directory.
+  connection, in-memory state only. Runs as the system user `doorman` under
+  `omarchy-doorman.service` (§6.7), started by
+  `scripts/run-doorman-broker`, which passes it the two socket paths, the
+  `doorman-askpass` gid and the single owner uid (`--owner-uid`). It holds no
+  token, capability or other secret: there is none (§6.9).
 - **askpass helper** (`askpass/doorman-askpass.c`, compiled and installed by
   `scripts/doorman-install-askpass`): implements the `SUDO_ASKPASS`
   contract — reads a prompt on argv, writes the secret to stdout, nothing
-  else. Installed once by root, outside the plugin's own git checkout,
-  owned `root:root`, mode `0711` (executable, not readable, by anyone but
-  root) and not writable by the user — this is what lets the broker tell it
-  apart from caller-written code that also happens to be a genuine child of
-  a genuinely escalated `sudo` (§6.11): the helper hands the broker a file
-  descriptor for its own `/proc/self/exe` over the request socket
-  (`SCM_RIGHTS`), and the broker compares that against this installed path.
-  The binary also carries the `cap_dac_read_search` file capability, set by
-  the install script — needed because opening `/proc/self/exe` isn't
-  privilege-exempt, so mode `0711` alone would block the legitimate binary
-  from reading itself too (§6.11).
+  else. Installed once by root at
+  `/usr/local/lib/omarchy-doorman/doorman-askpass`, outside the plugin's
+  own git checkout, owned `root:doorman-askpass`, mode `2755` (setgid), not
+  writable by the user. Its identity is its effective gid, which the kernel
+  records for the broker at `connect()` (§6.13) — the helper hands the broker
+  nothing to verify and opens no file. It is non-dumpable
+  (`prctl(PR_SET_DUMPABLE, 0)`), which §6.13 explains is mandatory.
   `broker/askpass.py` (and a self-contained copy, `askpass.py`, for when
-  `sudo` invokes it directly with no wrapper) are the pre-#9558-finding-4
-  Python implementation, kept only as a dev/test fixture — the broker
-  rejects them on the production path (`untrusted_askpass_helper`), since
-  they never attach that fd at all.
-- **bridge** (`bridge.py`): a secret-free CLI the Quickshell `Process` type
-  shells out to for `pending`/`stats`/`approve`/`cancel`. The secret is
+  `sudo` invokes it directly with no wrapper) are the earlier Python
+  implementation, kept only as a dev/test fixture — they are not setgid, so
+  the broker rejects them on the production path
+  (`untrusted_askpass_helper`).
+- **bridge** (`bridge.py`): a secret-free, tokenless CLI the Quickshell
+  `Process` type shells out to for `pending`/`stats`/`approve`/`cancel`,
+  always against `/run/doorman/control.sock` (`--socket`). The secret is
   piped over stdin on approval, never passed as an argument (arguments are
   visible to every other process on the machine via `/proc/<pid>/cmdline`).
 - **UI** (`BarWidget.qml`, `Panel.qml`, `SecureOverlay.qml`): a topbar icon
@@ -97,7 +98,10 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
   (Wayland layer-shell, exclusive keyboard focus while open) for the actual
   approve/deny decision. The modal is deliberately outside the bar's popout
   system — SecureOverlay must be able to appear (and grab exclusive keyboard
-  focus) whether or not the status popup is open.
+  focus) whether or not the status popup is open. The bar widget is
+  status-only: it shows broker state and hosts the modal, but has no
+  start/stop toggle, since the broker is a system service managed with
+  `systemctl` at install time, not from the UI.
 
 ## 4. Threat model
 
@@ -105,19 +109,23 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
 
 - A malicious or buggy **background agent process** that can set arbitrary
   *display* metadata (`cwd`, `tty`; `command` is no longer one of these —
-  see §6.12), can read the broker's public responses, and — this was wrong
-  in an earlier draft of this document — *does* have the session token and
-  capability: they live in files under the same UID the agent runs as,
-  exactly like the UI reads them. What the agent cannot do is claim a `pid`
-  other than its own real one, create a request at all without a real sudo
-  process as its connection's immediate parent (§6.1), invoke real `sudo`
-  with its own `SUDO_ASKPASS` and still be the one to receive the secret
-  (§6.11), act as the trusted UI (§6.9), or read the human's keystrokes
-  into the modal.
+  see §6.12), and runs as the same login user as the UI. There is no session
+  token or capability for it to find or lack (an earlier design had both and
+  they were removed, §6.9): its access is whatever the filesystem and socket
+  permissions give an ordinary process of that user, which includes
+  `doorman-ui` membership and therefore a connection to the control socket.
+  What the agent cannot do is claim a `pid` other than its own real one,
+  create a request at all without a real sudo process as its connection's
+  immediate parent (§6.1), connect to the request socket as anything but the
+  setgid askpass binary (§6.13), invoke real `sudo` with its own
+  `SUDO_ASKPASS` and still be the one to receive the secret (§6.13), ptrace
+  or read the memory of the askpass binary while it holds the secret
+  (§6.13), pass itself off as the trusted UI beyond the `comm` limitation in
+  §7, or read the human's keystrokes into the modal.
 - **Process identity drift**: the PID a request was opened for exits and is
   reused by an unrelated process before the human approves.
-- **Local resource exhaustion**: another process on the same machine (with
-  or without the token) trying to degrade the broker's availability.
+- **Local resource exhaustion**: another process on the same machine
+  trying to degrade the broker's availability.
 - **Replay**: reusing a `request_id`/`nonce` pair after it has already been
   consumed or has expired.
 
@@ -140,32 +148,37 @@ authorized command (sudo / sudo -A / SUDO_ASKPASS)
   against 192 bits of entropy over a local Unix socket is not a practical
   concern; the constant-time comparison is defense in depth, not the
   primary defense.
-- **A same-UID process that already has the token can still open up to
+- **A process that can pass the request gates can still open up to
   `MAX_PENDING` (20) concurrent requests**, each pinning a broker thread for
-  up to `timeout + 1` seconds. This requires the token/capability, so it is
-  a strictly smaller threat than the unauthenticated case fixed in §6.4; the
+  up to `timeout + 1` seconds. Creating a request requires the setgid askpass
+  egid and a genuine escalated `sudo` parent (§6.1, §6.13), so this is a
+  strictly smaller threat than the unauthenticated case fixed in §6.4; the
   cap exists so this stays a soft inconvenience, not a broker crash.
 
 ## 5. Protocol
 
-Transport: a single Unix stream socket, `0600`, under a `0700` directory.
-Every message is one line of UTF-8 JSON terminated by `\n`, capped at 16 KiB
+Transport: two Unix stream sockets in `/run/doorman`, both mode `0660`,
+owned by the system user `doorman` (§6.13) — `askpass.sock` (group
+`doorman-askpass`) serves `request`; `control.sock` (group `doorman-ui`)
+serves `approve`, `cancel`, `pending` and `stats`. A verb sent to the wrong
+socket gets `{"ok": false, "error": "wrong_socket"}`. Every message is one
+line of UTF-8 JSON terminated by `\n`, capped at 16 KiB
 (`MAX_LINE`); an oversized or unterminated line closes the connection with
 no response. The broker reads at most one request line per connection
 before dispatching — every request/response pair listed below is a full
 connection lifecycle (connect → send → read response(s) → close).
 
-All request objects carry a top-level `"token"` (the session token) checked
-with `secrets.compare_digest`. A wrong or missing token gets
-`{"ok": false, "error": "unauthorized"}` and nothing else runs.
+There is no `"token"` field and no `"origin"`/`"capability"` field: none of
+the messages below carries a bearer secret. Authorization is by the socket a
+connection arrived on plus the kernel-reported peer credentials (§6.13,
+§6.9). A client that still sends those legacy fields is simply ignored.
 
 ### 5.1 `request` — open a new authorization request
 
 ```jsonc
-// →
+// → on /run/doorman/askpass.sock only
 {
-  "token": "…", "type": "request",
-  "origin": "llm", "capability": "…",   // must match the broker's configured capability
+  "type": "request",
   "pid": 12345,                          // MUST be a positive integer of a live process
   "command": "sudo apt upgrade",         // free text, truncated to 1000 chars, display only
   "cwd": "/home/user/project",           // truncated to 1000 chars, display only
@@ -189,10 +202,9 @@ or, without a second response (connection closes immediately):
 {"ok": false, "error": "invalid_pid"}          // pid missing or <= 0
 {"ok": false, "error": "pid_mismatch"}         // claimed pid isn't this connection's real peer — see §6.1
 {"ok": false, "error": "not_sudo_child"}       // peer's parent process isn't sudo — see §6.1
-{"ok": false, "error": "askpass_identity_unavailable"} // trusted askpass path not installed — see §6.11
-{"ok": false, "error": "untrusted_askpass_helper"}     // peer didn't hand over a matching identity fd — see §6.11
+{"ok": false, "error": "wrong_socket"}         // sent on control.sock — see §6.13
+{"ok": false, "error": "untrusted_askpass_helper"}     // peer's effective gid isn't doorman-askpass — see §6.13
 {"ok": false, "error": "process_not_found"}    // /proc/<pid> unreadable or gone
-{"ok": false, "error": "invalid_llm_origin"}   // origin != "llm" or capability mismatch
 {"ok": false, "error": "too_many_pending"}     // MAX_PENDING (20) already open
 ```
 
@@ -216,7 +228,8 @@ to `timeout` seconds. See §6.2.
 
 ```jsonc
 // →
-{"token": "…", "type": "approve", "request_id": "…", "nonce": "…", "secret": "…"}
+// on /run/doorman/control.sock only
+{"type": "approve", "request_id": "…", "nonce": "…", "secret": "…"}
 // ←
 {"ok": true}
 {"ok": false, "error": "invalid_or_expired_request"}
@@ -224,14 +237,17 @@ to `timeout` seconds. See §6.2.
 
 Approval requires, atomically, under one lock acquisition: the request
 exists, is not yet delivered, the nonce matches (`secrets.compare_digest`),
-it hasn't expired, the process identity still matches (§6.1), and the
-secret is a string of at most 4096 bytes.
+it hasn't expired, the process identity still matches (§6.1), the control
+connection's peer uid equals the uid recorded when the request was created
+(§6.1), and the secret is a string of at most 4096 bytes. As with the other
+control verbs, the connection must also pass the trusted-UI check (§6.9),
+else `{"ok": false, "error": "untrusted_caller"}`.
 
 ### 5.3 `cancel` — explicit human rejection
 
 ```jsonc
 // →
-{"token": "…", "type": "cancel", "request_id": "…", "nonce": "…"}
+{"type": "cancel", "request_id": "…", "nonce": "…"}   // control.sock only
 // ←
 {"ok": true}   // or {"ok": false} if the id/nonce didn't match a live request
 ```
@@ -240,7 +256,7 @@ secret is a string of at most 4096 bytes.
 
 ```jsonc
 // →
-{"token": "…", "type": "pending"}
+{"type": "pending"}   // control.sock only
 // ←
 {"ok": true, "requests": [{"request_id": "…", "nonce": "…", "pid": …, "command": "…", "cwd": "…", "tty": "…", "prompt": "…", "screen": "…", "expires_at": …, "attempt": 1}]}
 ```
@@ -252,23 +268,26 @@ the request was correlated to an earlier one via `sudo_pid` (§6.10).
 
 ```jsonc
 // →
-{"token": "…", "type": "stats"}
+{"type": "stats"}   // control.sock only
 // ←
 {"ok": true, "uptime": 42, "pending": 0, "last_activity_at": 1234567890.1, "approved": 3, "cancelled": 1, "expired": 0, "requests": 4, "askpass_identity_available": true}
 ```
 
-`askpass_identity_available` is `false` when the trusted askpass path
-can't be `stat`'d (the install step was never run, or the installed file
-was removed — see §6.11) — every `request` is refused with
-`askpass_identity_unavailable` while this is `false`. The UI should
-surface this directly rather than require reading the broker's own stderr.
+`askpass_identity_available` is `false` when the `doorman-askpass` group
+doesn't resolve, or the installed binary is missing, isn't a regular file,
+lacks the setgid bit, or isn't owned `root:doorman-askpass` (the install
+step was never run, or its result was removed or altered — see §6.13). It is
+re-evaluated on every `stats` call. While it is `false` no process can carry
+the trusted egid, so every `request` is refused (`untrusted_askpass_helper`).
+The UI surfaces this directly rather than require reading the broker's own
+stderr.
 
 ## 6. Security properties and their rationale
 
 ### 6.1 Process identity is authenticated at request time, then re-checked at approval
 
 The `pid` field in a `request` message (§5.1) is attacker-controlled input —
-an agent holding the normal `origin=llm` token/capability could otherwise
+an agent could otherwise
 claim to be any PID that happens to exist, not even a real sudo/askpass
 process, display a convincing `command`, get a human to approve it, and
 receive the secret itself back on its own connection, since the response
@@ -277,10 +296,31 @@ always goes to whoever is actually connected, never to the claimed pid.
 reads the connection's real peer via `SO_PEERCRED` (kernel-verified, not
 something the remote process can forge — the same primitive §6.9 uses for
 the trusted-UI check) and rejects with `pid_mismatch` unless that peer's
-pid equals the claimed `pid` and its uid equals the broker's own. This
-changes nothing for the legitimate flow: askpass.py reports `os.getpid()`,
+pid equals the claimed `pid` and its uid equals the configured owner uid.
+This changes nothing for the legitimate flow: the askpass helper reports
 its own real pid, so the claim and the connection's real identity are
 always the same process to begin with.
+
+**Which uid "the owner" is (shape B).** Before the system-service move the
+broker ran as the login user, so these comparisons could use the broker's own
+uid. It now runs as the dedicated system user `doorman` (§6.13), so
+`os.getuid()` would be the wrong reference. Every peer-uid comparison in the
+broker — the `pid_mismatch` uid check above, the `not_sudo_child` parent's
+real uid, and the trusted-UI check (§6.9) — is against the single configured
+`--owner-uid` (the login user, supplied by `scripts/run-doorman-broker`),
+never against the broker's own uid. The owner uid is also bound to each
+request: `_create_request` records the creating connection's uid in the
+request, and `approve`/`cancel` succeed only if the control connection's
+peer uid equals it, so a request opened for one uid can never be decided by
+a connection from another.
+
+These checks read another uid's `/proc/<pid>/{comm,stat,status,cmdline}`
+from a process that is no longer that uid. They are plain, non-ptrace-gated
+reads (§6.7) and were validated under this unit's hardening during the
+spike (the unit file records this), but they remain part of the final live
+verification: the broker, the real `sudo` peer and its parent are all
+different uids than in the earlier `systemd --user` deployment, and §6.13
+lists that as an unrun check.
 
 That still leaves the actual case a maintainer's security review flagged
 on the marketplace submission (issue #9558): `pid_mismatch` only stops
@@ -331,10 +371,10 @@ start time/cmdline/uid won't match and the approval is rejected.
 ### 6.2 The handshake timeout is bounded, but the decision wait is not
 
 `_handle()` puts a 5-second (`HANDSHAKE_TIMEOUT`) socket timeout on the
-*first* read only — the line carrying the message type and token — then
+*first* read only — the line carrying the message — then
 clears it before doing anything else. This is deliberate: it closes a real
-denial-of-service (any same-UID process could open a connection, send
-nothing, and pin a broker thread forever, with no token required — fixed
+denial-of-service (any process that could reach the socket could open a
+connection, send nothing, and pin a broker thread forever — fixed
 after being found during manual testing), without breaking the legitimate
 case where a `request` connection needs to stay open for up to 300 seconds
 waiting on a human. A client library must apply the same split: a short
@@ -346,8 +386,11 @@ window.
 
 ### 6.3 Every comparison that gates a decision is constant-time
 
-`session_token`, `llm_capability`, and both nonce checks (`approve` and
-`cancel`) use `secrets.compare_digest`. This was inconsistent during
+Both nonce checks (`approve` and `cancel`) use `secrets.compare_digest`.
+(Earlier revisions also compared a session token and an LLM capability this
+way; both were removed with the token layer, §6.9. The uid and gid
+comparisons that now gate a decision are integer equality on
+kernel-reported values, not secret comparisons.) This was inconsistent during
 development — `approve` briefly used `==` while `cancel` used
 `compare_digest` for the identical check — and was corrected for
 consistency; see §4.3 for why the practical exposure was always low given
@@ -355,31 +398,79 @@ the nonce's entropy.
 
 ### 6.4 Concurrency is bounded at two layers
 
-- **Unauthenticated**: the handshake timeout (§6.2) bounds how long an
-  unauthenticated idle connection can hold a thread.
-- **Authenticated**: `MAX_PENDING` (20) bounds how many requests a valid
-  token holder can have open at once, checked and inserted atomically under
-  the broker's single lock to avoid a check-then-act race.
+- **Idle**: the handshake timeout (§6.2) bounds how long an idle connection
+  that never sends a line can hold a thread.
+- **Admitted**: `MAX_PENDING` (20) bounds how many requests can be open at
+  once, checked and inserted atomically under the broker's single lock to
+  avoid a check-then-act race.
 
 ### 6.5 The secret never touches a surface that isn't the approval itself
 
 - Never an argument (`ps`/`/proc/<pid>/cmdline` visible to any local user).
 - Never written to a file, including temp files.
-- Never logged — the broker's own `print()` calls only ever log the socket
-  path at startup.
+- Never logged — the broker's own output is the startup line naming the two
+  socket paths and the once-a-minute "askpass binary not installed" notice
+  (§6.13); neither contains request data.
 - The bridge CLI passes it over stdin on `approve`, not argv.
 - The askpass helper writes it to stdout, which only `sudo` itself reads.
 
-### 6.6 The socket and its directory are private by construction
+### 6.6 The sockets and their directory are access-controlled by construction
 
-Socket file `0600`; its parent directory `0700`; the systemd unit enforces
-`UMask=0077`, `RuntimeDirectoryMode=0700`, and `ProtectSystem=strict` /
-`ProtectHome=read-only` with the runtime directory as the sole writable
-path. On startup, if a stale socket path exists and isn't owned by the
-current UID, the broker refuses to bind rather than silently taking over a
-path another user's process might be using.
+There are two sockets (§6.13), both created by the broker in `/run/doorman`
+and both `chown`ed `doorman:<group>` and `chmod`ed `0660` immediately after
+`bind()`:
+
+| Socket | Group | Who the kernel lets connect |
+|---|---|---|
+| `/run/doorman/askpass.sock` | `doorman-askpass` | members of that group — only the service user — and any process whose *effective* gid is that group, i.e. one that exec'd the setgid askpass binary |
+| `/run/doorman/control.sock` | `doorman-ui` | members of `doorman-ui` — the service user and the single login user |
+
+The directory is created by systemd (`RuntimeDirectory=doorman`,
+`RuntimeDirectoryMode=0750`), so it is owned `doorman:doorman` and recreated
+at each service start. A socket's permission bits are enforced by the
+kernel at `connect()`, before the broker sees a byte. If a bind-time
+`chgrp` cannot be done (the group does not resolve, or the process lacks the
+right to it), the broker refuses to start rather than leave a socket with
+the wrong group; the only exception is an explicit test seam, which falls
+back to owner-only `0600` — strictly tighter, used only by unprivileged CI.
+On startup, if a stale socket path exists and isn't owned by the current
+uid, or isn't a socket at all, the broker refuses to bind rather than
+silently taking over a path.
+
+Two honest qualifications. First, the control socket's ACL separates the
+login user from *other* users, not the trusted UI from the agent: every
+process of the login user inherits `doorman-ui` after the re-login, so the
+distinction between Quickshell and an agent on that socket rests on the
+`comm` check of §6.9 and is bounded by §7. Second, the directory is
+`0750 doorman:doorman`; a caller reaches a socket inside it only if the path
+is traversable for that caller, and this directory-traversal path for the two
+caller groups is one of the items in the live verification (§6.13), not
+something the unit-test suite exercises.
 
 ### 6.7 Systemd sandboxing
+
+The broker is a **system** unit, `/etc/systemd/system/omarchy-doorman.service`
+(installed by `scripts/doorman-install-askpass`, started with
+`systemctl enable --now omarchy-doorman.service`), not a `systemd --user`
+unit. It sets `User=doorman`, `Group=doorman`,
+`SupplementaryGroups=doorman-askpass doorman-ui` (so it may `chgrp` both
+sockets), `RuntimeDirectory=doorman`, `RuntimeDirectoryMode=0750`,
+`ReadWritePaths=/run/doorman` and `UMask=0007`, and is
+`WantedBy=multi-user.target`. Its sockets live in `/run/doorman` and do not
+depend on any login session; the UI simply needs them to exist. The
+`ExecStart` is `scripts/run-doorman-broker`, with `@PROJECT_DIR@` in the unit
+template replaced at install time by the checkout the script was run from.
+
+**Known pending deployment item.** The broker's code is read from that
+checkout, which today is under the login user's home (e.g.
+`~/.config/omarchy/plugins/mauricio.doorman`). The broker runs as `doorman`
+with `ProtectHome=read-only`, and a home directory is normally mode `0700`
+for its owner — so `doorman` may be unable to read its own code. `ProtectHome=read-only`
+does not grant access; it only removes write access. This is not resolved in
+the current tree. Fixing it may require installing the broker code outside
+`/home` (as the askpass binary already is, under `/usr/local/lib`); the unit
+file carries a comment to the same effect. Until that is settled and
+verified, treat the install/run flow as not yet end-to-end proven.
 
 The unit additionally sets `NoNewPrivileges`, `PrivateTmp`,
 `RestrictAddressFamilies=AF_UNIX` (the broker never needs any other socket
@@ -390,22 +481,23 @@ clock, hostname, namespaces, realtime scheduling, SUID/SGID,
 `LockPersonality`, `MemoryDenyWriteExecute`). Almost none of these change
 behavior for a pure-Python service that only speaks Unix sockets and reads
 `/proc`; they remove attack surface the broker was never going to use
-anyway. The one exception: `ProtectSystem=strict`/`ProtectHome=read-only`/
-`PrivateTmp=true` each independently place the broker in a private,
-unprivileged Linux user namespace. Two different things break under this
-deployment shape, discovered one after the other while building §6.11:
-*credential values* (uid/gid) outside the namespace's minimal mapping
-resolve to the kernel's overflow id instead of the real one; and reading
-*another process's* `/proc/<pid>/exe` (or `/maps`, `/mem` — anything
-`ptrace_may_access()`-gated) is denied outright (`PermissionError`), not
-just resolved to the wrong value — the same gate, and the same open
-question about its exact mechanism under `systemd --user`, that §6.9
-already ran into for a different check. Neither affects plain,
+anyway. The one exception, which is history of the earlier
+`systemd --user` deployment: there, `ProtectSystem=strict`/
+`ProtectHome=read-only`/`PrivateTmp=true` each independently confined the
+broker so that reading *another process's* `/proc/<pid>/exe` (or `/maps`,
+`/mem` — anything `ptrace_may_access()`-gated) was denied outright
+(`PermissionError`), and credential values outside its minimal mapping
+resolved to the kernel's overflow id. Neither affects plain,
 non-ptrace-gated `/proc` reads like `comm`, `status`'s pid/uid lines, or
-`cmdline` — which is why §6.1's checks were never affected, and why each
-successive version of §6.11's fix had to stop depending on resolving a
-value *or* ptrace-reading the peer at all. See §6.9 and §6.11 for the full
-history.
+`cmdline` — which is why §6.1's checks were never affected, and why the
+current design (§6.13) reads no ptrace-gated file of the peer at all: the
+askpass is non-dumpable, which would revoke exactly those reads, and its
+identity comes from `SO_PEERCRED` instead. Under the system unit the
+broker's checks are the plain reads of §6.1, validated in the spike under
+these directives (see the comment in the unit file) but still subject to the
+final live verification (§6.13). If a `Protect*` directive were found to
+block them, the specific directive would be reconsidered, not the whole
+profile. See §6.9, §6.11, and §6.13 for the history.
 
 ### 6.8 PATH shadowing is what makes interception actually happen
 
@@ -440,14 +532,34 @@ which bypasses `PATH` resolution entirely — no user-level shadow can catch
 that without replacing the system binary itself, which this project
 deliberately does not do (see §2, "Non-goals").
 
-### 6.9 approve/cancel/pending/stats require being the trusted UI, not just the token
+### 6.9 approve/cancel/pending/stats require being the trusted UI; there is no token or capability
 
-An earlier version of this document (§4.1, now corrected) assumed the agent
-doesn't have the session token. That's false: the token and capability live
-in files under the same UID the agent runs as, exactly like the UI reads
-them — `origin=llm` + capability only gates who can *create* a request.
+**There is no session token and no `origin=llm` capability in the current
+design.** Earlier revisions had both: every message carried a `token`, and
+`request` additionally carried `origin: "llm"` plus a `capability`, all kept
+in files under the user's runtime directory. They were removed completely —
+no `token`/`origin`/`capability` field, no `unauthorized` or
+`invalid_llm_origin` error, no token file, no `--token`/`--llm-capability`
+option on the broker, no `--token-file` on the bridge. The reasons are in the
+history below and in §6.13: the token files were readable by exactly the
+processes the token was supposed to exclude (same uid), and the askpass
+helper's read of them was the root of the 2026-10-25 symlink/environment
+finding. What stands in for them is not a replacement secret but the
+connection itself:
+
+- `request` is gated by the peer's effective gid on the askpass socket
+  (§6.13), then §6.1, then a human approval;
+- `approve`, `cancel`, `pending` and `stats` are gated by `doorman-ui`
+  membership (the control socket's group ACL, §6.6), the trusted-UI
+  process-name walk described next, and the owner-uid binding (§6.1).
+
+*History of why the control verbs are gated at all.* An earlier version of
+this document assumed the agent doesn't have the session token. That was
+false: the token and capability lived in files under the same UID the agent
+runs as, exactly like the UI reads them — `origin=llm` + capability only
+gated who could *create* a request.
 Manual testing during development confirmed the consequence directly: a
-plain shell script that reads those files can create a request and then
+plain shell script that read those files could create a request and then
 immediately call `approve` on it with a fabricated secret, with zero UI, no
 human click, and no visible sign anything happened — the broker returned
 `{"ok": true}`. A fabricated secret doesn't leak the real password, but it
@@ -473,6 +585,16 @@ from the trusted UI:
    a process name that matches the trusted UI (`quickshell` by default,
    `Broker(..., trusted_ui_exe=...)` / `--trusted-ui-exe` elsewhere, for
    tests).
+3. The connection's peer uid (step 1) must equal the configured owner uid
+   (§6.1) before the walk starts, and that uid is what `approve`/`cancel`
+   then compare to the request's recorded owner uid. A connection from any
+   other uid is `untrusted_caller` even if it somehow reached the socket.
+
+Reaching the control socket at all additionally requires `doorman-ui`
+membership (§6.6). That is an access control against *other* users; it does
+not by itself tell the agent from Quickshell, since both run as the login
+user and both inherit the group — steps 1–3 do that, and step 2 is bounded by
+the `comm` limitation in §7.
 
 That process name comes from `/proc/<pid>/comm`, not `/proc/<pid>/exe`.
 `exe` would be the stronger check — it's the kernel's resolved path to the
@@ -493,6 +615,31 @@ no such permission. The trade-off is real: forging `comm` costs an attacker
 one deliberate `prctl`/`argv[0]` step instead of nothing, not the
 impossible-to-forge guarantee `exe` would have given. Still a large
 improvement over no check at all, which is what shipped first.
+
+**2026-11-05 note, added while writing the then-current identity-helper
+design (history: that design was later replaced by the current §6.13; the
+bisection this note cites now lives in the design record
+`docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md`, not in
+§6.13):** that design's work performed a later,
+more precise bisection of this same broker unit file while designing the
+identity-helper, and found that exactly five directives
+(`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=true`,
+`ProtectKernelTunables=true`, `ProtectControlGroups=true`) each
+independently cause this `EACCES`, and that a caller with *none* of those
+five succeeds with no special permission at all — not "stripped to zero"
+as stated two paragraphs above. That's a real tension with this section's
+own claim: if the bisection described here truly reached zero directives
+and still failed, the identity-helper's own unit (which deliberately keeps
+roughly fifteen *other* directives and drops only those five) shouldn't
+work either, yet it does, confirmed live. This section's "stripped to
+zero" characterization may simply have been imprecise, or the bisection
+it describes may have been run under different conditions than §6.13's —
+that wasn't re-verified before this note was written, and re-verifying it
+is out of scope here. Rather than guess which, treat §6.13's
+directive-by-directive bisection as the more rigorous, more precise
+finding on this exact question, and this section's broader "even stripped
+to zero" claim as superseded by it, the same way §6.11's mechanism is
+superseded by §6.13's.
 
 ### 6.10 A rejected password shows up as a retry, not a second, unrelated request
 
@@ -543,7 +690,7 @@ Two consequences the implementation handles explicitly:
   — which matches by title — still clears it when the queue empties.
 
 This is a UX heuristic, not a security control: `sudo_pid` is optional and
-self-reported by the caller (any `origin=llm` request can claim any
+self-reported by the caller (any request can claim any
 `sudo_pid`, causing a false "attempt 2" label at worst), and the inference
 that a same-`sudo_pid` retry implies "the previous password was wrong"
 relies on the observed (not kernel-guaranteed) behavior that Doorman's own
@@ -552,6 +699,21 @@ what the modal *says*; it never changes whether a request needs a real human
 approval, still gated by the exact same checks as any other request.
 
 ### 6.11 The askpass helper itself must carry an identity it can't fake
+
+> **Superseded (history, not current behavior).** Everything in this
+> section describes the `SCM_RIGHTS`/`cap_dac_read_search` mechanism, which
+> an `O_PATH` bypass defeated during production security review (issue
+> #9558). §6.13 describes what replaced it: the broker now reads the peer's
+> kernel-recorded effective gid, and no longer receives a file descriptor
+> from, or inspects the file behind, the peer at all — so the device+inode
+> comparison below no longer exists in the code. An intermediate
+> identity-helper/`SIGSTOP` design replaced this one for a time and was in
+> turn replaced by §6.13; it is recorded in
+> `docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md`. The
+> three earlier failed attempts documented below remain the complete record
+> of what didn't work here and why. References below to the token,
+> capability, `systemd --user` and `/proc/<pid>/exe` describe those earlier
+> designs.
 
 §6.1's checks (`pid_mismatch`, `not_sudo_child`, the privilege-escalation
 requirement) all validate the connecting peer's *parent* — that it's a
@@ -722,10 +884,11 @@ silently accepted).
 
 ### 6.12 The displayed command is derived from the real sudo invocation, not the caller
 
-§6.11 closes who can receive the secret. It doesn't, by itself, stop a
-caller running the genuinely trusted askpass binary (a legitimate
-invocation) from lying about what the human is approving: the request
-payload's `command` field used to be taken verbatim from the caller
+§6.11 — now superseded by §6.13, which closes the same question with a
+different mechanism — closed who can receive the secret. Neither version,
+by itself, stops a caller running the genuinely trusted askpass binary (a
+legitimate invocation) from lying about what the human is approving: the
+request payload's `command` field used to be taken verbatim from the caller
 (`str(message.get("command", ""))`), display-only, with nothing tying it to
 what would actually run. A caller that controls its own environment also
 controls this field, and could show a harmless-looking string while a
@@ -745,39 +908,198 @@ displayed command falls back to a visible placeholder, never to the
 caller-supplied value — a display gap under an unlikely race, not a
 reopened trust boundary.
 
+### 6.13 Askpass identity is a kernel-recorded credential (the effective gid), not something the broker inspects or is handed
+
+> **Status.** This is the "shape B" design as it exists in the code. It is
+> implemented and unit-tested but **has not yet been live-verified end to
+> end** against the real system unit, a real `sudo` round trip and a real
+> Quickshell session — that is a separate, human-run step (see "What is and
+> is not verified" at the end of this section). Issue #9558 is not reopened
+> until it passes.
+
+This section supersedes both mechanisms that came before it: §6.11's
+`SCM_RIGHTS`/`cap_dac_read_search` fd-passing check, and the intermediate
+identity-helper design (a separate `systemd --user` process the broker
+queried synchronously at accept time, with a `SIGSTOP`/`pidfd` freeze of the
+peer around the query). Neither exists in the code any more: there is no
+identity-helper process, no `SIGSTOP`/`SIGCONT`, no `pidfd`, no
+`/proc/<pid>/exe` lookup of the peer, no file descriptor read from the peer,
+and no session token or capability (§6.9). The broker's own docstring
+(`broker/broker.py`) states the same inventory. Why those designs were
+abandoned — the `O_PATH` bypass of the fd check (issue #9558), the
+mount-namespace confinement that blocks `/proc/<pid>/exe` reads under the
+broker's hardening, the fork-then-exec race against any identity check made
+after `accept()`, and the later finding that a non-dumpable askpass is
+structurally incompatible with an exe-based check — is recorded, with the
+live evidence, in
+[`docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md`](docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md)
+(its "Decision and spike" section and Findings 4 and 5). It is not repeated
+here.
+
+**The mechanism.** The broker is a **system** service running as a dedicated
+system user, `doorman` (§6.7). Three things work together:
+
+1. *The askpass binary is setgid.* `scripts/doorman-install-askpass`
+   compiles `askpass/doorman-askpass.c` and installs it at
+   `/usr/local/lib/omarchy-doorman/doorman-askpass`, owned
+   `root:doorman-askpass`, mode `2755`. The install script verifies the
+   owner and the setgid bit after the move and fails if either did not
+   stick. A process that `exec`s this file runs with effective gid
+   `doorman-askpass`. The group owns no other file, and the install script
+   adds no login user to it (the only account added to it is the service
+   user `doorman`, so the broker can `chgrp` its socket).
+2. *The kernel enforces it at `connect()`.* The request socket
+   `/run/doorman/askpass.sock` is owned `doorman:doorman-askpass`, mode
+   `0660`. Because the owner (`doorman`) is not the connecting uid, the
+   connector is judged by the group bits: an ordinary process of the login
+   user that is not in `doorman-askpass` is refused with `EACCES`. The
+   spike confirmed this on the target machine (design record, Q2).
+3. *The broker re-checks the credential it was handed by the kernel.* For a
+   `request`, `_handle` reads the peer's *effective* gid from `SO_PEERCRED`
+   and requires it to equal the `doorman-askpass` gid
+   (`_peer_has_trusted_egid`); otherwise the connection gets
+   `{"ok": false, "error": "untrusted_askpass_helper"}`. `SO_PEERCRED` is
+   recorded by the kernel at `connect()` time, so a later `execve()` in the
+   same or a different process cannot change it: a process that connected
+   as some other binary and then `exec`s the setgid one does not acquire
+   the egid on the existing connection, and a process that connected as the
+   setgid binary cannot lose it. The check reads nothing from the peer — no
+   message field, no fd, no file — which is why the `O_PATH` class of
+   attack has nothing to attach to.
+
+Only the *request* path is gated by egid. Everything else §6.1 checks
+(the claimed `pid` equals the peer's real pid, the peer's immediate parent is
+a genuine escalated `sudo`, the owner uid) still applies after it and is
+unchanged except for which uid it compares against (§6.1).
+
+**Two sockets, per-socket verb routing.** The broker listens on two Unix
+sockets, and which listener accepted a connection — not anything the peer
+sends — decides the verb set `_handle` will serve:
+
+| Socket | Owner / mode | Verbs served | Gate |
+|---|---|---|---|
+| `/run/doorman/askpass.sock` | `doorman:doorman-askpass`, `0660` | `request` | peer egid == `doorman-askpass` (this section) + §6.1 + human approval |
+| `/run/doorman/control.sock` | `doorman:doorman-ui`, `0660` | `approve`, `cancel`, `pending`, `stats` | `doorman-ui` socket ACL + trusted-UI `comm` walk + owner uid (§6.9) |
+
+A `request` arriving on the control socket, or any of the four control verbs
+arriving on the askpass socket, is rejected with
+`{"ok": false, "error": "wrong_socket"}` *before* any other gate runs, so a
+caller that can reach one socket cannot exercise the other's verbs even if it
+would have passed that verb's own gate. An unrecognised `type` gets
+`unknown_type`. The askpass binary connects to the fixed
+`/run/doorman/askpass.sock` (modulo the test override described below), and
+the broker reads no file whose location a caller influences.
+
+**The askpass binary is non-dumpable and ignores the environment.** The
+first statement of `main()` in `askpass/doorman-askpass.c` is
+`prctl(PR_SET_DUMPABLE, 0)`. This closes the ptrace/memory read of the
+plaintext secret (design record, Finding 5): a same-uid process can no
+longer `PTRACE_ATTACH` to the askpass while it holds the secret, or read its
+memory. The call is **mandatory and not belt-and-suspenders**: after a
+setgid `exec`, whether the process is dumpable is governed by the machine's
+`fs.suid_dumpable` sysctl. On the spike machine that value left the process
+non-dumpable, but a machine with `fs.suid_dumpable=1` would leave it
+`dumpable=1` and the ptrace read would succeed. The explicit `prctl` removes
+that dependence. Separately, because the exec is setgid the kernel sets
+`AT_SECURE=1`, so the dynamic loader ignores `LD_PRELOAD` and other `LD_*`
+variables from the caller's environment; the binary stays dynamically linked
+and relies on that. Dumpability does not gate `SO_PEERCRED`, so making the
+binary non-dumpable does not break the egid check (spike Q4) — which is
+exactly what it did break for the earlier `/proc/<pid>/exe` design.
+
+The binary opens no file at all. It connects to the fixed path
+`/run/doorman/askpass.sock`, sends one JSON line, and reads one JSON line
+back. The 2026-10-25 symlink/`XDG_RUNTIME_DIR`/`DOORMAN_SOCKET`
+exfiltration finding is therefore closed by removing the read, not by
+guarding it: there is no token file to be tricked into reading, and nothing the binary
+holds that it could be tricked into sending to a chosen path. One
+environment variable is nonetheless consulted,
+`DOORMAN_SOCKET_DEV_OVERRIDE`, which exists only so the binary's own test
+suite can point it at a test socket; nothing in the production flow sets it,
+but a caller who controls the environment of its own `sudo` invocation can,
+and the binary does not refuse it. Its effect is confined to *where the
+binary connects*: the binary sends no secret (it only receives one), so
+redirecting it to a socket the caller controls discloses nothing it holds,
+and a fake broker there can only make that one askpass process receive a
+caller-chosen string instead of a password. This is a code-level wrinkle
+worth knowing about, not a finding; removing the override from the
+production build is a possible hardening.
+
+**Degraded state.** The broker computes `askpass_identity_available`: the
+`doorman-askpass` group resolves *and* the binary exists at the fixed path,
+is a regular file, has the setgid bit, and is owned `root:doorman-askpass`.
+It is re-evaluated on every `stats` (§5.5) and logged to the journal at most
+once a minute while false. When it is false no process can carry the trusted
+egid, so every `request` is refused with `untrusted_askpass_helper`; the UI
+surfaces the flag rather than requiring the journal to be read. (An earlier
+revision had a separate `askpass_identity_unavailable` error; the current
+code does not emit it.)
+
+**The single-owner pin.** The broker is started with `--owner-uid` (§6.1,
+§6.9). `scripts/run-doorman-broker` takes that from `DOORMAN_OWNER_UID` if
+set, otherwise from the *sole* login member of the `doorman-ui` group, and
+refuses to start if there is not exactly one. Each request records the uid
+of the connection that created it, and `approve`/`cancel` require the
+control connection's peer uid to equal it. This is a pinned single-user
+model, not a multi-user one (§2).
+
+**What is and is not verified.** Closed by design, in the sense that the
+code removes the mechanism the finding relied on: the `O_PATH`/fd-passing
+bypass (nothing is read from the peer), the symlink/environment
+exfiltration (the binary reads no file and uses a fixed path), the
+fork-then-exec race (identity is the connect-time egid, not a check made
+afterward — for a post-connect fork the child has no ACL access to the
+socket and shares no egid; for a pre-connect fork the connector is judged by
+its own egid), and the same-uid ptrace/memory read of the secret
+(`PR_SET_DUMPABLE`). What has been confirmed live is limited to the four
+kernel assumptions in the design record's spike (setgid survives `sudo -A`;
+the socket group ACL refuses a non-member; the ancestor ptrace attack is
+blocked against a setgid target; `SO_PEERCRED` reads the egid of a
+non-dumpable client). **What has not been done:** the end-to-end check
+against the real system unit, a real `sudo` round trip and real Quickshell,
+including the repeated fork-exec attacker runs, the ptrace attempt against
+the real binary, the symlink/environment reproduction, the second-user
+rejection and the degraded-state check. Those are enumerated as Task 12 of
+`docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md` and are run
+by a human with root; until they pass, the fork-exec race and the ptrace
+read are *closed by design, live verification pending*, not "fixed and
+verified". The unit-test suite does not substitute for that (this project's
+own repeated lesson).
+
 ## 7. Known limitations
 
 - The trusted-UI check (§6.9) matches on `/proc/<pid>/comm`, which a
   process can set to anything via `argv[0]` or `prctl(PR_SET_NAME)`. An
   agent that deliberately spawns a child process named `quickshell` and
   connects from it would pass. This is a real gap, accepted because the
-  alternative (`/proc/<pid>/exe`) doesn't work at all under how this
-  broker is deployed (see §6.9) — not a claim that `comm` is sufficient
-  against a targeted attacker, only that it's better than no check.
+  alternative (`/proc/<pid>/exe`) is not available to the broker (see §6.9)
+  — not a claim that `comm` is sufficient against a targeted attacker, only
+  that it's better than no check. Shape B does not change it: the control
+  socket's `doorman-ui` ACL excludes other users, not same-user processes
+  (§6.6), and there is no token any more to add a second factor.
 - The `~/.local/bin/sudo` shadow (§6.8) does not catch a caller that
   invokes `/usr/bin/sudo` by absolute path, or one running in an
   environment where `~/.local/bin` isn't on `PATH` ahead of `/usr/bin`
   (non-interactive systemd units, cron, a stripped-down `PATH`). Since
-  §6.11, this is a UX gap, not a disclosure one: bypassing the shadow no
+  §6.13, this is a UX gap, not a disclosure one: bypassing the shadow no
   longer lets a caller's own askpass receive the secret, so the only cost
   is losing the friendly retry labeling and `DOORMAN_COMMAND` hint that
   come from going through the wrapper.
-- §6.11's identity check requires a one-time, root-privileged install step
-  (`scripts/doorman-install-askpass`) that didn't exist before — every
+- The askpass identity (§6.13) requires a one-time, root-privileged install
+  step (`scripts/doorman-install-askpass`) that didn't exist before — every
   other install step stays fully unprivileged. If that step is skipped, or
-  the installed file is later removed, the broker is designed to fail
-  loudly (`askpass_identity_unavailable`, surfaced via `stats`), never to
-  fall back silently to the pre-#9558-finding-4 guarantee, but it does mean
+  the installed file is later removed or its setgid bit lost, the broker is
+  designed to fail loudly (`stats` reports `askpass_identity_available:
+  false` and every `request` is refused with `untrusted_askpass_helper`),
+  never to fall back silently to a weaker guarantee, but it does mean
   Doorman simply doesn't function until the install step has been run.
 - No automated test against a real Quickshell session or real Omarchy —
   the test suite drives the broker's own protocol directly and via the
-  askpass helper (both the Python dev fixture and a real identity-matching
-  peer exercising §6.11's positive path — see
-  `test_request_with_real_trusted_askpass_identity_is_accepted`, which
-  needs no root or compiler and runs in regular CI). A real `sudo` round
-  trip through the installed C binary and a real Quickshell approval still
-  needs to be verified live on the maintainer's own machine, outside
-  automated CI.
+  askpass helper, with the trusted egid supplied through a test-only seam
+  so no root, real group or setgid binary is needed in regular CI. A real
+  `sudo` round trip through the installed setgid C binary, the real socket
+  ACLs and a real Quickshell approval still need to be verified live on the
+  maintainer's own machine, outside automated CI (§6.13).
 - No `qmllint` or static analysis on the QML yet.
 - The plugin's manifest `id` is load-bearing for Omarchy's bar layout
   (`~/.config/omarchy/shell.json` tracks placed widgets by id) — renaming it
@@ -790,26 +1112,61 @@ reopened trust boundary.
   caller could claim an arbitrary `sudo_pid` to make an unrelated request
   falsely show as "attempt 2", or vice versa. Cosmetic only: it never
   changes which checks gate approval.
+- **Shape-B residuals (§6.13).**
+  - *Group join and re-login.* The login user is added to `doorman-ui` by
+    the install script, but supplementary groups are read at login: the UI
+    (Quickshell) cannot reach the control socket until the user has logged
+    out and back in. The install script says so; until then the widget
+    reports the broker as unreachable.
+  - *`doorman-ui` has exactly one login member.* `scripts/run-doorman-broker`
+    refuses to start unless exactly one login user is in the group (or
+    `DOORMAN_OWNER_UID` names one), and every uid check is pinned to that
+    uid. Adding a second member is an unsupported configuration, not a
+    multi-user feature; a different user who did gain access would still be
+    refused by the owner-uid checks (§6.1), but that behavior is part of the
+    live verification, not yet confirmed.
+  - *`fs.suid_dumpable` dependence.* Whether a setgid `exec` leaves the
+    process dumpable depends on that sysctl, which varies by machine. The
+    explicit `prctl(PR_SET_DUMPABLE, 0)` in the askpass binary is therefore
+    mandatory, not defense in depth; removing it would reopen the same-uid
+    ptrace/memory read of the secret on machines where the sysctl is `1`.
+  - *The broker code must be readable by `doorman`.* The unit runs as
+    `doorman` with `ProtectHome=read-only` against a checkout that is
+    currently in the login user's home (§6.7). This may require installing
+    the broker code outside `/home`; it is an open deployment item, not
+    solved.
+  - *Directory traversal for the socket callers.* `/run/doorman` is
+    `0750 doorman:doorman` (§6.6); that the askpass binary (egid
+    `doorman-askpass`) and the UI (group `doorman-ui`) can reach their
+    sockets through it is unverified (§6.13).
+  - *Pending final live verification.* The fork-exec race (both the
+    post-connect and pre-connect variants) and the ptrace read of the secret
+    are closed by design but **not yet live-verified** against the real
+    system unit and a real `sudo` round trip (§6.13; Task 12 of
+    `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`). Issue
+    #9558 is not reopened until that passes.
 
 ## 8. Acceptance criteria
 
-Every property in §6 has a corresponding automated test in `tests/`:
-wrong token, invalid origin, missing PID, process-identity change, request
+Every property in §6 has a corresponding automated test in `tests/`
+(except the live-only checks §6.13 names): missing PID, process-identity change, request
 expiry, approve/replay, wrong-nonce approve and cancel, the askpass helper's
-stdout-only contract, the idle-unauthenticated-connection close, the
+stdout-only contract, the idle-connection close, the
 slow-approval timeout regression, the `MAX_PENDING` cap with slot release on
-cancel, — for §6.9 — that a caller with a valid token but the wrong
+cancel, — for §6.9 — that a control-socket caller with the wrong
 process ancestry gets `untrusted_caller` on all four of
-approve/cancel/pending/stats, while `request` still succeeds for it, and —
+approve/cancel/pending/stats, that no token is required on either socket,
+that each socket rejects the other's verbs with `wrong_socket`, that
+`approve`/`cancel` are bound to the request's recorded owner uid, and —
 for §6.10 — that a same-`sudo_pid` retry is tagged `attempt = 2`, supersedes
 the previous pending request, and that unrelated or `sudo_pid`-less requests
-are unaffected; for §6.11 — that a peer who doesn't hand over a matching
-identity fd is rejected (`untrusted_askpass_helper`), that a
-missing/unresolvable trusted path fails loudly (`askpass_identity_unavailable`,
-also surfaced via `stats`) rather than silently skipping the check, and
-that a peer whose fd genuinely does match is accepted — no root or
-compiler needed for any of the three, unlike either design this
-replaced; and for §6.12 — that
+are unaffected; for §6.13 — that a peer whose effective gid isn't the
+trusted gid is rejected (`untrusted_askpass_helper`), that a missing or non-setgid installed binary
+is reported loudly via `stats` rather than silently skipping the check, and
+that a peer with the trusted egid is accepted (unprivileged CI pins the gid
+through a test-only seam rather than needing a real group or setgid
+binary — which is exactly why the real setgid, ACL and ptrace behavior is a
+live check, not a unit-test one); and for §6.12 — that
 the displayed `command` is derived from the real sudo parent's own
 `/proc/<pid>/cmdline`, not from a lying caller-supplied payload field.
 `python3 -m unittest discover -s tests -p 'test_*.py'` must pass before any
@@ -820,14 +1177,16 @@ change to `askpass/doorman-askpass.c` is considered done.
 
 ## 9. Glossary
 
-- **Broker**: the long-running service in §3 that owns the socket and all
-  request state.
-- **Capability**: a shared secret (like the token, but scoped to identify
-  "this caller claims to be the LLM-driven flow") required on every
-  `request` message alongside `origin: "llm"`.
+- **Broker**: the long-running system service in §3 that owns both sockets
+  and all request state.
+- **Control socket**: `/run/doorman/control.sock`, group `doorman-ui`; the
+  only socket that serves `approve`, `cancel`, `pending` and `stats` (§6.13).
+- **Askpass socket**: `/run/doorman/askpass.sock`, group `doorman-askpass`;
+  the only socket that serves `request` (§6.13).
 - **Nonce**: a per-request random value required, in addition to
   `request_id`, to approve or cancel — prevents an attacker who can guess
   or observe a `request_id` (e.g. from process listings, since it isn't
   secret) from acting on a request they didn't create.
-- **Session token**: the broker-wide shared secret every message must
-  present; scoped to one broker process's lifetime.
+- **Trusted egid**: the effective gid `doorman-askpass`, carried only by a
+  process that exec'd the root-installed setgid askpass binary (§6.13).
+  Formerly-described "session token" and "capability" no longer exist.

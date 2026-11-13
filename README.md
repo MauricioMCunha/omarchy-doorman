@@ -42,7 +42,8 @@ actually ran the command, or you hit Escape — it fails closed.
 requesting process (sudo -A)
         │
         ▼
-   askpass helper  ──(local Unix socket, token + capability)──►  broker
+   askpass helper  ──(/run/doorman/askpass.sock, group ACL +      ──►  broker
+   (setgid binary)      kernel-checked effective gid)                  (system service)
                                                                       │
                                                        shows the request in
                                                              a Quickshell modal
@@ -52,16 +53,21 @@ requesting process (sudo -A)
         ◄──────────────────────── secret, once ───────────────────────┘
 ```
 
-- The **broker** is a small Python service that owns a private Unix socket
-  (`0600`, under a `0700` runtime directory). It never writes the secret to
-  disk, a log, or its own stdout.
+- The **broker** is a small Python system service, running as the dedicated
+  `doorman` user, that owns two Unix sockets in `/run/doorman`: one for the
+  askpass helper's requests, one for the UI's approve/cancel/status calls.
+  Who may connect to each is enforced by the kernel through group
+  permissions, and the broker re-checks the connecting process's identity
+  itself. It never writes the secret to disk, a log, or its own stdout, and
+  there is no session token or other bearer secret to steal.
 - Every request carries a random `request_id` and a high-entropy `nonce`,
   expires in 1–300 seconds, and can be consumed exactly once. The broker
   re-validates the requesting process's PID, UID, start time, and command
   line at the moment of approval — not just when the request was created —
   so a PID that's been reused or a process whose identity changed can't
   slip through.
-- The **UI** is a Quickshell overlay: a topbar widget for status/history, and
+- The **UI** is a Quickshell overlay: a topbar widget for status/history (it is status-only — it does not start
+  or stop the service), and
   a modal that grabs keyboard focus, shows exactly what's being authorized
   (command, working directory, PID, terminal), counts down the time left to
   decide, and sends a desktop notification if you're looking at a different
@@ -75,9 +81,17 @@ we found and fixed while building this.
 
 ## Installing
 
+> **Status of this flow.** The system-service design below is implemented
+> but has **not yet been verified end to end** on a real machine (real unit,
+> real `sudo` round trip, real Quickshell) — that is the last pending step
+> before this is offered for review again. The broker runs from a
+> root-installed copy under `/usr/local/lib/omarchy-doorman`, not from your
+> home checkout. Expect the steps below to change until that is settled.
+
 Doorman has two parts: the **plugin**, an Omarchy bar widget, and the
-**broker**, a `systemd --user` service. `omarchy plugin add` handles the
-first; the broker and the `sudo` wrapper are one step each, by hand.
+**broker**, a **system** service (`omarchy-doorman.service`, running as a
+dedicated `doorman` user). `omarchy plugin add` handles the first; the
+broker needs one root step, and the `sudo` wrapper one more by hand.
 
 ```bash
 # 1. Add and enable the plugin — validates the manifest, clones it into
@@ -85,32 +99,45 @@ first; the broker and the `sudo` wrapper are one step each, by hand.
 #    places the bar widget without a full shell restart.
 omarchy plugin add https://github.com/MauricioMCunha/omarchy-doorman.git --enable
 
-# 2. Install and enable the broker service (omarchy plugin add only manages
-#    the bar widget, not systemd units)
-cp ~/.config/omarchy/plugins/mauricio.doorman/packaging/omarchy-doorman.service \
-  ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now omarchy-doorman.service
-
-# 3. One-time, root-privileged: install the askpass helper that actually
-#    receives the password (SPEC.md §6.11). The broker refuses every sudo
-#    request until this has been run — see "Why this step needs root"
-#    below for what it's protecting against.
+# 2. The one root step. Creates the `doorman` system user and the
+#    `doorman-askpass` / `doorman-ui` groups, builds and installs the setgid
+#    askpass binary under /usr/local/lib/omarchy-doorman, adds YOU (the
+#    sudo-invoking user) to `doorman-ui`, and installs the system unit.
+#    Safe to re-run. See "Why this step needs root" below.
 sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass
+
+# 3. Start the broker (and have it start at boot).
+sudo systemctl enable --now omarchy-doorman.service
 
 # 4. Shadow `sudo` for this user so agents pick it up without any
 #    per-agent configuration — see "Wiring up sudo" below for why this
 #    step is the one that actually makes Doorman useful.
 ln -s ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo ~/.local/bin/sudo
+
+# 5. Log out and back in. Group membership is read at login, so the bar
+#    widget (which runs as you, inside Quickshell) cannot reach the broker's
+#    control socket until you do.
 ```
 
 Nothing here replaces `/usr/bin/sudo`, edits `sudoers`, or touches anything
-under `/usr/share/omarchy/`. Step 3 is the one exception to "everything else
-is unprivileged": it installs one small binary, owned by root and not
-writable by this user, outside this plugin's own git checkout (so `omarchy
-plugin update` never touches it) — see **Why this step needs root** below.
-Every step is explicit and reversible — see **Activating, updating, and
-removing** below for the inverse of each one.
+under `/usr/share/omarchy/`. Step 2 is the one exception to "everything else
+is unprivileged": it creates a system user and two groups, installs one
+small setgid binary (owned by root, not writable by you, outside this
+plugin's own git checkout so `omarchy plugin update` never touches it), and
+installs a system unit. Every step is explicit and reversible — see
+**Activating, updating, and removing** below.
+
+**Exactly one login user.** `doorman-ui` must have exactly one login member:
+the broker is pinned to that one user's uid and refuses to start otherwise
+(a systemd drop-in that sets `DOORMAN_OWNER_UID` overrides it explicitly).
+This is a single-user tool by design.
+
+**The bar widget is status-only.** It shows whether the broker is reachable
+and healthy, the pending queue and recent activity, and hosts the approval
+modal. It does not start or stop the service — that is `systemctl`, above.
+If the broker is down it tells you to run `sudo systemctl enable --now
+omarchy-doorman.service`; if the askpass binary is missing or lost its
+setgid bit it tells you to run `doorman-install-askpass`.
 
 ### Why this step needs root
 
@@ -120,26 +147,40 @@ Doorman's own `sudo` shadow entirely) and pointing `SUDO_ASKPASS` at a
 script it wrote itself — which would still look, to the broker, exactly
 like a legitimate request, and would receive the real password once a
 human approved it. Closing that needs an identity an ordinary, same-user
-process cannot fake: a binary installed once by root, at a fixed path this
-user cannot write to or even read (only execute), which hands the broker a
-file descriptor for its own executable so the broker can confirm — without
-needing any special permission over the process that sent it — that it
-really is that exact file. The install step also grants that one binary a
-narrow Linux file capability (`cap_dac_read_search`) so it can read its own
-executable content despite not being readable by this user — without it,
-mode `0711` would block the legitimate helper from reading itself, not just
-an attacker's forgery. See
-[`SPEC.md` §6.11](SPEC.md#611-the-askpass-helper-itself-must-carry-an-identity-it-cant-fake)
-for the full reasoning, including why three earlier versions of this check
-(one group-based, one that had the broker inspect the connecting process
-directly, one that assumed reading your own executable needs no
-permission) turned out not to work.
+process cannot fake, and the kernel can provide one:
+
+- The askpass binary is installed once by root, at a fixed path you cannot
+  write to, **setgid** to a dedicated group, `doorman-askpass`, that owns
+  nothing else and has no human members. Only a process that actually
+  executes that file runs with that effective group.
+- The broker's request socket is owned by the `doorman` user and the
+  `doorman-askpass` group, mode `0660`: the kernel itself refuses to let an
+  ordinary process of yours connect to it. The broker then reads the
+  connecting process's effective group from `SO_PEERCRED` — recorded by the
+  kernel at `connect()`, so exec'ing something else afterwards cannot
+  change it — and refuses anything that isn't `doorman-askpass`.
+- The broker is a separate system user because a socket owned by *you* would
+  let you (and anything running as you) bypass that group check, and because
+  a process that can ptrace the broker could do worse. `doorman` owns the
+  sockets; you and your agents don't.
+- The askpass binary marks itself non-dumpable, so a same-user process
+  cannot ptrace it or read its memory while it holds the secret, and, being
+  setgid, it ignores `LD_PRELOAD`. It opens no file and connects to a fixed
+  socket path.
+- The UI talks to a second socket, `control.sock`, owned by `doorman` and
+  the `doorman-ui` group — which is why you are added to that group and
+  must log out and in.
+
+There is no session token or other bearer secret anywhere in this design.
+See [`SPEC.md` §6.13](SPEC.md#613-askpass-identity-is-a-kernel-recorded-credential-the-effective-gid-not-something-the-broker-inspects-or-is-handed)
+for the full reasoning and, in its last paragraphs, exactly what has and
+has not been verified live — the fork-exec race and the ptrace read of the
+secret are closed by design but their live verification is still pending.
 
 ### Activating, updating, and removing
 
 The plugin and the broker are independent: toggling one doesn't touch the
-other, and nothing below deletes your session token or metrics unless you
-run the removal block at the end.
+other.
 
 ```bash
 # Toggle the bar widget on/off, without touching the installed files
@@ -147,34 +188,43 @@ omarchy plugin disable mauricio.doorman
 omarchy plugin enable mauricio.doorman
 
 # Stop/resume the broker, without touching the installed files
-systemctl --user stop omarchy-doorman.service
-systemctl --user start omarchy-doorman.service
+sudo systemctl stop omarchy-doorman.service
+sudo systemctl start omarchy-doorman.service
 
 # Pull the latest plugin code (it's a git checkout) and restart the broker
 # to pick up any broker/ changes — the bar widget's QML hot-reloads on its
-# own, the broker does not.
+# own, the broker does not. The broker runs from a root-installed system copy,
+# so `omarchy plugin update` (an unprivileged git pull) does NOT update it:
+# re-run the install script (refreshes the system copy and askpass binary),
+# then restart the unit.
 omarchy plugin update mauricio.doorman
-systemctl --user restart omarchy-doorman.service
+sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass
+sudo systemctl restart omarchy-doorman.service
+```
 
-# Remove everything, in order. Check the sudo shadow symlink BEFORE
-# deleting the plugin folder it points into — in case you reused
-# ~/.local/bin/sudo for something else since installing, this only removes
-# it if it's still exactly doorman-sudo.
+**Removing everything, in order:**
+
+```bash
+# 1. Remove the sudo shadow FIRST, before the plugin folder it points into.
+#    Only removes it if it's still exactly doorman-sudo.
 [ "$(readlink -f ~/.local/bin/sudo 2>/dev/null)" = "$(readlink -f ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo 2>/dev/null)" ] \
   && rm -f ~/.local/bin/sudo
-# Disables and unloads the widget, then backs up (or deletes, since this
-# is a git checkout) the plugin folder.
-omarchy plugin remove mauricio.doorman --yes
-systemctl --user disable --now omarchy-doorman.service
-rm -f ~/.config/systemd/user/omarchy-doorman.service
-systemctl --user daemon-reload
 
-# The root-installed askpass helper is the only state that lives outside
-# the plugin folder and the per-user runtime dir — removed separately, and
-# only if you're not keeping Doorman around for another user on this
-# machine.
-sudo rm -rf /usr/local/lib/omarchy-doorman
+# 2. Tear down the system side (while the plugin checkout still exists,
+#    since the script lives in it): stops and disables the unit, removes the
+#    unit file and the installed askpass binary, removes you from
+#    `doorman-ui`, and deletes the `doorman` user and the two groups.
+sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass --uninstall
+
+# 3. Remove the plugin (disables and unloads the widget, then backs up or
+#    deletes the plugin folder, since it is a git checkout).
+omarchy plugin remove mauricio.doorman --yes
+
+# 4. Log out and back in to drop the stale `doorman-ui` membership.
 ```
+
+`--uninstall` tolerates a group that is still in use (it prints a notice and
+leaves it) and is safe to re-run.
 
 ### Wiring up `sudo`
 
@@ -205,7 +255,7 @@ wrapper, which always forwards to the real `sudo -A` unless the caller
 already passed `-A`/`-S`/`-n`/`--stdin`/`--non-interactive` explicitly. The
 one thing this can't catch is a caller that hardcodes `/usr/bin/sudo` by
 absolute path, bypassing `PATH` resolution entirely — but since the askpass
-identity check (§6.11), that no longer means the secret leaks: a caller
+identity check (§6.13), that no longer means the secret leaks: a caller
 that bypasses the wrapper still can't make its own `SUDO_ASKPASS` receive
 the password, so the residual gap is UX only (no friendly retry labeling,
 no `DOORMAN_COMMAND` hint) — see
@@ -223,11 +273,11 @@ export SUDO_ASKPASS=/usr/local/lib/omarchy-doorman/doorman-askpass
 sudo -A whoami
 ```
 
-That installed path is the only `SUDO_ASKPASS` target the broker will
-accept in production (SPEC.md §6.11) — only root's install step can put a
-file there, not the plain `askpass.py` in the plugin folder. `askpass.py`
-still exists, but only as a dev/test fixture: pointing `SUDO_ASKPASS` at
-it gets `untrusted_askpass_helper`, by design.
+A process running that installed setgid binary is the only thing the broker
+will serve a request to in production (SPEC.md §6.13) — only root's install
+step can put a file there, not the plain `askpass.py` in the plugin folder.
+`askpass.py` still exists, but only as a dev/test fixture: pointing
+`SUDO_ASKPASS` at it gets `untrusted_askpass_helper`, by design.
 
 ## What Doorman is not
 
@@ -255,6 +305,15 @@ reviewed by anyone outside the project. Current gaps before a wider release:
   shell reload, broker toggle, approval, cancellation, expiry, removal, and
   rollback, all on an account that never had Doorman on it before.
 - Threat model and plugin lifecycle haven't had an independent review.
+- The current identity design (a setgid askpass binary plus kernel-checked
+  socket ACLs, [`SPEC.md` §6.13](SPEC.md#7-known-limitations)) is
+  implemented and unit-tested, but **not yet verified live** against the
+  real system unit, a real `sudo` round trip and a real Quickshell session.
+  Until it is, the fork-exec race and the same-user ptrace read of the
+  secret are closed by design, not confirmed closed. The install flow also
+  has an open deployment item (the broker's code location, see
+  **Installing**). Issue #9558 is not reopened until that live verification
+  passes.
 
 None of that changes what's already true today: the secret never leaves the
 approval path, every request is single-use and identity-checked, and the
@@ -269,10 +328,12 @@ git diff --check
 scripts/qmllint-check  # needs a local Omarchy/Quickshell install
 ```
 
-The test suite covers authentication, invalid origin, missing/mismatched
-PID, expiry, approval, replay, wrong nonce, cancellation, the askpass helper,
-process-identity changes, the idle-connection DoS fix, and the concurrent-
-request cap. See [`SPEC.md`](SPEC.md#acceptance-criteria) for the full list
+The test suite covers the two-socket routing and the effective-gid gate,
+owner-uid binding, missing/mismatched PID, expiry, approval, replay, wrong
+nonce, cancellation, the askpass helper, process-identity changes, the
+idle-connection DoS fix, and the concurrent-request cap. It does not
+exercise the real setgid binary, the real socket ACLs or a real Quickshell
+session; those are live checks. See [`SPEC.md`](SPEC.md#acceptance-criteria) for the full list
 mapped to requirements.
 
 ## License

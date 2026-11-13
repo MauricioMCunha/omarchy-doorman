@@ -17,10 +17,9 @@ except ImportError:  # invoked outside the package, with the repo root on PYTHON
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
-    parser.add_argument("--token", required=True)
     parser.add_argument("--fake-secret", default="test-do-not-use-in-production")
     args = parser.parse_args()
-    response = call(args.socket, args.token, {"type": "pending"})
+    response = call(args.socket, {"type": "pending"})
     requests = response.get("requests", [])
     if not requests:
         print("no pending request")
@@ -35,7 +34,6 @@ def main() -> None:
         secret = getpass.getpass("Fake secret: ")
     result = call(
         args.socket,
-        args.token,
         {
             "type": "approve",
             "request_id": item["request_id"],

@@ -4,25 +4,30 @@
 
 1. **Visual plugin** — runs inside Quickshell/Omarchy Shell, presents
    requests, and collects local consent.
-2. **Local broker** — a user service with a private Unix socket, nonce,
-   timeout, process binding, and buffer cleanup.
+2. **Local broker** — a **system** service (`omarchy-doorman.service`,
+   running as the dedicated user `doorman`) with two Unix sockets in
+   `/run/doorman` — `askpass.sock` for requests and `control.sock` for the
+   trusted UI — plus per-request nonce, timeout, process binding, and buffer
+   cleanup. It holds no session token or capability.
 3. **Authentication helper** — a small, dependency-free native binary
    (`askpass/doorman-askpass.c`), installed once by root at a fixed path
-   outside the plugin's own checkout, owned by root and only executable
-   (not readable or writable) by the user. It proves its identity by
-   handing the broker a file descriptor for its own executable
-   (`SCM_RIGHTS`) rather than the broker trying to inspect the connecting
-   process itself — reading another process's `/proc/<pid>/exe` needs a
-   permission this project's own systemd hardening denies the broker, so
-   the fd is passed instead of inspected. Opening its own `/proc/self/exe`
-   isn't privilege-exempt either (same DAC check as opening the file by
-   path), so the binary also carries the `cap_dac_read_search` file
-   capability, applied by the install script, scoped to this one binary
-   only. Limited integration with `sudo
-   askpass`, never receiving arbitrary commands from the plugin — and,
-   since this is the only thing the broker will hand the secret to, never a
-   plain script the agent itself could have written or pointed
-   `SUDO_ASKPASS` at. See `SPEC.md` §6.11.
+   outside the plugin's own checkout
+   (`/usr/local/lib/omarchy-doorman/doorman-askpass`), owned
+   `root:doorman-askpass`, mode `2755` (**setgid**). Its identity is the
+   effective gid the kernel gives any process that executes it: the request
+   socket is owned `doorman:doorman-askpass`, `0660`, so only such a process
+   can connect, and the broker re-reads that egid from `SO_PEERCRED`
+   (recorded at `connect()`, so a later `execve()` can't change it) and
+   refuses anything else. The binary opens no file, connects to the fixed
+   path `/run/doorman/askpass.sock` (the one environment variable it
+   reads, `DOORMAN_SOCKET_DEV_OVERRIDE`, exists for its own tests; see
+   `SPEC.md` §6.13), marks itself non-dumpable
+   (`prctl(PR_SET_DUMPABLE, 0)`) so a same-user process can't ptrace it or
+   read the secret from its memory, and, being setgid, ignores `LD_PRELOAD`.
+   There is no identity-helper process, no `SIGSTOP`, no `pidfd`, and no
+   `/proc/<pid>/exe` lookup. Limited integration with `sudo askpass`, never
+   receiving arbitrary commands from the plugin. See `SPEC.md` §6.13, which
+   also states what has not yet been verified live.
 4. **Privileged operation** — `sudo` or `pkexec`, always with a verifiable
    scope and origin.
 
@@ -31,10 +36,17 @@
 ```text
 authorized command
     └─ sudo / sudo -A / SUDO_ASKPASS
-         └─ local broker
-              └─ Omarchy plugin
-                   └─ user confirms and types locally
+         └─ doorman-askpass (setgid doorman-askpass, non-dumpable)
+              └─ /run/doorman/askpass.sock  (doorman:doorman-askpass 0660)
+                   └─ broker: egid check via SO_PEERCRED, sudo-parent checks
+                        └─ /run/doorman/control.sock (doorman:doorman-ui 0660)
+                             └─ Omarchy plugin (bridge.py, status-only widget)
+                                  └─ user confirms and types locally
 ```
+
+Each socket serves only its own verbs: `request` on the askpass socket;
+`approve`/`cancel`/`pending`/`stats` on the control socket. The other socket
+answers `wrong_socket`.
 
 The password's content never returns to the agent, the chat, the
 clipboard, or the log.
