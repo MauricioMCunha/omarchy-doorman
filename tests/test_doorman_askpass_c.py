@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, socket, subprocess, sys, tempfile, threading, unittest
+import json, os, socket, subprocess, sys, tempfile, threading, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,74 +51,103 @@ class AskpassBinaryTest(unittest.TestCase):
         return subprocess.run([str(self.binary)], env=full_env, capture_output=True, timeout=5)
 
     def test_ignores_xdg_runtime_dir_and_doorman_socket_in_production(self) -> None:
-        # Uses DOORMAN_RUNTIME_DIR_DEV_OVERRIDE (not
-        # DOORMAN_SOCKET_DEV_OVERRIDE), so the socket path is still derived
-        # from runtime_dir the production way. This deliberately never
-        # touches this machine's real, getuid()-derived production runtime
-        # dir — asserting against that path would be environment-coupled
-        # and dangerous: if a real broker is running there, the binary
-        # could connect to it for real and pop a live approval prompt in
-        # the real Quickshell UI in the middle of a test run. Instead, this
-        # isolates the two "ignored in production" claims with hard
-        # evidence: the token content actually sent, and which of two fake
-        # listeners actually received a connection.
-        runtime_dir = self.tmp_path / "runtime"
-        runtime_dir.mkdir()
-        (runtime_dir / "token").write_text("test-token\n")
-        (runtime_dir / "llm-capability").write_text("test-capability\n")
-        real_socket = runtime_dir / "broker.sock"
+        # Only DOORMAN_SOCKET_DEV_OVERRIDE selects the connect target;
+        # XDG_RUNTIME_DIR and DOORMAN_SOCKET must be ignored.
+        real_socket = self.tmp_path / "broker.sock"
         fake_real = _FakeBroker(real_socket)
         self.addCleanup(fake_real.close)
-
-        evil_runtime_dir = self.tmp_path / "evil-xdg-runtime-dir" / "omarchy-doorman"
-        evil_runtime_dir.mkdir(parents=True)
-        (evil_runtime_dir / "token").write_text("evil-token\n")
-        (evil_runtime_dir / "llm-capability").write_text("evil-capability\n")
         attacker_socket = self.tmp_path / "attacker.sock"
         fake_attacker = _FakeBroker(attacker_socket)
         self.addCleanup(fake_attacker.close)
 
         self._run_askpass({
-            "DOORMAN_RUNTIME_DIR_DEV_OVERRIDE": str(runtime_dir),
+            "DOORMAN_SOCKET_DEV_OVERRIDE": str(real_socket),
             "XDG_RUNTIME_DIR": str(self.tmp_path / "evil-xdg-runtime-dir"),
             "DOORMAN_SOCKET": str(attacker_socket),
         })
         self.assertIsNone(fake_attacker.received)
         self.assertIsNotNone(fake_real.received)
-        self.assertIn(b'"token":"test-token"', fake_real.received)
 
-    def test_dev_override_env_vars_are_honored(self) -> None:
-        runtime_dir = self.tmp_path / "runtime"
-        runtime_dir.mkdir()
-        (runtime_dir / "token").write_text("test-token\n")
-        (runtime_dir / "llm-capability").write_text("test-capability\n")
+    def test_request_has_exact_field_set_without_token_capability_origin(self) -> None:
         socket_path = self.tmp_path / "broker.sock"
         fake = _FakeBroker(socket_path)
         self.addCleanup(fake.close)
-        result = self._run_askpass({
-            "DOORMAN_RUNTIME_DIR_DEV_OVERRIDE": str(runtime_dir),
+        result = self._run_askpass({"DOORMAN_SOCKET_DEV_OVERRIDE": str(socket_path)})
+        self.assertNotEqual(result.returncode, 0)  # fake replies ok:false
+        self.assertIsNotNone(fake.received)
+        req = json.loads(fake.received)
+        self.assertEqual(
+            set(req), {"type", "pid", "sudo_pid", "command", "cwd", "tty", "prompt"})
+        self.assertEqual(req["type"], "request")
+        self.assertEqual(req["prompt"], "Password: ")
+
+    def test_does_not_read_token_files_from_runtime_dir_env(self) -> None:
+        # A stale env var from the removed design must have no effect.
+        socket_path = self.tmp_path / "broker.sock"
+        fake = _FakeBroker(socket_path)
+        self.addCleanup(fake.close)
+        self._run_askpass({
             "DOORMAN_SOCKET_DEV_OVERRIDE": str(socket_path),
+            "DOORMAN_RUNTIME_DIR_DEV_OVERRIDE": str(self.tmp_path / "nonexistent"),
         })
         self.assertIsNotNone(fake.received)
-        self.assertIn(b'"token":"test-token"', fake.received)
+        self.assertNotIn(b"token", fake.received)
 
-    def test_symlinked_token_file_is_rejected_even_when_target_is_readable(self) -> None:
-        runtime_dir = self.tmp_path / "runtime"
-        runtime_dir.mkdir()
-        readable_target = self.tmp_path / "world-readable-but-wrong-file"
-        readable_target.write_text("not the real token\n")
-        os.chmod(readable_target, 0o644)
-        (runtime_dir / "token").symlink_to(readable_target)
-        (runtime_dir / "llm-capability").write_text("test-capability\n")
+    def test_approved_decision_prints_secret(self) -> None:
         socket_path = self.tmp_path / "broker.sock"
-        fake = _FakeBroker(socket_path)
-        self.addCleanup(fake.close)
-        result = self._run_askpass({
-            "DOORMAN_RUNTIME_DIR_DEV_OVERRIDE": str(runtime_dir),
-            "DOORMAN_SOCKET_DEV_OVERRIDE": str(socket_path),
-        })
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIsNone(fake.received)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(socket_path))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def serve() -> None:
+            conn, _ = srv.accept()
+            with conn:
+                conn.settimeout(3.0)
+                f = conn.makefile("rb")
+                f.readline(16384)
+                conn.sendall(b'{"ok":true}\n')
+                conn.sendall(b'{"ok":true,"secret":"p\\"w\\\\x"}\n')
+
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        result = self._run_askpass({"DOORMAN_SOCKET_DEV_OVERRIDE": str(socket_path)})
+        th.join(timeout=3)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'p"w\\x\n')
+
+    def test_process_is_non_dumpable_at_runtime(self) -> None:
+        socket_path = self.tmp_path / "broker.sock"
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(socket_path))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        env = os.environ.copy()
+        env["DOORMAN_SOCKET_DEV_OVERRIDE"] = str(socket_path)
+        proc = subprocess.Popen([str(self.binary)], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            srv.settimeout(3.0)
+            conn, _ = srv.accept()
+            with conn:
+                conn.settimeout(3.0)
+                conn.makefile("rb").readline(16384)  # binary is now blocked reading our reply
+                # /proc/<pid>/status has no Dumpable: line. The kernel
+                # instead makes the files inside /proc/<pid> (e.g. environ)
+                # root-owned for a non-dumpable process (a dumpable one's
+                # are owned by its own euid).
+                self.assertEqual(os.stat(f"/proc/{proc.pid}/environ").st_uid, 0)
+                # Control: the same check on a dumpable process must differ,
+                # so the assertion above is not vacuous.
+                ctl = subprocess.Popen(["sleep", "5"])
+                try:
+                    self.assertEqual(os.stat(f"/proc/{ctl.pid}/environ").st_uid, os.getuid())
+                finally:
+                    ctl.kill()
+                    ctl.wait()
+        finally:
+            proc.kill()
+            proc.communicate()
 
 if __name__ == "__main__":
     unittest.main()

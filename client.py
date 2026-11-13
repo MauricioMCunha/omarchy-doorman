@@ -16,8 +16,8 @@ DECISION_WAIT_MARGIN = 2.0
 MAX_DECISION_WAIT = 305.0
 
 
-def call(socket_path: Path, token: str, payload: dict[str, Any]) -> dict[str, Any]:
-    message = {"token": token, **payload}
+def call(socket_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    message = dict(payload)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(SOCKET_TIMEOUT)
         conn.connect(str(socket_path))
@@ -30,9 +30,9 @@ def call(socket_path: Path, token: str, payload: dict[str, Any]) -> dict[str, An
     return json.loads(line)
 
 
-def request_secret(socket_path: Path, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+def request_secret(socket_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Create a request and keep the connection open until the UI decides."""
-    message = {"token": token, "type": "request", **payload}
+    message = {"type": "request", **payload}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(SOCKET_TIMEOUT)
         conn.connect(str(socket_path))

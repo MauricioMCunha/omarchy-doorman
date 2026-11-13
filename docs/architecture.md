@@ -4,30 +4,30 @@
 
 1. **Visual plugin** — runs inside Quickshell/Omarchy Shell, presents
    requests, and collects local consent.
-2. **Local broker** — a user service with a private Unix socket, nonce,
-   timeout, process binding, and buffer cleanup.
+2. **Local broker** — a **system** service (`omarchy-doorman.service`,
+   running as the dedicated user `doorman`) with two Unix sockets in
+   `/run/doorman` — `askpass.sock` for requests and `control.sock` for the
+   trusted UI — plus per-request nonce, timeout, process binding, and buffer
+   cleanup. It holds no session token or capability.
 3. **Authentication helper** — a small, dependency-free native binary
    (`askpass/doorman-askpass.c`), installed once by root at a fixed path
-   outside the plugin's own checkout, owned by root and not writable by
-   the user. Unlike earlier designs, the binary itself is privilege-free:
-   no file capability, no `setuid`/`setgid`, and it never opens its own
-   `/proc/self/exe` or hands the broker a file descriptor. Instead, a
-   separate systemd `--user` unit — `omarchy-doorman-identity-helper`
-   (`identity_helper/identity_helper.py`), started independently of the
-   broker so it keeps none of the broker's own mount-namespace hardening —
-   answers one question: does a given pid's `/proc/<pid>/exe` identify the
-   same file (device+inode, via `fstat()`, never a path string) as this
-   installed binary? The broker queries that helper synchronously, the
-   instant it accepts a connection and before reading anything the peer
-   sends, holding a `pidfd` and briefly `SIGSTOP`ping the peer for the
-   duration of the query so a process that forks and execs into the
-   trusted binary mid-connection can't be mistaken for the real thing —
-   the peer is always resumed (`SIGCONT`) once the check completes,
-   whatever the answer. Limited integration with `sudo askpass`, never
-   receiving arbitrary commands from the plugin — and, since this is the
-   only thing the broker will hand the secret to, never a plain script the
-   agent itself could have written or pointed `SUDO_ASKPASS` at. See
-   `SPEC.md` §6.13.
+   outside the plugin's own checkout
+   (`/usr/local/lib/omarchy-doorman/doorman-askpass`), owned
+   `root:doorman-askpass`, mode `2755` (**setgid**). Its identity is the
+   effective gid the kernel gives any process that executes it: the request
+   socket is owned `doorman:doorman-askpass`, `0660`, so only such a process
+   can connect, and the broker re-reads that egid from `SO_PEERCRED`
+   (recorded at `connect()`, so a later `execve()` can't change it) and
+   refuses anything else. The binary opens no file, connects to the fixed
+   path `/run/doorman/askpass.sock` (the one environment variable it
+   reads, `DOORMAN_SOCKET_DEV_OVERRIDE`, exists for its own tests; see
+   `SPEC.md` §6.13), marks itself non-dumpable
+   (`prctl(PR_SET_DUMPABLE, 0)`) so a same-user process can't ptrace it or
+   read the secret from its memory, and, being setgid, ignores `LD_PRELOAD`.
+   There is no identity-helper process, no `SIGSTOP`, no `pidfd`, and no
+   `/proc/<pid>/exe` lookup. Limited integration with `sudo askpass`, never
+   receiving arbitrary commands from the plugin. See `SPEC.md` §6.13, which
+   also states what has not yet been verified live.
 4. **Privileged operation** — `sudo` or `pkexec`, always with a verifiable
    scope and origin.
 
@@ -36,10 +36,17 @@
 ```text
 authorized command
     └─ sudo / sudo -A / SUDO_ASKPASS
-         └─ local broker
-              └─ Omarchy plugin
-                   └─ user confirms and types locally
+         └─ doorman-askpass (setgid doorman-askpass, non-dumpable)
+              └─ /run/doorman/askpass.sock  (doorman:doorman-askpass 0660)
+                   └─ broker: egid check via SO_PEERCRED, sudo-parent checks
+                        └─ /run/doorman/control.sock (doorman:doorman-ui 0660)
+                             └─ Omarchy plugin (bridge.py, status-only widget)
+                                  └─ user confirms and types locally
 ```
+
+Each socket serves only its own verbs: `request` on the askpass socket;
+`approve`/`cancel`/`pending`/`stats` on the control socket. The other socket
+answers `wrong_socket`.
 
 The password's content never returns to the agent, the chat, the
 clipboard, or the log.

@@ -23,13 +23,11 @@ def main() -> int:
     parser.add_argument("prompt", nargs="?", default="Password: ")
     args = parser.parse_args()
     socket_path = os.environ.get("DOORMAN_SOCKET")
-    token = os.environ.get("DOORMAN_TOKEN")
-    if not socket_path or not token:
+    if not socket_path:
         return 2
     try:
         result = request_secret(
             Path(socket_path),
-            token,
             {
                 "pid": os.getpid(),
                 # sudo execs this script (via the bash wrapper), so the ppid
@@ -42,8 +40,6 @@ def main() -> int:
                 "cwd": os.getcwd(),
                 "tty": os.environ.get("DOORMAN_TTY", ""),
                 "prompt": args.prompt,
-                "origin": "llm",
-                "capability": os.environ.get("DOORMAN_LLM_CAPABILITY", ""),
                 "screen": os.environ.get("DOORMAN_SCREEN", ""),
             },
         )

@@ -12,14 +12,20 @@ project and has to go along with any submission.
 - The plugin doesn't capture global keyboard, PTY, clipboard, or arbitrary
   commands.
 - The secret never enters arguments, files, logs, or the agent's messages.
-- The UI only approves a request authenticated by token, nonce, deadline,
-  and process identity.
-- The broker only accepts `origin=llm` with a valid session capability.
-- The socket and the session files are private to the user (`0700`/`0600`).
+- The UI only approves a request bound to its nonce, deadline, process
+  identity and the configured owner uid, and only over the control socket.
+- The broker only accepts a request from a process carrying the
+  `doorman-askpass` effective gid (the root-installed setgid askpass
+  binary), read from `SO_PEERCRED`. There is no session token, `origin`, or
+  capability (SPEC.md §6.9, §6.13).
+- Two sockets in `/run/doorman`, owned by the system user `doorman`, mode
+  `0660`, groups `doorman-askpass` and `doorman-ui`; no session files exist.
 - The UI calls absolute executables and the bridge ships alongside the
   plugin; there's no path override via environment variable.
 - The service is explicit and reversible; the plugin doesn't silently
-  install a service or package.
+  install a service or package. The broker is a system service installed by
+  one explicit root step (`scripts/doorman-install-askpass`, with
+  `--uninstall`), not a `systemd --user` unit.
 
 ## Blockers before submission
 
@@ -45,7 +51,10 @@ project and has to go along with any submission.
    as a git checkout, and places the widget without a full shell restart.
    The broker step (the `systemd --user` service) stays manual, since
    `omarchy plugin add` doesn't manage units — documented explicitly as
-   such.
+   such. *(Superseded 2026-11: the broker is now a system service installed
+   by `scripts/doorman-install-askpass` and started with
+   `systemctl enable --now`; the README documents that flow and its
+   `--uninstall` counterpart. Item 12 tracks that change.)*
 4. Test on a clean account: installation, shell restart, toggling the
    broker, approval, cancellation, expiry, removal, and rollback.
 5. ~~Add dependency review, `qmllint`, Python tests, and secret inspection
@@ -326,6 +335,41 @@ project and has to go along with any submission.
     systemd units and a real `sudo` round trip — not just the test suite —
     is tracked separately and had not yet been run as of this writing; see
     `docs/superpowers/plans/2026-11-05-askpass-identity-6th-design.md`'s
-    final task. Still only a partial review.
+    final task. Still only a partial review. *(The mechanism in this item
+    was itself replaced; see item 12.)*
+
+12. **OPEN** — Shape B ("7th design") for the #9558 identity findings:
+    implemented, **not yet verified live, and #9558 is not reopened.** What
+    changed, as shipped in the code and described in SPEC.md §6.13: the
+    broker became a system service (`User=doorman`) with two sockets
+    (`askpass.sock`, group `doorman-askpass`; `control.sock`, group
+    `doorman-ui`); the askpass binary is installed `root:doorman-askpass`
+    `2755` and non-dumpable (`PR_SET_DUMPABLE`); the broker admits a
+    `request` only if the peer's effective gid from `SO_PEERCRED` is
+    `doorman-askpass`; each socket serves only its own verbs
+    (`wrong_socket`); every uid comparison is against the configured
+    `--owner-uid` and `approve`/`cancel` are bound to the request's owner uid;
+    and the whole token/capability/`origin=llm` layer was removed. The
+    identity-helper, `SIGSTOP`, `pidfd` and `/proc/<pid>/exe` mechanisms of
+    item 11 no longer exist in the code. Closed by design, live
+    verification pending: the `O_PATH` fd bypass (nothing is read from the
+    peer), the symlink/environment exfiltration (no file read, fixed socket
+    path), the fork-exec race (identity is the connect-time egid), and the
+    same-uid ptrace/memory read of the secret (non-dumpable). Confirmed live
+    so far: only the four kernel assumptions in the design record's spike.
+    Still to do, by a human with root (Task 12 of
+    `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`): the
+    real-unit end-to-end round trip, setgid surviving real `sudo -A`, the
+    socket ACL, §6.1's cross-uid `/proc` reads under the system unit, the
+    ptrace attempt against the real binary, the symlink/environment
+    reproduction, both fork-exec variants 20/20, the second-user
+    rejection, and the degraded-state check. Open deployment item: the
+    broker's code lives in the user's home, which `doorman` may not be able
+    to read under `ProtectHome=read-only`; it may need to be installed
+    outside `/home`. Also unresolved: the `/run/doorman` directory is
+    `0750 doorman:doorman`, and that the askpass binary and the UI can
+    traverse it to their sockets is unverified. Items 10 and 11 above are
+    kept as the record of the earlier designs; the mechanisms they describe
+    were replaced.
 
 Don't submit while any blocker above is still open.

@@ -6,18 +6,18 @@ set -euo pipefail
 # Explicit non-interactive/stdin modes remain untouched.
 
 readonly real_sudo="/usr/bin/sudo"
-readonly runtime_dir="${XDG_RUNTIME_DIR:?}/omarchy-doorman"
-readonly plugin_dir="${DOORMAN_PLUGIN_DIR:-${HOME}/.config/omarchy/plugins/mauricio.doorman}"
 # The helper installed by scripts/doorman-install-askpass (SPEC.md §6.13)
-# — a fixed path outside the plugin's own git checkout, owned root:root,
-# mode 0755. The binary itself is privilege-free (no file capability, no
-# setuid/setgid, no fd-passing): its identity is instead confirmed by a
-# separate omarchy-doorman-identity-helper.service, which the broker
-# queries synchronously at accept() time, comparing the connecting peer's
-# /proc/<pid>/exe (device+inode) against this installed path.
-# DOORMAN_ASKPASS stays available as an override for development/testing
-# against the plain Python askpass.py, which the broker will reject on the
-# production path (identity-helper reports no match).
+# is a root-owned, setgid `doorman-askpass` binary (mode 2755) at a fixed path
+# outside the plugin's checkout. Its identity is its effective gid, which the
+# kernel records at connect() and the broker reads via SO_PEERCRED. The socket
+# ACL (askpass.sock is group doorman-askpass, 0660) plus the broker's egid gate
+# mean a non-setgid substitute connects without that egid and is rejected.
+# The installed binary ignores the environment for its socket path: it uses the
+# fixed /run/doorman/askpass.sock, and the broker derives the displayed command
+# from the real sudo parent's cmdline (§6.12), so none is passed here.
+# DOORMAN_ASKPASS is a dev/test override only (e.g. a wrapper running the
+# Python broker.askpass, which needs DOORMAN_SOCKET set by the caller). Being
+# non-setgid, it is rejected by the production broker, which is correct.
 readonly askpass="${DOORMAN_ASKPASS:-/usr/local/lib/omarchy-doorman/doorman-askpass}"
 
 for arg in "$@"; do
@@ -51,8 +51,10 @@ esac
 }
 
 export SUDO_ASKPASS="$askpass"
-export DOORMAN_SOCKET="${DOORMAN_SOCKET:-${runtime_dir}/broker.sock}"
-export DOORMAN_COMMAND="sudo $*"
-export PYTHONPATH="${plugin_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+# PYTHONPATH is only needed by a Python dev askpass, never the installed binary.
+if [[ -n "${DOORMAN_ASKPASS:-}" ]]; then
+  plugin_dir="${DOORMAN_PLUGIN_DIR:-${HOME}/.config/omarchy/plugins/mauricio.doorman}"
+  export PYTHONPATH="${plugin_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 exec "$real_sudo" -A "$@"

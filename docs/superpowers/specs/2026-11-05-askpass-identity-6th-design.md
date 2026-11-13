@@ -316,6 +316,67 @@ side-effect of a mechanism rather than stating the requirement explicitly
 call should be added regardless, as defense-in-depth that doesn't depend on
 whatever the final identity-binding mechanism turns out to be.
 
+## Decision and spike (2026-11-08/09): build "shape B", validated live
+
+After a 3-engineer debate and a separate decider (full decision in
+`.superpowers/sdd/2026-11-05-askpass-identity-6th-design/decision.md`), the
+chosen path is **shape B**: abandon `/proc/<pid>/exe` identity entirely and
+bind identity to a kernel-captured credential instead. The broker becomes a
+**system** service under a dedicated system user (`doorman`), its socket
+owned `doorman:doorman-askpass` mode `0660`, and the installed askpass
+binary is `setgid doorman-askpass` (a group that owns no files). The
+kernel's permission check at `connect()` time *is* the identity check:
+only a process that actually exec'd the setgid binary has that egid, and
+the broker reads it via `SO_PEERCRED` (kernel-recorded at `connect()`, not
+raceable by a later `execve()`). The identity-helper, `SIGSTOP`, and
+`pidfd` pinning all retire with this.
+
+The decider forced this NOW rather than later, because the mandatory
+Finding-5 fix (non-dumpable askpass) is structurally incompatible with the
+`/proc/<pid>/exe` helper (a same-uid non-ancestor's exe read is
+`PTRACE_MODE_READ`-gated, which `dumpable=0` revokes) — so the exe-identity
+mechanism had to be replaced, not patched.
+
+**Spike result (2026-11-09, live, on this machine; disposable, self-cleaning
+root script — see `spike-report.md`), all four make-or-break kernel
+assumptions hold:**
+
+- **Q1 (the kill-test): PASS.** The `setgid` bit *survives* a real `sudo -A`
+  exec — `no_new_privs` does not drop it. Confirmed: the askpass stand-in,
+  invoked as `SUDO_ASKPASS` through real `sudo -A`, ran with
+  `egid=doorman-askpass`. This is the single assumption that would have
+  killed shape B; it holds.
+- **Q2: PASS.** A socket owned `doorman:doorman-askpass` mode `0660` denies
+  (`EACCES`) an ordinary same-uid process that is not in the group. The
+  "owner-bits precedence" worry is real but works in B's favour, because
+  the socket owner (`doorman`) differs from the connecting uid, so the
+  connector is judged by the group bits.
+- **Q3: PASS (on security; the spike script's own verdict line was a bug).**
+  Against the `setgid` target, the ancestor `PTRACE_ATTACH` failed with
+  `EPERM`, `at_secure=1`, attack `BLOCKED`; the dumpable control target was
+  `COMPROMISED` (attack reproduced). The script hard-coded a check for
+  `dumpable==0` but the process showed `dumpable==2`
+  (`SUID_DUMP_ROOT`) — **both values are `!= SUID_DUMP_USER(1)` and both
+  block same-uid ptrace**, so the security goal was met. **Crucial
+  implementation consequence:** `dumpable` after a `setgid` exec is governed
+  by the machine's `fs.suid_dumpable` sysctl (observed `2` here → safe; a
+  machine with `fs.suid_dumpable=1` would leave the `setgid` process
+  `dumpable=1` and the ptrace read would SUCCEED). Therefore the explicit
+  `prctl(PR_SET_DUMPABLE, 0)` in the askpass's `main()` is **mandatory, not
+  belt-and-suspenders** — the `setgid` non-dumpable side effect must not be
+  relied on, exactly as the §6.11 capability history warned.
+- **Q4: PASS.** A non-dumpable `setgid` client connected and the listener
+  read its `egid` via `SO_PEERCRED` correctly. Dumpability does not gate
+  `SO_PEERCRED`, so making askpass non-dumpable does not break the new
+  credential check (which is why this replaces the exe check that
+  non-dumpability *did* break).
+
+Issue #9558 is **not** reopened until shape B is built, implemented, and
+live-verified against the real units — reopening earlier would hand the
+reviewer the confirmed Finding-5 ptrace read (a regression this branch
+introduced) plus the unmitigated race. Fix the boundary; don't document it
+away.
+
 ## Design
 
 ### New component: `omarchy-doorman-identity-helper`

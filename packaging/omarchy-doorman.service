@@ -1,27 +1,46 @@
 [Unit]
 Description=Omarchy Doorman Broker
-After=graphical-session.target
-Wants=omarchy-doorman-identity-helper.service
-After=omarchy-doorman-identity-helper.service
-PartOf=graphical-session.target
+# The sockets live in /run/doorman and are independent of any user session.
+After=local-fs.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/mauriciocunha/DEV/omarchy-doorman
-ExecStart=/home/mauriciocunha/DEV/omarchy-doorman/scripts/run-doorman-broker
+# @PROJECT_DIR@ is substituted by scripts/doorman-install-askpass with the
+# system install dir /usr/local/lib/omarchy-doorman (root-owned, outside the
+# checkout), so the service does not depend on the user's home at all.
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/scripts/run-doorman-broker
+User=doorman
+Group=doorman
+SupplementaryGroups=doorman-askpass doorman-ui
+RuntimeDirectory=doorman
+# 0711, not 0750: /run/doorman is owned doorman:doorman, but the askpass
+# (uid=login user, egid=doorman-askpass) and the UI (login uid, group
+# doorman-ui) are neither uid doorman nor in group doorman, so they fall into
+# "other". They must be able to TRAVERSE the directory (--x) to reach the
+# sockets inside. The real access gate is each socket's own 0660 group ACL
+# (askpass.sock -> doorman-askpass, control.sock -> doorman-ui), not the
+# directory mode. 0711 grants traverse only: others cannot list the directory.
+# The owner (the broker, uid doorman) keeps rwx to create/bind/chgrp sockets.
+RuntimeDirectoryMode=0711
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
 PrivateTmp=true
+
+# !!! IMPORTANT (Task 12 live check) !!!
+# The broker reads /proc/<pid>/{comm,stat,status,cmdline,exe} of processes
+# owned by the login user (SPEC §6.1 cross-uid /proc reads). Under this
+# system uid those reads were verified in a spike with the directives below,
+# but they REMAIN a live check (Task 12). If ProtectHome/ProtectSystem ever
+# block them, reconsider those specific directives, not the whole profile.
+# The broker code is read from the root-installed copy, not from /home.
 ProtectSystem=strict
 ProtectHome=read-only
-RuntimeDirectory=omarchy-doorman
-RuntimeDirectoryMode=0700
-ReadWritePaths=%t/omarchy-doorman
-UMask=0077
+ReadWritePaths=/run/doorman
+UMask=0007
 
-# Extra hardening: the broker only speaks over a local Unix socket and reads
-# /proc of its own user, so it can give up almost every other surface.
+# Extra hardening: the broker only speaks over local Unix sockets.
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
@@ -40,4 +59,4 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=multi-user.target

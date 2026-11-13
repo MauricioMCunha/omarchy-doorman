@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import uuid
-from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,7 +24,7 @@ from client import call, request_secret  # noqa: E402
 from broker.broker import Broker, PendingRequest, MAX_PENDING  # noqa: E402
 
 # approve/cancel/pending/stats now require the caller (or its near ancestry)
-# to be the trusted UI process — see Broker._peer_is_trusted_ui, which reads
+# to be the trusted UI process — see Broker._trusted_ui_peer_uid, which reads
 # /proc/<pid>/comm (not /proc/<pid>/exe: reading another same-user process's
 # exe needs ptrace-equivalent permission that a systemd --user service is
 # denied even with CAP_SYS_PTRACE and zero sandboxing — confirmed while
@@ -45,21 +50,30 @@ TEST_TRUSTED_SUDO_EXE = TEST_TRUSTED_UI_EXE
 # of the check while still exercising everything else it does.
 TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT = "--trusted-sudo-allow-unprivileged-parent"
 
-# Broker._handle (SPEC.md §6.11) additionally requires the connecting
-# peer's real /proc/<pid>/exe — resolved out-of-process by the
-# identity-helper, never by the broker itself — to match a fixed,
-# root-installed path. Plain client.call()/request_secret() connections are
-# ordinary Python processes, not that binary, so every broker below that
-# needs legitimate request creation to succeed also needs this test-only
-# bypass, unless the test is specifically exercising the identity check
-# itself.
+# Shape B: Broker._handle admits a "request" only if the peer's effective gid
+# (SO_PEERCRED) equals the trusted askpass gid. Plain client connections in
+# tests are ordinary processes, so brokers that need legitimate request
+# creation pass this test-only bypass, unless the test exercises the egid gate
+# itself (those pass --trusted-askpass-gid instead).
 TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK = "--trusted-askpass-skip-identity-check"
 
-# A real file, used as the identity-helper's configured trusted path in
-# tests that want the helper reachable but every real peer to mismatch it —
-# no process's /proc/<pid>/exe ever resolves to this test file, so the
-# helper always answers "no match" without needing root or a compiler.
-_ALWAYS_PRESENT_OTHER_PATH = str(Path(__file__).resolve())
+# The single configured login user (--owner-uid): in tests, the test runner.
+TEST_OWNER_UID = os.getuid()
+TEST_EGID = os.getegid()
+
+
+# askpass (request) socket path -> its sibling control (UI verbs) socket path.
+_CONTROL_SOCKETS: dict[Path, Path] = {}
+
+
+def _ctl(socket_path: Path) -> Path:
+    """The control socket of the broker whose askpass socket is socket_path."""
+    return _CONTROL_SOCKETS[socket_path]
+
+
+def _other_gid() -> int:
+    """A gid that is not this process's egid."""
+    return TEST_EGID + 1 if TEST_EGID + 1 != TEST_EGID else TEST_EGID + 2
 
 # Calling the client directly from this test process would make the
 # process's own parent (whatever launched the test runner, not something
@@ -71,30 +85,30 @@ _ALWAYS_PRESENT_OTHER_PATH = str(Path(__file__).resolve())
 _SUBPROCESS_CALL_CODE = (
     "import json, os, sys\n"
     "from client import call\n"
-    "payload = json.loads(sys.argv[3])\n"
+    "payload = json.loads(sys.argv[2])\n"
     "if payload.get('type') == 'request': payload['pid'] = os.getpid()\n"
-    "print(json.dumps(call(sys.argv[1], sys.argv[2], payload)))\n"
+    "print(json.dumps(call(sys.argv[1], payload)))\n"
 )
 _SUBPROCESS_REQUEST_SECRET_CODE = (
     "import json, os, sys\n"
     "from client import request_secret\n"
-    "payload = json.loads(sys.argv[3])\n"
+    "payload = json.loads(sys.argv[2])\n"
     "payload['pid'] = os.getpid()\n"
-    "print(json.dumps(request_secret(sys.argv[1], sys.argv[2], payload)))\n"
+    "print(json.dumps(request_secret(sys.argv[1], payload)))\n"
 )
 
 
-def _call_as_subprocess(socket_path: Path, token: str, payload: dict) -> dict:
+def _call_as_subprocess(socket_path: Path, payload: dict) -> dict:
     proc = subprocess.run(
-        [sys.executable, "-c", _SUBPROCESS_CALL_CODE, str(socket_path), token, json.dumps(payload)],
+        [sys.executable, "-c", _SUBPROCESS_CALL_CODE, str(socket_path), json.dumps(payload)],
         cwd=ROOT, capture_output=True, text=True, timeout=15, check=False,
     )
     return json.loads(proc.stdout)
 
 
-def _request_secret_subprocess(socket_path: Path, token: str, payload: dict) -> subprocess.Popen:
+def _request_secret_subprocess(socket_path: Path, payload: dict) -> subprocess.Popen:
     return subprocess.Popen(
-        [sys.executable, "-c", _SUBPROCESS_REQUEST_SECRET_CODE, str(socket_path), token, json.dumps(payload)],
+        [sys.executable, "-c", _SUBPROCESS_REQUEST_SECRET_CODE, str(socket_path), json.dumps(payload)],
         cwd=ROOT, stdout=subprocess.PIPE, text=True,
     )
 
@@ -109,8 +123,8 @@ def _request_secret_subprocess(socket_path: Path, token: str, payload: dict) -> 
 # as a second line.
 _SUBPROCESS_REQUEST_AND_HOLD_CODE = (
     "import json, os, socket, sys\n"
-    "payload = json.loads(sys.argv[3]); payload['pid'] = os.getpid()\n"
-    "msg = {'token': sys.argv[2], 'type': 'request', **payload}\n"
+    "payload = json.loads(sys.argv[2]); payload['pid'] = os.getpid()\n"
+    "msg = {'type': 'request', **payload}\n"
     "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
     "    conn.connect(sys.argv[1])\n"
     "    conn.sendall((json.dumps(msg) + chr(10)).encode())\n"
@@ -122,84 +136,24 @@ _SUBPROCESS_REQUEST_AND_HOLD_CODE = (
 )
 
 
-def _request_and_hold(socket_path: Path, token: str, payload: dict) -> tuple[dict, subprocess.Popen]:
+def _request_and_hold(socket_path: Path, payload: dict) -> tuple[dict, subprocess.Popen]:
     proc = subprocess.Popen(
-        [sys.executable, "-c", _SUBPROCESS_REQUEST_AND_HOLD_CODE, str(socket_path), token, json.dumps(payload)],
+        [sys.executable, "-c", _SUBPROCESS_REQUEST_AND_HOLD_CODE, str(socket_path), json.dumps(payload)],
         cwd=ROOT, stdout=subprocess.PIPE, text=True,
     )
     return json.loads(proc.stdout.readline()), proc
 
 
-# For test_fork_then_exec_on_connecting_peer_is_rejected: connects, then
-# forks — the parent immediately execve()s into a stand-in "trusted" binary
-# (standing in for "becomes the trusted askpass exe"), while the child
-# sleeps briefly and then drives the rest of the protocol on the same,
-# shared, already-connected socket. This is the exact live-tested attack
-# from docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md,
-# "Validated findings" item 3: SO_PEERCRED's pid is captured once at
-# connect() time and never updates, so a check performed any later than
-# accept()-time (before any data is read) would see this pid's post-exec
-# identity, not the real one that opened the connection.
-_SUBPROCESS_FORK_EXEC_ATTACK_CODE = (
-    "import json, os, socket, sys, time\n"
-    "socket_path, token, payload_json = sys.argv[1], sys.argv[2], sys.argv[3]\n"
-    "payload = json.loads(payload_json)\n"
-    "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-    "s.connect(socket_path)\n"
-    "pid = os.fork()\n"
-    "if pid == 0:\n"
-    "    time.sleep(0.3)\n"
-    "    payload['pid'] = os.getppid()\n"
-    "    msg = {'token': token, 'type': 'request', **payload}\n"
-    "    s.sendall((json.dumps(msg) + chr(10)).encode())\n"
-    "    line = s.makefile('rb').readline()\n"
-    "    sys.stdout.write(line.decode()); sys.stdout.flush()\n"
-    "    os._exit(0)\n"
-    "else:\n"
-    "    os.execv('/usr/bin/true', ['/usr/bin/true'])\n"
-)
-
-# For test_fork_before_connect_on_connecting_peer_is_rejected: forks BEFORE
-# calling connect() at all, so the parent's post-connect() critical path is
-# execve() alone, with no fork() call in it to pay for. This is the
-# "Addendum 2" (2026-11-08) attack: the original SIGSTOP mitigation ran
-# inside _handle, which only starts after serve()'s main accept loop has
-# already spawned a new thread for the connection — that thread-dispatch
-# latency alone was enough for this faster attacker to win the race. See
-# docs/superpowers/specs/2026-11-05-askpass-identity-6th-design.md,
-# "Addendum 2".
-_SUBPROCESS_PRECONNECT_FORK_ATTACK_CODE = (
-    "import json, os, socket, sys, time\n"
-    "socket_path, token, payload_json = sys.argv[1], sys.argv[2], sys.argv[3]\n"
-    "payload = json.loads(payload_json)\n"
-    "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-    "pid = os.fork()\n"  # fork BEFORE connect() -- this is the point
-    "if pid == 0:\n"
-    "    time.sleep(0.3)\n"
-    "    payload['pid'] = os.getppid()\n"
-    "    msg = {'token': token, 'type': 'request', **payload}\n"
-    "    s.sendall((json.dumps(msg) + chr(10)).encode())\n"
-    "    line = s.makefile('rb').readline()\n"
-    "    sys.stdout.write(line.decode()); sys.stdout.flush()\n"
-    "    os._exit(0)\n"
-    "else:\n"
-    "    s.connect(socket_path)\n"
-    "    os.execv('/usr/bin/true', ['/usr/bin/true'])\n"
-)
-
-# For test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe:
-# the broker no longer has any SCM_RIGHTS-handling code at all (Task 2's own
-# point — the identity-helper query replaced it), so a peer that still tries
-# the old trick — attaching an fd for some other, real, root-owned-looking
-# path via SCM_RIGHTS — gets nothing special: the fd is simply never read,
-# and the connecting peer's own real /proc/<pid>/exe (this Python
-# interpreter) is what the identity-helper is asked about, which mismatches
-# the broker's configured trusted path regardless of what was attached.
+# For test_scm_rights_fd_is_ignored_…: the broker has no SCM_RIGHTS/recvmsg
+# handling at all (it never reads a file descriptor from the peer — that is
+# what keeps the O_PATH/fstat bypass structurally closed). A peer that still
+# attaches an fd via SCM_RIGHTS gets nothing special: the fd is silently
+# ignored and the request is judged purely on egid / §6.1.
 _SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE = (
     "import array, json, os, socket, sys\n"
-    "socket_path, token, trusted_path, payload_json = sys.argv[1:5]\n"
+    "socket_path, trusted_path, payload_json = sys.argv[1:4]\n"
     "payload = json.loads(payload_json); payload['pid'] = os.getpid()\n"
-    "msg = {'token': token, 'type': 'request', **payload}\n"
+    "msg = {'type': 'request', **payload}\n"
     "line = (json.dumps(msg) + chr(10)).encode()\n"
     "foreign_fd = os.open(trusted_path, os.O_PATH)\n"
     "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
@@ -221,7 +175,7 @@ _SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE = (
 # "command" is something this test can assert on precisely.
 _SUBPROCESS_SUDO_PARENT_CODE = (
     "import json, os, socket, sys\n"
-    "marker, socket_path, token = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+    "marker, socket_path = sys.argv[1], sys.argv[2]\n"
     # Via env, not argv: the payload (which deliberately carries a lying
     # "command") must NOT itself appear in this process's own /proc/<pid>/
     # cmdline, or the test below couldn't tell "derived from the real
@@ -231,7 +185,7 @@ _SUBPROCESS_SUDO_PARENT_CODE = (
     "pid = os.fork()\n"
     "if pid == 0:\n"
     "    payload = json.loads(payload_json); payload['pid'] = os.getpid()\n"
-    "    msg = {'token': token, 'type': 'request', **payload}\n"
+    "    msg = {'type': 'request', **payload}\n"
     "    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:\n"
     "        conn.connect(socket_path)\n"
     "        conn.sendall((json.dumps(msg) + chr(10)).encode())\n"
@@ -244,65 +198,25 @@ _SUBPROCESS_SUDO_PARENT_CODE = (
 
 
 class BrokerTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.socket_path = Path(self.temp.name) / "broker.sock"
-        self.token = "test-token-only"
-        self.capability = "test-llm-capability"
-        # Never started — pairs with TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK
-        # below to prove the skip path never even tries to reach a helper,
-        # not just that it happens to succeed because one is running. See
-        # test_skip_identity_check_never_contacts_identity_helper.
-        self.unstarted_identity_helper_socket = Path(self.temp.name) / "never-started-helper.sock"
-        self.process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "broker.broker",
-                "--socket",
-                str(self.socket_path),
-                "--token",
-                self.token,
-                "--llm-capability",
-                self.capability,
-                "--timeout",
-                "2",
-                "--trusted-ui-exe",
-                TEST_TRUSTED_UI_EXE,
-                "--trusted-sudo-exe",
-                TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-                "--identity-helper-socket",
-                str(self.unstarted_identity_helper_socket),
-            ],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for _ in range(50):
-            if self.socket_path.exists():
-                return
-            time.sleep(0.02)
-        self.fail("broker did not create the socket")
-
-    def tearDown(self) -> None:
-        self.process.terminate()
-        self.process.wait(timeout=2)
-        if self.process.stdout:
-            self.process.stdout.close()
-        if self.process.stderr:
-            self.process.stderr.close()
-        self.temp.cleanup()
-
-    def _start_identity_helper(self, trusted_path: str) -> Path:
+    def _start_broker(
+        self, name: str, *extra: str, timeout: str = "2", owner_uid: int = TEST_OWNER_UID,
+    ) -> Path:
+        """Starts a broker (cleaned up automatically) and returns its socket path."""
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "helper.sock"
+        socket_path = Path(temp.name) / f"{name}.sock"
+        control_path = Path(temp.name) / f"{name}-control.sock"
+        _CONTROL_SOCKETS[socket_path] = control_path
+        self.addCleanup(_CONTROL_SOCKETS.pop, socket_path, None)
         process = subprocess.Popen(
-            [sys.executable, "-m", "identity_helper.identity_helper",
-             "--socket", str(socket_path), "--trusted-askpass-path", trusted_path],
+            [
+                sys.executable, "-m", "broker.broker",
+                "--socket", str(socket_path),
+                "--control-socket", str(control_path),
+                "--owner-uid", str(owner_uid),
+                "--timeout", timeout,
+                *extra,
+            ],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         self.addCleanup(lambda: process.stderr and process.stderr.close())
@@ -310,27 +224,37 @@ class BrokerTest(unittest.TestCase):
         self.addCleanup(process.wait, timeout=2)
         self.addCleanup(process.terminate)
         for _ in range(50):
-            if socket_path.exists():
+            if socket_path.exists() and control_path.exists():
                 return socket_path
             time.sleep(0.02)
-        self.fail("identity helper did not create its socket")
+        self.fail("broker did not create the socket")
+
+    def setUp(self) -> None:
+        # Most tests do not exercise the egid gate, so the default broker
+        # skips it (and ALSO gets --trusted-askpass-gid so serve() can chgrp
+        # the socket exactly like production). Egid-gate tests start their own.
+        self.socket_path = self._start_broker(
+            "broker",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
+        )
 
     def test_request_approve_is_single_use(self) -> None:
         created, holder = _request_and_hold(
             self.socket_path,
-            self.token,
             {
                 "command": "fake-command",
                 "cwd": str(ROOT),
                 "tty": "test-pty",
-                "origin": "llm",
-                "capability": self.capability,
             },
         )
         self.addCleanup(lambda: holder.stdout and holder.stdout.close())
         self.addCleanup(holder.wait, timeout=2)
         self.assertTrue(created["ok"])
-        pending = call(self.socket_path, self.token, {"type": "pending"})
+        pending = call(_ctl(self.socket_path), {"type": "pending"})
         # Not "fake-command": the displayed command is now derived from the
         # real sudo parent's own /proc cmdline (SPEC.md §6.12), not trusted
         # from the payload — here that "parent" is this test process
@@ -339,8 +263,7 @@ class BrokerTest(unittest.TestCase):
         # for the dedicated, precise assertion on that behavior.
         self.assertTrue(pending["requests"][0]["command"])
         approved = call(
-            self.socket_path,
-            self.token,
+            _ctl(self.socket_path),
             {
                 "type": "approve",
                 "request_id": created["request_id"],
@@ -350,8 +273,7 @@ class BrokerTest(unittest.TestCase):
         )
         self.assertEqual(approved, {"ok": True})
         replay = call(
-            self.socket_path,
-            self.token,
+            _ctl(self.socket_path),
             {
                 "type": "approve",
                 "request_id": created["request_id"],
@@ -360,10 +282,6 @@ class BrokerTest(unittest.TestCase):
             },
         )
         self.assertFalse(replay["ok"])
-
-    def test_wrong_token_is_rejected(self) -> None:
-        result = call(self.socket_path, "wrong-token", {"type": "pending"})
-        self.assertEqual(result, {"ok": False, "error": "unauthorized"})
 
     def test_process_cmdline_change_invalidates_identity(self) -> None:
         identity = Broker._process_identity(os.getpid())
@@ -384,18 +302,14 @@ class BrokerTest(unittest.TestCase):
     def test_expired_request_is_rejected(self) -> None:
         created = _call_as_subprocess(
             self.socket_path,
-            self.token,
             {
                 "type": "request",
                 "command": "expires",
-                "origin": "llm",
-                "capability": self.capability,
             },
         )
         time.sleep(2.2)
         result = call(
-            self.socket_path,
-            self.token,
+            _ctl(self.socket_path),
             {
                 "type": "approve",
                 "request_id": created["request_id"],
@@ -408,27 +322,23 @@ class BrokerTest(unittest.TestCase):
     def test_askpass_like_request_receives_secret_after_ui_approval(self) -> None:
         askpass = _request_secret_subprocess(
             self.socket_path,
-            self.token,
             {
                 "command": "sudo -A test",
                 "prompt": "Password: ",
-                "origin": "llm",
-                "capability": self.capability,
             },
         )
         self.addCleanup(lambda: askpass.stdout and askpass.stdout.close())
         self.addCleanup(askpass.wait, timeout=2)
         request = None
         for _ in range(50):
-            pending = call(self.socket_path, self.token, {"type": "pending"})
+            pending = call(_ctl(self.socket_path), {"type": "pending"})
             if pending["requests"]:
                 request = pending["requests"][0]
                 break
             time.sleep(0.02)
         self.assertIsNotNone(request)
         approval = call(
-            self.socket_path,
-            self.token,
+            _ctl(self.socket_path),
             {
                 "type": "approve",
                 "request_id": request["request_id"],
@@ -440,39 +350,27 @@ class BrokerTest(unittest.TestCase):
         stdout, _ = askpass.communicate(timeout=2)
         self.assertEqual(json.loads(stdout), {"ok": True, "secret": "fake-secret"})
 
-    def test_non_llm_origin_is_rejected(self) -> None:
-        result = call(
-            self.socket_path,
-            self.token,
-            {"type": "request", "origin": "terminal", "capability": self.capability},
-        )
-        self.assertEqual(result, {"ok": False, "error": "invalid_llm_origin"})
-
     def test_approve_requires_correct_nonce(self) -> None:
         created, holder = _request_and_hold(
-            self.socket_path, self.token,
-            {"command": "wrong-nonce",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"command": "wrong-nonce"},
         )
         self.addCleanup(lambda: holder.stdout and holder.stdout.close())
         self.addCleanup(holder.wait, timeout=2)
         wrong = call(
-            self.socket_path, self.token,
-            {"type": "approve", "request_id": created["request_id"],
-             "nonce": "deliberately-wrong-nonce", "secret": "must-not-leak"},
+            _ctl(self.socket_path), {"type": "approve", "request_id": created["request_id"],
+              "nonce": "deliberately-wrong-nonce", "secret": "must-not-leak"},
         )
         self.assertFalse(wrong["ok"])
         correct = call(
-            self.socket_path, self.token,
-            {"type": "approve", "request_id": created["request_id"],
-             "nonce": created["nonce"], "secret": "correct-secret"},
+            _ctl(self.socket_path), {"type": "approve", "request_id": created["request_id"],
+              "nonce": created["nonce"], "secret": "correct-secret"},
         )
         self.assertTrue(correct["ok"])
 
     def test_idle_unauthenticated_connection_is_closed_after_handshake_timeout(self) -> None:
         # Regression: without a handshake timeout, a connection that never
-        # sends data (not even a token) held the broker's thread forever —
-        # a trivial local DoS, with no token needed, against any process of
+        # sends data held the broker's thread forever —
+        # a trivial local DoS, against any process of
         # the same user. The broker must close the connection on its own.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.connect(str(self.socket_path))
@@ -480,23 +378,19 @@ class BrokerTest(unittest.TestCase):
             closed = conn.recv(1)
         self.assertEqual(closed, b"")
         # The broker keeps responding normally to other connections.
-        stats = call(self.socket_path, self.token, {"type": "stats"})
+        stats = call(_ctl(self.socket_path), {"type": "stats"})
         self.assertTrue(stats["ok"])
 
     def test_cancel_requires_nonce(self) -> None:
         created = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "command": "cancellable",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "command": "cancellable"},
         )
         wrong = call(
-            self.socket_path, self.token,
-            {"type": "cancel", "request_id": created["request_id"], "nonce": "wrong"},
+            _ctl(self.socket_path), {"type": "cancel", "request_id": created["request_id"], "nonce": "wrong"},
         )
         self.assertFalse(wrong["ok"])
         cancelled = call(
-            self.socket_path, self.token,
-            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+            _ctl(self.socket_path), {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
         )
         self.assertTrue(cancelled["ok"])
 
@@ -504,45 +398,36 @@ class BrokerTest(unittest.TestCase):
         accepted = []
         for i in range(MAX_PENDING):
             result = _call_as_subprocess(
-                self.socket_path, self.token,
-                {"type": "request", "command": f"request-{i}",
-                 "origin": "llm", "capability": self.capability},
+                self.socket_path,     {"type": "request", "command": f"request-{i}"},
             )
             self.assertTrue(result["ok"], result)
             accepted.append(result)
 
         overflow = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "command": "overflow",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "command": "overflow"},
         )
         self.assertEqual(overflow, {"ok": False, "error": "too_many_pending"})
 
         # Frees up a slot; a new request should be accepted again.
         cancelled = call(
-            self.socket_path, self.token,
-            {"type": "cancel", "request_id": accepted[0]["request_id"],
-             "nonce": accepted[0]["nonce"]},
+            _ctl(self.socket_path), {"type": "cancel", "request_id": accepted[0]["request_id"],
+              "nonce": accepted[0]["nonce"]},
         )
         self.assertTrue(cancelled["ok"])
         freed = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "command": "new-slot",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "command": "new-slot"},
         )
         self.assertTrue(freed["ok"])
 
     def test_missing_pid_is_rejected(self) -> None:
         result = call(
-            self.socket_path, self.token,
-            {"type": "request", "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request"},
         )
         self.assertEqual(result, {"ok": False, "error": "invalid_pid"})
 
     def test_request_claiming_a_different_real_pid_is_rejected(self) -> None:
-        # Security review finding: a requester holding the normal request
-        # token/capability could claim any PID that happens to exist (not
-        # even a real sudo process) instead of its own, get a human to
+        # Security review finding: a requester could claim any PID that
+        # happens to exist (not even a real sudo process) instead of its own, get a human to
         # approve what looked like a legitimate request for it, and receive
         # the secret itself on its own connection — the response always goes
         # back over whoever is actually connected, never over the claimed
@@ -550,9 +435,7 @@ class BrokerTest(unittest.TestCase):
         # process, so this is exactly that attack. Must be rejected before
         # ever reaching process-identity lookups.
         result = call(
-            self.socket_path, self.token,
-            {"type": "request", "pid": 1, "command": "impersonation-attempt",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "pid": 1, "command": "impersonation-attempt"},
         )
         self.assertEqual(result, {"ok": False, "error": "pid_mismatch"})
 
@@ -567,39 +450,14 @@ class BrokerTest(unittest.TestCase):
         # peer's parent — which this test's subprocess, spawned directly by
         # the test process, never has, even though its own identity
         # (pid/start_time/cmdline/uid) is entirely genuine.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-no-sudo-parent.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                # Irrelevant to what this test exercises (not_sudo_child);
-                # without it, the identity check — now run unconditionally
-                # before the sudo checks — would fail first against the
-                # default, unreachable production identity-helper socket.
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        socket_path = self._start_broker(
+            "broker-no-sudo-parent",
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
 
         result = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "direct-connect-attempt",
-             "origin": "llm", "capability": self.capability},
+            socket_path, {"type": "request", "command": "direct-connect-attempt"},
         )
         self.assertEqual(result, {"ok": False, "error": "not_sudo_child"})
 
@@ -615,40 +473,15 @@ class BrokerTest(unittest.TestCase):
         # it still requires the real default: the parent must show a genuine
         # privilege escalation, which this test process (an ordinary,
         # non-root process) cannot have without actually becoming root.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-spoofed-comm.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                # Irrelevant to what this test exercises (not_sudo_child);
-                # without it, the identity check — now run unconditionally
-                # before the sudo checks — would fail first against the
-                # default, unreachable production identity-helper socket.
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        socket_path = self._start_broker(
+            "broker-spoofed-comm",
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
 
         result = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "spoofed-comm-attempt",
-             "origin": "llm", "capability": self.capability},
+            socket_path, {"type": "request", "command": "spoofed-comm-attempt"},
         )
         self.assertEqual(result, {"ok": False, "error": "not_sudo_child"})
 
@@ -658,20 +491,17 @@ class BrokerTest(unittest.TestCase):
         env = os.environ.copy()
         env.update({
             "DOORMAN_SOCKET": str(self.socket_path),
-            "DOORMAN_TOKEN": self.token,
-            "DOORMAN_LLM_CAPABILITY": self.capability,
             "DOORMAN_COMMAND": "sudo -A id",
         })
         result: dict[str, object] = {}
 
         def approve() -> None:
             for _ in range(50):
-                pending = call(self.socket_path, self.token, {"type": "pending"})
+                pending = call(_ctl(self.socket_path), {"type": "pending"})
                 if pending["requests"]:
                     item = pending["requests"][0]
                     result.update(call(
-                        self.socket_path,
-                        self.token,
+                        _ctl(self.socket_path),
                         {"type": "approve", "request_id": item["request_id"],
                          "nonce": item["nonce"], "secret": "fake-secret"},
                     ))
@@ -698,60 +528,28 @@ class BrokerTest(unittest.TestCase):
         # Regression: request_secret() used to inherit the handshake timeout
         # (5s) for reading the result, which only arrives once the UI
         # decides. A real human approval is commonly slower than that.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-slow.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "broker.broker",
-                "--socket",
-                str(socket_path),
-                "--token",
-                self.token,
-                "--llm-capability",
-                self.capability,
-                "--timeout",
-                "20",
-                "--trusted-ui-exe",
-                TEST_TRUSTED_UI_EXE,
-                "--trusted-sudo-exe",
-                TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-            ],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        socket_path = self._start_broker(
+            "broker-slow",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
+            timeout="20",
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
 
         askpass = _request_secret_subprocess(
             socket_path,
-            self.token,
             {
                 "command": "sudo -A slow-test",
                 "prompt": "Password: ",
-                "origin": "llm",
-                "capability": self.capability,
             },
         )
         self.addCleanup(lambda: askpass.stdout and askpass.stdout.close())
         self.addCleanup(askpass.wait, timeout=2)
         request = None
         for _ in range(50):
-            pending = call(socket_path, self.token, {"type": "pending"})
+            pending = call(_ctl(socket_path), {"type": "pending"})
             if pending["requests"]:
                 request = pending["requests"][0]
                 break
@@ -761,8 +559,7 @@ class BrokerTest(unittest.TestCase):
         time.sleep(6.0)  # exceeds the client's old 5s SOCKET_TIMEOUT
 
         approval = call(
-            socket_path,
-            self.token,
+            _ctl(socket_path),
             {
                 "type": "approve",
                 "request_id": request["request_id"],
@@ -784,53 +581,16 @@ class BrokerTest(unittest.TestCase):
         # test process is not, so approve/cancel/pending/stats must fail
         # even with the correct token; only "request" (creation, which is
         # what an agent legitimately needs to do) keeps working.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-untrusted.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "broker.broker",
-                "--socket",
-                str(socket_path),
-                "--token",
-                self.token,
-                "--llm-capability",
-                self.capability,
-                "--timeout",
-                "2",
-                # Deliberately no --trusted-ui-exe override: this test needs
-                # the real default ("quickshell"), which the test process is
-                # not, to confirm the untrusted-caller rejection below.
-                # --trusted-sudo-exe is unrelated to that and still needs
-                # overriding, or even the legitimate "request" creation a
-                # few lines down would fail.
-                "--trusted-sudo-exe",
-                TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-            ],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        socket_path = self._start_broker(
+            "broker-untrusted",
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
 
         created = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "self-approval-attempt",
-             "origin": "llm", "capability": self.capability},
+            socket_path, {"type": "request", "command": "self-approval-attempt"},
         )
         self.assertTrue(created["ok"], created)
 
@@ -841,7 +601,7 @@ class BrokerTest(unittest.TestCase):
              "nonce": created["nonce"], "secret": "forged-secret"},
             {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
         ):
-            result = call(socket_path, self.token, message)
+            result = call(_ctl(socket_path), message)
             self.assertEqual(
                 result, {"ok": False, "error": "untrusted_caller"}, message,
             )
@@ -857,15 +617,13 @@ class BrokerTest(unittest.TestCase):
         # arrives — otherwise it would sit around until it expired, and the
         # UI could select that dead entry instead of the current attempt.
         first_askpass = _request_secret_subprocess(
-            self.socket_path, self.token,
-            {"sudo_pid": 999999, "command": "sudo -A id",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"sudo_pid": 999999, "command": "sudo -A id"},
         )
         self.addCleanup(lambda: first_askpass.stdout and first_askpass.stdout.close())
         self.addCleanup(first_askpass.wait, timeout=2)
         pending = None
         for _ in range(50):
-            pending = call(self.socket_path, self.token, {"type": "pending"})
+            pending = call(_ctl(self.socket_path), {"type": "pending"})
             if pending["requests"]:
                 break
             time.sleep(0.02)
@@ -873,12 +631,11 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(pending["requests"][0]["attempt"], 1)
 
         second = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "sudo_pid": 999999,
-             "command": "sudo -A id", "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "sudo_pid": 999999,
+             "command": "sudo -A id"},
         )
         self.assertTrue(second["ok"], second)
-        pending = call(self.socket_path, self.token, {"type": "pending"})
+        pending = call(_ctl(self.socket_path), {"type": "pending"})
         self.assertEqual(len(pending["requests"]), 1, pending)
         self.assertEqual(pending["requests"][0]["attempt"], 2)
         self.assertEqual(pending["requests"][0]["request_id"], second["request_id"])
@@ -888,446 +645,37 @@ class BrokerTest(unittest.TestCase):
 
         # A different sudo_pid (an unrelated command) starts fresh.
         unrelated = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "sudo_pid": 999998,
-             "command": "sudo -A whoami", "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "sudo_pid": 999998,
+             "command": "sudo -A whoami"},
         )
         self.assertTrue(unrelated["ok"], unrelated)
-        pending = call(self.socket_path, self.token, {"type": "pending"})
+        pending = call(_ctl(self.socket_path), {"type": "pending"})
         by_id = {item["request_id"]: item for item in pending["requests"]}
         self.assertEqual(by_id[unrelated["request_id"]]["attempt"], 1)
 
         # A request without sudo_pid (a caller that doesn't send the field)
         # never enters correlation and never breaks the normal flow.
         no_sudo_pid = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request",
-             "command": "sudo -A ls", "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request",
+             "command": "sudo -A ls"},
         )
         self.assertTrue(no_sudo_pid["ok"], no_sudo_pid)
-        pending = call(self.socket_path, self.token, {"type": "pending"})
+        pending = call(_ctl(self.socket_path), {"type": "pending"})
         by_id = {item["request_id"]: item for item in pending["requests"]}
         self.assertEqual(by_id[no_sudo_pid["request_id"]]["attempt"], 1)
 
     def test_stats_reports_request_lifecycle(self) -> None:
         created = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "command": "metric",
-             "origin": "llm", "capability": self.capability},
+            self.socket_path, {"type": "request", "command": "metric"},
         )
         call(
-            self.socket_path, self.token,
-            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+            _ctl(self.socket_path), {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
         )
-        stats = call(self.socket_path, self.token, {"type": "stats"})
+        stats = call(_ctl(self.socket_path), {"type": "stats"})
         self.assertTrue(stats["ok"])
         self.assertEqual(stats["requests"], 1)
         self.assertEqual(stats["cancelled"], 1)
         self.assertEqual(stats["approved"], 0)
-
-    def test_skip_identity_check_never_contacts_identity_helper(self) -> None:
-        # self.process already runs with TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK
-        # and an --identity-helper-socket that was never started (no helper
-        # process at all) — if a request still succeeds, the broker never
-        # tried to reach it.
-        result = _call_as_subprocess(
-            self.socket_path, self.token,
-            {"type": "request", "command": "skip-check-attempt",
-             "origin": "llm", "capability": self.capability},
-        )
-        self.assertTrue(result["ok"], result)
-
-    def test_trusted_ui_call_succeeds_through_sigstop_sigcont_round_trip(self) -> None:
-        # _check_peer_identity now SIGSTOPs every connecting peer before
-        # querying the identity-helper, then SIGCONTs it in a finally —
-        # including trusted-UI connections (approve/cancel/pending/stats),
-        # which will always come back "no_match" (Quickshell/bridge.py is
-        # never the askpass binary) but must still complete normally: the
-        # cached outcome is only ever consulted for kind == "request" (see
-        # _handle). Every other test either skips the identity check
-        # entirely (TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK, which never calls
-        # _check_peer_identity/SIGSTOP at all) or leaves the helper
-        # unreachable, so none of them actually exercise "helper is up,
-        # genuinely answers no_match, caller is still SIGSTOP'd+SIGCONT'd
-        # and still gets its response" for a UI-type call. This test's own
-        # connection *is* the peer that gets SIGSTOP'd+SIGCONT'd — if that
-        # round trip ever failed to resume it (the exact bug the plan's
-        # SIGSTOP addendum calls out — a crash between SIGSTOP and SIGCONT
-        # leaves the peer stopped forever), this test would hang and time
-        # out rather than merely fail an assertion.
-        helper_socket = self._start_identity_helper("/usr/bin/true")
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-ui-sigstop.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        # This call's own connection is the one that gets SIGSTOP'd and
-        # SIGCONT'd by the broker, synchronously, before it ever reads this
-        # message — a hang here (bounded by the socket's own timeout in
-        # client.call) rather than a clean response would mean the resume
-        # path is broken.
-        pending = call(socket_path, self.token, {"type": "pending"})
-        self.assertTrue(pending["ok"], pending)
-        stats = call(socket_path, self.token, {"type": "stats"})
-        self.assertTrue(stats["ok"], stats)
-        # The helper was reachable at startup — this is about the helper
-        # being up and genuinely answering "no_match" for this UI call, not
-        # about the degraded-helper case (see
-        # test_request_is_rejected_when_identity_helper_is_unreachable).
-        self.assertTrue(stats["askpass_identity_available"])
-
-    def test_request_with_mismatched_askpass_identity_is_rejected(self) -> None:
-        # Issue #9558, 4th finding: not_sudo_child only validates the
-        # peer's *parent* (that it's a real, escalated sudo). sudo lets the
-        # caller pick SUDO_ASKPASS, so the peer itself — the process that
-        # actually holds this connection and would receive the secret —
-        # could still be the attacker's own script, genuinely spawned by a
-        # genuine sudo. The broker now settles that by asking the
-        # identity-helper whether the connecting peer's own real
-        # /proc/<pid>/exe matches the trusted path; here the helper is
-        # pointed at a real file that no process's exe ever resolves to, so
-        # a perfectly ordinary client (no SCM_RIGHTS, no trickery at all)
-        # is rejected the same way a genuinely mismatched peer would be.
-        helper_socket = self._start_identity_helper(_ALWAYS_PRESENT_OTHER_PATH)
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-askpass-mismatch.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        result = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "untrusted-askpass-attempt",
-             "origin": "llm", "capability": self.capability},
-        )
-        self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
-
-    def test_request_is_rejected_when_helper_has_no_matching_trusted_path(self) -> None:
-        # The install step (scripts/doorman-install-askpass) was never run,
-        # or the installed file was removed — the identity-helper itself
-        # (Task 1) always answers "no match" in that case rather than
-        # erroring, so from the broker's point of view this looks exactly
-        # like any other mismatched peer: untrusted_askpass_helper, not a
-        # distinct "unavailable" error. (Degraded-helper-process case is
-        # test_request_is_rejected_when_identity_helper_is_unreachable,
-        # below — that's the one that still needs its own error code and
-        # its own `stats` surfacing.)
-        missing_path = f"/nonexistent/doorman-askpass-test-missing-{uuid.uuid4().hex}"
-        helper_socket = self._start_identity_helper(missing_path)
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-askpass-missing-path.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        result = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "unavailable-trusted-path-attempt",
-             "origin": "llm", "capability": self.capability},
-        )
-        self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
-
-    def test_request_is_rejected_when_identity_helper_is_unreachable(self) -> None:
-        # Degraded-state check (SPEC.md's own design item 5): the
-        # identity-helper unit is stopped or never started at all — the
-        # broker must refuse every request loudly (identity_helper_unreachable)
-        # rather than silently falling back to accepting, and must surface
-        # that through `stats` too. UI-style calls (pending/stats) are
-        # unaffected: they never consult the identity-helper at all.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-helper-down.sock"
-        missing_helper_socket = Path(temp.name) / "no-such-helper.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path), "--token", self.token,
-                "--llm-capability", self.capability, "--timeout", "2",
-                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(missing_helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        result = _call_as_subprocess(
-            socket_path, self.token,
-            {"type": "request", "command": "helper-down-attempt",
-             "origin": "llm", "capability": self.capability},
-        )
-        self.assertEqual(result, {"ok": False, "error": "identity_helper_unreachable"})
-        stats = call(socket_path, self.token, {"type": "stats"})
-        self.assertFalse(stats["askpass_identity_available"])
-        # UI-style calls still work while the helper is down.
-        pending = call(socket_path, self.token, {"type": "pending"})
-        self.assertTrue(pending["ok"])
-
-    def test_request_with_real_trusted_askpass_identity_is_accepted(self) -> None:
-        # The genuine positive path: a peer whose own real /proc/<pid>/exe
-        # really does match the identity-helper's configured trusted path.
-        # In production that path is the root-installed C binary; here it's
-        # simply sys.executable, and the connecting peer is spawned as
-        # [sys.executable, "-c", ...] (not via a shebang, which would make
-        # the interpreter the exe and the script just an argument) so its
-        # own exe genuinely is that same interpreter binary — no root, no
-        # compiler, and no SCM_RIGHTS fd needed at all, unlike the mechanism
-        # this replaced (SPEC.md §6.11).
-        helper_socket = self._start_identity_helper(sys.executable)
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-askpass-real-identity.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        payload = {"command": "real-identity-attempt", "origin": "llm", "capability": self.capability}
-        created, proc = _request_and_hold(socket_path, self.token, payload)
-        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
-        self.addCleanup(proc.wait, timeout=5)
-        self.assertTrue(created.get("ok"), created)
-
-    def test_fork_then_exec_on_connecting_peer_is_rejected(self) -> None:
-        # Live-tested attack from docs/superpowers/specs/
-        # 2026-11-05-askpass-identity-6th-design.md, "Validated findings"
-        # item 3: the connecting process forks right after connect(), the
-        # parent immediately execve()s into a stand-in trusted binary while
-        # the forked child drives the rest of the protocol on the same,
-        # already-connected socket. SO_PEERCRED's pid is captured once at
-        # connect() time and never updates, so this would fool any identity
-        # check performed after data is read from the peer. The broker's
-        # own check runs at accept()-time, before any read, and sees the
-        # real, pre-exec identity (this Python interpreter) — which doesn't
-        # match "/usr/bin/true" regardless.
-        helper_socket = self._start_identity_helper("/usr/bin/true")
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-fork-exec-attack.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        payload = json.dumps({"command": "fork-exec-attack", "origin": "llm", "capability": self.capability})
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _SUBPROCESS_FORK_EXEC_ATTACK_CODE,
-             str(socket_path), self.token, payload],
-            cwd=ROOT, stdout=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
-        self.addCleanup(proc.wait, timeout=3)
-        out = proc.stdout.readline()
-        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
-
-    def test_fork_before_connect_on_connecting_peer_is_rejected(self) -> None:
-        # "Addendum 2" (2026-11-08, final whole-branch review): a faster
-        # attacker forks BEFORE calling connect(), so their post-connect()
-        # critical path is execve() alone — no fork() call left to pay for.
-        # The original SIGSTOP mitigation sent SIGSTOP from inside _handle,
-        # which only starts running after serve()'s main accept loop has
-        # already spawned a new thread for this connection; that
-        # thread-dispatch latency alone was enough for this attack to win
-        # the race (confirmed live, 5/5 vulnerable). The fix moves the
-        # SIGSTOP into serve()'s own main accept loop, synchronously,
-        # before any thread is spawned — see
-        # _stop_peer_for_identity_check and docs/superpowers/specs/
-        # 2026-11-05-askpass-identity-6th-design.md, "Addendum 2".
-        helper_socket = self._start_identity_helper("/usr/bin/true")
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-preconnect-fork-attack.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        payload = json.dumps({"command": "preconnect-fork-attack", "origin": "llm", "capability": self.capability})
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _SUBPROCESS_PRECONNECT_FORK_ATTACK_CODE,
-             str(socket_path), self.token, payload],
-            cwd=ROOT, stdout=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
-        self.addCleanup(proc.wait, timeout=3)
-        out = proc.stdout.readline()
-        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
-
-    def test_scm_rights_fd_is_ignored_identity_still_checked_against_real_peer_exe(self) -> None:
-        # The broker no longer has any SCM_RIGHTS-handling code at all —
-        # this is Task 2's own point. A peer that still tries the old
-        # trick (attaching an fd for some other real path via SCM_RIGHTS)
-        # gets nothing special from it: the fd is simply never read, and
-        # the connecting peer's own real /proc/<pid>/exe (this Python
-        # interpreter, not /usr/bin/true) is what's actually checked.
-        helper_socket = self._start_identity_helper("/usr/bin/true")
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-opath-bypass.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                "--identity-helper-socket", str(helper_socket),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
-
-        payload = json.dumps({"command": "opath-bypass-attempt", "origin": "llm", "capability": self.capability})
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE,
-             str(socket_path), self.token, "/usr/bin/true", payload],
-            cwd=ROOT, stdout=subprocess.PIPE, text=True,
-        )
-        self.addCleanup(lambda: proc.stdout and proc.stdout.close())
-        self.addCleanup(proc.wait, timeout=3)
-        out = proc.stdout.readline()
-        self.assertEqual(json.loads(out), {"ok": False, "error": "untrusted_askpass_helper"})
 
     def test_command_metadata_is_derived_from_real_sudo_cmdline_not_caller_supplied(self) -> None:
         # Issue #9558: the displayed "command" must reflect what will
@@ -1341,42 +689,24 @@ class BrokerTest(unittest.TestCase):
         marker = f"doorman-cmdline-marker-{uuid.uuid4().hex[:12]}"
         lying_command = "deliberately-wrong-command-should-not-be-shown"
         payload_json = json.dumps(
-            {"command": lying_command, "origin": "llm", "capability": self.capability},
+            {"command": lying_command},
         )
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        socket_path = Path(temp.name) / "broker-cmdline.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "5",
-                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
-                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
-                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
-                TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        socket_path = self._start_broker(
+            "broker-cmdline",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
+            timeout="5",
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
 
         env = os.environ.copy()
         env["DOORMAN_TEST_PAYLOAD"] = payload_json
         sudo_parent = subprocess.Popen(
             [
                 sys.executable, "-c", _SUBPROCESS_SUDO_PARENT_CODE,
-                marker, str(socket_path), self.token,
+                marker, str(socket_path),
             ],
             cwd=ROOT, stdout=subprocess.PIPE, text=True, env=env,
         )
@@ -1386,76 +716,269 @@ class BrokerTest(unittest.TestCase):
         created = json.loads(created_line)
         self.assertTrue(created.get("ok"), created)
 
-        pending = call(socket_path, self.token, {"type": "pending"})
+        pending = call(_ctl(socket_path), {"type": "pending"})
         self.assertEqual(len(pending["requests"]), 1, pending)
         shown_command = pending["requests"][0]["command"]
         self.assertIn(marker, shown_command)
         self.assertNotIn(lying_command, shown_command)
 
-    def test_stats_reflects_identity_helper_becoming_available_after_startup(self) -> None:
-        # self.askpass_identity_available used to be set once, at __init__
-        # time, by pinging the identity-helper — if the broker started
-        # before the helper's socket existed (a real possibility: the
-        # helper unit is Type=simple, so After= only orders process start,
-        # not socket readiness), the flag stayed stuck False for the whole
-        # session even once the helper came up. Fix: _stats() now re-pings
-        # live on every call. This starts a broker pointed at a helper
-        # socket that doesn't exist yet, confirms stats reports False, then
-        # starts the helper at that same path and confirms a later stats
-        # call reports True — proving the flag isn't just the __init__-time
-        # snapshot anymore.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        helper_socket_path = Path(temp.name) / "late-starting-helper.sock"
-        socket_path = Path(temp.name) / "broker-late-helper.sock"
-        process = subprocess.Popen(
-            [
-                sys.executable, "-m", "broker.broker",
-                "--socket", str(socket_path),
-                "--token", self.token,
-                "--llm-capability", self.capability,
-                "--timeout", "2",
-                "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
-                "--identity-helper-socket", str(helper_socket_path),
-            ],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    # ---- Shape B: egid gate, owner-uid pin, installed-binary availability ----
+
+    def test_broker_binds_both_sockets_with_owner_only_fallback_mode(self) -> None:
+        # Each socket is chgrp'd to its real doorman group (doorman-askpass /
+        # doorman-ui) and set 0660 so only that group can connect. Where the
+        # group is absent, or the chgrp is refused because the test user is not
+        # a member of it (both common unprivileged cases), the seam falls back
+        # to owner-only 0600. The invariant that must hold in EVERY environment:
+        # never any access for "other", and never wider than owner+group. We
+        # deliberately do NOT pin 0600-vs-0660 here: that depends on which
+        # doorman groups exist on the host and whether the test user belongs to
+        # them, and pinning it made this test fail spuriously once the plugin
+        # was installed and the groups came to exist. See SPEC.md §6.13.
+        for path in (self.socket_path, _ctl(self.socket_path)):
+            self.assertTrue(stat.S_ISSOCK(path.stat().st_mode), path)
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertIn(mode, (0o600, 0o660), (path, oct(mode)))
+            self.assertEqual(mode & 0o007, 0, (path, oct(mode)))  # no access for "other"
+
+    def test_request_on_control_socket_is_rejected_even_with_matching_egid(self) -> None:
+        socket_path = self._start_broker(
+            "request-on-control",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            "--trusted-askpass-gid", str(TEST_EGID),
         )
-        self.addCleanup(lambda: process.stderr and process.stderr.close())
-        self.addCleanup(lambda: process.stdout and process.stdout.close())
-        self.addCleanup(process.wait, timeout=2)
-        self.addCleanup(process.terminate)
-        for _ in range(50):
-            if socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("broker did not create the socket")
+        # Same payload is accepted on the askpass socket (egid matches)...
+        ok = _call_as_subprocess(socket_path, {"type": "request", "command": "x"})
+        self.assertTrue(ok["ok"], ok)
+        # ...and refused on the control socket.
+        result = _call_as_subprocess(_ctl(socket_path), {"type": "request", "command": "x"})
+        self.assertEqual(result, {"ok": False, "error": "wrong_socket"})
+        stats = call(_ctl(socket_path), {"type": "stats"})
+        self.assertEqual(stats["requests"], 1)
 
-        stats_before = call(socket_path, self.token, {"type": "stats"})
-        self.assertTrue(stats_before["ok"], stats_before)
-        self.assertFalse(stats_before["askpass_identity_available"])
-
-        # Now bring the helper up at the exact path the broker was told
-        # about, without restarting the broker.
-        helper_process = subprocess.Popen(
-            [sys.executable, "-m", "identity_helper.identity_helper",
-             "--socket", str(helper_socket_path), "--trusted-askpass-path", "/usr/bin/true"],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    def test_request_on_control_socket_is_rejected_with_skip_identity_check(self) -> None:
+        result = _call_as_subprocess(
+            _ctl(self.socket_path), {"type": "request", "command": "x"},
         )
-        self.addCleanup(lambda: helper_process.stderr and helper_process.stderr.close())
-        self.addCleanup(lambda: helper_process.stdout and helper_process.stdout.close())
-        self.addCleanup(helper_process.wait, timeout=2)
-        self.addCleanup(helper_process.terminate)
-        for _ in range(50):
-            if helper_socket_path.exists():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("identity helper did not create its socket")
+        self.assertEqual(result, {"ok": False, "error": "wrong_socket"})
+        self.assertEqual(call(_ctl(self.socket_path), {"type": "stats"})["requests"], 0)
 
-        stats_after = call(socket_path, self.token, {"type": "stats"})
-        self.assertTrue(stats_after["ok"], stats_after)
-        self.assertTrue(stats_after["askpass_identity_available"])
+    def test_ui_verbs_on_askpass_socket_are_rejected_even_from_trusted_ui(self) -> None:
+        # This process is the "trusted UI" (comm matches, uid is the owner),
+        # so these would pass the comm-walk on the control socket.
+        created = _call_as_subprocess(
+            self.socket_path, {"type": "request", "command": "wrong-socket"},
+        )
+        self.assertTrue(created["ok"], created)
+        for message in (
+            {"type": "pending"},
+            {"type": "stats"},
+            {"type": "approve", "request_id": created["request_id"],
+             "nonce": created["nonce"], "secret": "s"},
+            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+        ):
+            self.assertEqual(
+                call(self.socket_path, message),
+                {"ok": False, "error": "wrong_socket"}, message,
+            )
+        # Nothing was approved/cancelled by the refused attempts.
+        pending = call(_ctl(self.socket_path), {"type": "pending"})
+        self.assertEqual(len(pending["requests"]), 1)
+        stats = call(_ctl(self.socket_path), {"type": "stats"})
+        self.assertEqual((stats["approved"], stats["cancelled"]), (0, 0))
+
+    def test_happy_paths_each_on_their_own_socket(self) -> None:
+        socket_path = self._start_broker(
+            "happy",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            "--trusted-askpass-gid", str(TEST_EGID),
+        )
+        created = _call_as_subprocess(socket_path, {"type": "request", "command": "x"})
+        self.assertTrue(created["ok"], created)
+        self.assertTrue(call(_ctl(socket_path), {"type": "stats"})["ok"])
+        cancelled = call(
+            _ctl(socket_path),
+            {"type": "cancel", "request_id": created["request_id"], "nonce": created["nonce"]},
+        )
+        self.assertEqual(cancelled, {"ok": True})
+
+    def test_control_socket_does_not_apply_the_egid_gate_to_ui_verbs(self) -> None:
+        # The UI never carries the askpass egid; a non-matching trusted gid
+        # must not block control verbs from the trusted UI.
+        socket_path = self._start_broker(
+            "ctl-no-egid",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-askpass-gid", str(_other_gid()),
+        )
+        self.assertTrue(call(_ctl(socket_path), {"type": "stats"})["ok"])
+
+    def test_request_is_rejected_when_peer_egid_is_not_the_trusted_gid(self) -> None:
+        socket_path = self._start_broker(
+            "broker-egid-mismatch",
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            "--trusted-askpass-gid", str(_other_gid()),
+        )
+        result = _call_as_subprocess(socket_path, {"type": "request", "command": "x"})
+        self.assertEqual(result, {"ok": False, "error": "untrusted_askpass_helper"})
+
+    def test_request_is_accepted_when_peer_egid_matches_the_trusted_gid(self) -> None:
+        socket_path = self._start_broker(
+            "broker-egid-match",
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            "--trusted-askpass-gid", str(TEST_EGID),
+        )
+        result = _call_as_subprocess(socket_path, {"type": "request", "command": "x"})
+        self.assertTrue(result["ok"], result)
+
+    def test_request_is_rejected_when_peer_uid_is_not_the_owner_uid(self) -> None:
+        socket_path = self._start_broker(
+            "broker-wrong-owner",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+            TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+            TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK,
+            "--trusted-askpass-gid", str(TEST_EGID),
+            owner_uid=TEST_OWNER_UID + 1,
+        )
+        result = _call_as_subprocess(socket_path, {"type": "request", "command": "x"})
+        self.assertEqual(result, {"ok": False, "error": "pid_mismatch"})
+        # The UI side of the pin: a trusted-looking UI peer with the wrong uid.
+        self.assertEqual(
+            call(_ctl(socket_path), {"type": "stats"}), {"ok": False, "error": "untrusted_caller"},
+        )
+
+    def test_peer_credentials_parses_pid_uid_gid_in_order(self) -> None:
+        # Distinct values prove gid is the third field, not aliased to uid
+        # (on a dev box uid == gid, which would hide an offset mistake).
+        conn = SimpleNamespace(getsockopt=lambda *a, **k: struct.pack("3i", 111, 222, 333))
+        self.assertEqual(Broker._peer_credentials(conn), (111, 222, 333))
+
+    def _in_process_broker(self, **kwargs) -> Broker:
+        kwargs.setdefault("trusted_askpass_skip_identity_check", True)
+        # Construction logs "askpass unavailable" to stderr; keep output clean.
+        with contextlib.redirect_stderr(io.StringIO()):
+            return Broker(Path("/nonexistent/unused.sock"), 5.0, TEST_OWNER_UID, **kwargs)
+
+    def _pending_request(self, owner_uid: int | None) -> PendingRequest:
+        identity = Broker._process_identity(os.getpid())
+        return PendingRequest(
+            request_id="rid", nonce="nonce", created_at=time.time(),
+            expires_at=time.time() + 30, metadata={"pid": os.getpid()},
+            process_start_time=identity["start_time"],
+            process_cmdline=identity["cmdline"], process_uid=identity["uid"],
+            owner_uid=owner_uid,
+        )
+
+    def test_approve_and_cancel_require_ui_uid_to_match_request_owner_uid(self) -> None:
+        for verb, ok_key in (("approve", "ok"), ("cancel", "ok")):
+            for ui_uid, expected in ((TEST_OWNER_UID + 1, False), (TEST_OWNER_UID, True)):
+                broker = self._in_process_broker()
+                request = self._pending_request(TEST_OWNER_UID)
+                broker.pending["rid"] = request
+                a, b = socket.socketpair()
+                self.addCleanup(a.close)
+                self.addCleanup(b.close)
+                message = {"request_id": "rid", "nonce": "nonce", "secret": "s"}
+                getattr(broker, f"_{verb}")(a, message, ui_uid)
+                a.shutdown(socket.SHUT_WR)
+                response = json.loads(b.makefile("rb").readline())
+                self.assertEqual(response[ok_key], expected, (verb, ui_uid, response))
+                self.assertEqual(request.delivered, expected)
+
+    def test_approve_and_cancel_fail_closed_when_request_has_no_owner_uid(self) -> None:
+        for verb in ("approve", "cancel"):
+            broker = self._in_process_broker()
+            request = self._pending_request(None)
+            broker.pending["rid"] = request
+            a, b = socket.socketpair()
+            self.addCleanup(a.close)
+            self.addCleanup(b.close)
+            getattr(broker, f"_{verb}")(
+                a, {"request_id": "rid", "nonce": "nonce", "secret": "s"}, TEST_OWNER_UID,
+            )
+            self.assertFalse(request.delivered, verb)
+
+    def test_askpass_identity_available_reflects_installed_binary(self) -> None:
+        missing = Path(tempfile.gettempdir()) / f"doorman-no-such-binary-{uuid.uuid4().hex}"
+        # Live, over the wire: group resolvable (pinned gid) but no binary.
+        socket_path = self._start_broker(
+            "broker-no-binary",
+            "--trusted-ui-exe", TEST_TRUSTED_UI_EXE,
+            "--trusted-askpass-gid", str(TEST_EGID),
+            "--askpass-binary", str(missing),
+        )
+        stats = call(_ctl(socket_path), {"type": "stats"})
+        self.assertTrue(stats["ok"], stats)
+        self.assertFalse(stats["askpass_identity_available"])
+        # The skip seam reports available regardless.
+        self.assertTrue(call(_ctl(self.socket_path), {"type": "stats"})["askpass_identity_available"])
+
+        gid = TEST_EGID
+        good = SimpleNamespace(st_mode=stat.S_IFREG | stat.S_ISGID | 0o755, st_uid=0, st_gid=gid)
+        cases = {
+            "setgid root:group binary": (good, True),
+            "no setgid bit": (SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=gid), False),
+            "not owned by root": (SimpleNamespace(st_mode=good.st_mode, st_uid=1000, st_gid=gid), False),
+            "wrong group": (SimpleNamespace(st_mode=good.st_mode, st_uid=0, st_gid=gid + 1), False),
+        }
+        for label, (fake_stat, expected) in cases.items():
+            broker = self._in_process_broker(
+                trusted_askpass_skip_identity_check=False, trusted_askpass_gid=gid,
+                askpass_binary=Path("/fake/doorman-askpass"),
+            )
+            with patch("broker.broker.os.stat", return_value=fake_stat):
+                self.assertEqual(broker._compute_askpass_identity_available(), expected, label)
+        # Unresolvable group => unavailable even with a perfect binary.
+        broker = self._in_process_broker(
+            trusted_askpass_skip_identity_check=False, askpass_binary=Path("/fake/doorman-askpass"),
+        )
+        with patch("broker.broker.os.stat", return_value=good), \
+                patch("broker.broker.grp.getgrnam", side_effect=KeyError("doorman-askpass")):
+            self.assertFalse(broker._compute_askpass_identity_available())
+
+    def test_scm_rights_fd_is_ignored_request_judged_purely_on_egid_and_proc_checks(self) -> None:
+        # Structural: the broker never reads a file descriptor from the peer
+        # (no recvmsg / SCM_RIGHTS / pidfd) — this is what keeps the O_PATH
+        # /fstat bypass closed. Asserted on the AST so comments don't matter.
+        import ast
+        tree = ast.parse((ROOT / "broker" / "broker.py").read_text(encoding="utf-8"))
+        forbidden = {
+            "recvmsg", "recvmsg_into", "recv_fds", "SCM_RIGHTS", "CMSG_LEN",
+            "CMSG_SPACE", "SO_PASSCRED", "pidfd_open", "SIGSTOP", "SIGCONT",
+        }
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+        }
+        self.assertFalse(forbidden & used, forbidden & used)
+
+        # Behavioural: an fd attached via SCM_RIGHTS changes nothing. Judged on
+        # egid: mismatched gid is rejected, matching gid is accepted.
+        payload = json.dumps({"command": "opath-bypass-attempt"})
+        for gid, expected in ((_other_gid(), {"ok": False, "error": "untrusted_askpass_helper"}), (TEST_EGID, None)):
+            socket_path = self._start_broker(
+                f"broker-opath-{gid}",
+                "--trusted-sudo-exe", TEST_TRUSTED_SUDO_EXE,
+                TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT,
+                "--trusted-askpass-gid", str(gid),
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _SUBPROCESS_SEND_FOREIGN_OPATH_FD_CODE,
+                 str(socket_path), "/usr/bin/true", payload],
+                cwd=ROOT, stdout=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda p=proc: p.stdout and p.stdout.close())
+            self.addCleanup(proc.wait, timeout=3)
+            response = json.loads(proc.stdout.readline())
+            if expected is None:
+                self.assertTrue(response["ok"], response)
+            else:
+                self.assertEqual(response, expected)
 
 
 if __name__ == "__main__":

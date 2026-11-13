@@ -1,54 +1,41 @@
 /* Doorman's askpass helper.
  *
  * This is the only thing allowed to receive the plaintext secret from the
- * broker on the production path. It is a privilege-free binary: no file
- * capability, no setuid, no ambient permission beyond whatever its
- * invoking user already has. Identity of the connecting peer is no longer
- * this binary's concern — as of the askpass-identity 6th design, that
- * question is answered by a separate identity-helper service the broker
- * queries directly (see broker/broker.py and identity_helper/), so this
- * binary no longer opens its own /proc/self/exe or sends any file
- * descriptor to the broker. It talks to the broker over a single Unix
+ * broker on the production path. It talks to the broker over a single Unix
  * socket using only the plain JSON-line protocol: one request line out,
- * one decision line back.
+ * one decision line back. No file descriptor is ever sent to the broker.
  *
- * Paths are pinned, not trusted from the environment. In production this
- * binary derives its runtime directory from getuid() alone
- * (/run/user/<uid>/omarchy-doorman) and never reads XDG_RUNTIME_DIR or
- * DOORMAN_SOCKET — a 2026-10-25 finding (#9558) showed that trusting
- * either from this process's environment lets an attacker who controls
- * the invocation environment (which is most of what SUDO_ASKPASS callers
- * control) redirect the token/capability reads and the socket connect to
- * files and listeners of their own choosing, exfiltrating the broker
- * token or spoofing a decision. Two environment variables,
- * DOORMAN_RUNTIME_DIR_DEV_OVERRIDE and DOORMAN_SOCKET_DEV_OVERRIDE, exist
- * solely for this binary's own test suite (tests/test_doorman_askpass_c.py)
- * and are never set by anything in production (scripts/doorman-sudo,
- * packaging/ service units).
+ * Identity (shape B): this binary is installed setgid with group
+ * "doorman-askpass", so when sudo execs it the process runs with that
+ * egid. The broker's socket (/run/doorman/askpass.sock) is reachable only
+ * through a group ACL for that group, and the broker additionally checks
+ * the connecting peer's egid via SO_PEERCRED. There is NO token, NO
+ * capability and NO file read of any kind in this binary: the 2026-10-25
+ * symlink/env finding (#9558) is closed by removal of the read, not by a
+ * guard. The only environment variable consulted is
+ * DOORMAN_SOCKET_DEV_OVERRIDE, which exists solely for this binary's own
+ * test suite (tests/test_doorman_askpass_c.py) and is never set by
+ * anything in production.
  *
- * The token and capability files are read with an additional
- * canonical-path check (read_file_trim_canonical, below) as defense in
- * depth against symlink-based redirection, independent of the runtime
- * directory already being pinned via getuid().
+ * Non-dumpable: prctl(PR_SET_DUMPABLE, 0) is the very first statement of
+ * main(). This is mandatory and must not rely on the setgid side effect:
+ * with fs.suid_dumpable != 0 a setgid exec can otherwise stay dumpable and
+ * let a same-uid process ptrace it or read its memory.
  *
- * Linking decision: kept dynamically linked. Removing the capability
- * means this binary gains no privilege boundary an LD_PRELOAD could cross
- * that the attacker (same uid, already controls the whole invocation
- * environment) didn't already have over any other program they could run
- * instead; static linking would add build complexity and lose automatic
- * libc security patches for no closed threat.
+ * Linking decision: kept dynamically linked. This is now safe against
+ * LD_PRELOAD because the setgid exec sets AT_SECURE=1, so the loader
+ * ignores LD_PRELOAD and other LD_* variables from the environment.
+ * Static linking remains an optional belt-and-suspenders measure.
  *
  * Deliberately self-contained: no exec, no libraries beyond libc, one
- * source file. Nothing here execs anything else, so there's no second
- * process whose environment (PYTHONPATH, LD_PRELOAD, ...) a caller who
- * chose us as SUDO_ASKPASS could try to influence.
+ * source file.
  */
 #define _GNU_SOURCE
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -56,60 +43,7 @@
 #include <unistd.h>
 
 #define MAX_LINE (16 * 1024)
-
-static void trim_in_place(char *buf, size_t n) {
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
-                      buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
-        buf[--n] = '\0';
-    }
-    size_t start = 0;
-    while (buf[start] == ' ' || buf[start] == '\t' || buf[start] == '\n' ||
-           buf[start] == '\r') {
-        start++;
-    }
-    if (start > 0) memmove(buf, buf + start, n - start + 1);
-}
-
-/* Opens path with O_NOFOLLOW (blocks the final path component being a
- * symlink), then reads back the fd's own resolved path via
- * /proc/self/fd/<fd> (reflects exactly what was opened — no re-lookup, so
- * no TOCTOU window) and refuses to trust the content unless that resolved
- * path exactly matches expected_path. Closes the 2026-10-25 finding
- * (symlink-following read under an attacker-controlled base directory)
- * independently of runtime_dir already being pinned via getuid() below —
- * defense in depth, not redundant: this also catches an intermediate
- * directory component being a symlink, which O_NOFOLLOW alone does not. */
-static char *read_file_trim_canonical(const char *path, const char *expected_path) {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) return NULL;
-    char fd_path[64], resolved[800];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
-    ssize_t n = readlink(fd_path, resolved, sizeof(resolved) - 1);
-    if (n < 0) {
-        close(fd);
-        return NULL;
-    }
-    resolved[n] = '\0';
-    if (strcmp(resolved, expected_path) != 0) {
-        close(fd);
-        return NULL;
-    }
-    FILE *f = fdopen(fd, "rb");
-    if (!f) {
-        close(fd);
-        return NULL;
-    }
-    char *buf = malloc(MAX_LINE + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t len = fread(buf, 1, MAX_LINE, f);
-    fclose(f);
-    buf[len] = '\0';
-    trim_in_place(buf, len);
-    return buf;
-}
+#define ASKPASS_SOCKET_PATH "/run/doorman/askpass.sock"
 
 static ssize_t write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
@@ -293,51 +227,24 @@ static int parse_string_field(const char *line, const char *key, char *out,
 }
 
 int main(int argc, char **argv) {
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) return 1;
+
     const char *prompt = (argc > 1) ? argv[1] : "Password: ";
-
-    const char *runtime_override = getenv("DOORMAN_RUNTIME_DIR_DEV_OVERRIDE");
-    char runtime_dir[768];
-    if (runtime_override && *runtime_override) {
-        snprintf(runtime_dir, sizeof(runtime_dir), "%s", runtime_override);
-    } else {
-        snprintf(runtime_dir, sizeof(runtime_dir), "/run/user/%d/omarchy-doorman",
-                  (int)getuid());
-    }
-
-    char token_path[800], cap_path[800];
-    snprintf(token_path, sizeof(token_path), "%s/token", runtime_dir);
-    snprintf(cap_path, sizeof(cap_path), "%s/llm-capability", runtime_dir);
-
-    char *token = read_file_trim_canonical(token_path, token_path);
-    char *capability = read_file_trim_canonical(cap_path, cap_path);
-    if (!token || !*token || !capability || !*capability) {
-        free(token);
-        free(capability);
-        return 2;
-    }
 
     const char *socket_override = getenv("DOORMAN_SOCKET_DEV_OVERRIDE");
     char socket_path[800];
-    if (socket_override && *socket_override) {
-        snprintf(socket_path, sizeof(socket_path), "%s", socket_override);
-    } else {
-        snprintf(socket_path, sizeof(socket_path), "%s/broker.sock", runtime_dir);
-    }
+    snprintf(socket_path, sizeof(socket_path), "%s",
+              (socket_override && *socket_override) ? socket_override
+                                                    : ASKPASS_SOCKET_PATH);
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        free(token);
-        free(capability);
-        return 1;
-    }
+    if (fd < 0) return 1;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     if (strlen(socket_path) >= sizeof(addr.sun_path)) {
         close(fd);
-        free(token);
-        free(capability);
         return 1;
     }
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
@@ -348,29 +255,19 @@ int main(int argc, char **argv) {
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
-        free(token);
-        free(capability);
         return 1;
     }
 
     char cwd[700];
     if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
 
-    char esc_token[2200] = "";
-    char esc_capability[1200] = "";
     char esc_prompt[1200] = "";
     char esc_cwd[1500] = "";
-    if (write_json_string(esc_token, sizeof(esc_token), token) < 0 ||
-        write_json_string(esc_capability, sizeof(esc_capability), capability) < 0 ||
-        write_json_string(esc_prompt, sizeof(esc_prompt), prompt) < 0 ||
+    if (write_json_string(esc_prompt, sizeof(esc_prompt), prompt) < 0 ||
         write_json_string(esc_cwd, sizeof(esc_cwd), cwd) < 0) {
         close(fd);
-        free(token);
-        free(capability);
         return 1;
     }
-    free(token);
-    free(capability);
 
     /* "command" is intentionally a static, non-authoritative placeholder:
      * the broker derives the displayed command itself from the real sudo
@@ -380,10 +277,9 @@ int main(int argc, char **argv) {
     char request[8192];
     int n = snprintf(
         request, sizeof(request),
-        "{\"token\":%s,\"type\":\"request\",\"pid\":%d,\"sudo_pid\":%d,"
-        "\"command\":\"sudo askpass\",\"cwd\":%s,\"tty\":\"\",\"prompt\":%s,"
-        "\"origin\":\"llm\",\"capability\":%s}\n",
-        esc_token, (int)getpid(), (int)getppid(), esc_cwd, esc_prompt, esc_capability);
+        "{\"type\":\"request\",\"pid\":%d,\"sudo_pid\":%d,"
+        "\"command\":\"sudo askpass\",\"cwd\":%s,\"tty\":\"\",\"prompt\":%s}\n",
+        (int)getpid(), (int)getppid(), esc_cwd, esc_prompt);
     if (n < 0 || (size_t)n >= sizeof(request)) {
         close(fd);
         return 1;

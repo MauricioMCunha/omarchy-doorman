@@ -4,6 +4,20 @@
 The broker holds the secret only for the duration of the request's response.
 It never logs the secret payload and invalidates each request after a
 single use.
+
+Identity model ("shape B", 7th design — see docs/superpowers/specs/
+2026-11-05-askpass-identity-6th-design.md): a request is admitted only if the
+connecting peer's *effective gid*, read from SO_PEERCRED, equals the
+`doorman-askpass` group's gid. The installed askpass binary is setgid to that
+group and the group has no human members, so only a process that exec'd that
+binary carries that egid; the kernel records it at connect() and a later
+execve() cannot change it. There is no helper process, no SIGSTOP, no
+/proc/<pid>/exe lookup, no token/capability, and the broker reads NO file
+descriptor from the peer (no recvmsg/SCM_RIGHTS) — that is what keeps the
+O_PATH/fstat bypass closed. The broker also reads no caller-influenced file.
+Every peer-uid comparison is against the single configured --owner-uid (the
+login user), never against os.getuid(): in production the broker itself runs as
+the dedicated `doorman` system user.
 """
 
 from __future__ import annotations
@@ -11,8 +25,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import grp
+import select
 import secrets
-import signal
 import socket
 import stat
 import struct
@@ -28,14 +43,13 @@ from typing import Any
 MAX_LINE = 16 * 1024
 DEFAULT_TIMEOUT = 30.0
 HANDSHAKE_TIMEOUT = 5.0
-# Defense in depth: someone who already has the token/capability (a
-# compromised process of the same user) could still open many concurrent
-# requests, each holding a thread for up to timeout+1s. This doesn't affect
-# normal use, which rarely has more than one pending request at a time.
+# Defense in depth: a compromised process of the owner could still open many
+# concurrent requests, each holding a thread for up to timeout+1s. This doesn't
+# affect normal use, which rarely has more than one pending request at a time.
 MAX_PENDING = 20
 # Process name (/proc/<pid>/comm) of the trusted process allowed to
 # approve/cancel/list requests. Configurable only for tests — in production
-# it's always the real Quickshell. See Broker._peer_is_trusted_ui.
+# it's always the real Quickshell. See Broker._trusted_ui_peer_uid.
 DEFAULT_TRUSTED_UI_EXE = "quickshell"
 # Process name (/proc/<pid>/comm) a request's connecting peer's immediate
 # parent must have for the request to be accepted at all. Configurable only
@@ -57,13 +71,18 @@ DEFAULT_TRUSTED_SUDO_EXE = "sudo"
 # model (see SPEC.md §6.1) if it ever becomes possible. Always required in
 # production; only tests, which cannot become root, turn it off.
 DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION = True
-# Timeout for the broker's own connection to the identity-helper (connect +
-# the single request/response round trip). The helper does its work
-# (fstat()-ing /proc/<pid>/exe) locally and fast; this only needs to be long
-# enough to rule out transient scheduling noise, not to wait out a hung or
-# missing helper — a request's human-facing latency shouldn't balloon just
-# because the helper unit is down.
-IDENTITY_HELPER_TIMEOUT = 3.0
+# System group whose gid a request peer's effective gid must equal, and which
+# the installed askpass binary is setgid to (see the module docstring).
+ASKPASS_GROUP = "doorman-askpass"
+UI_GROUP = "doorman-ui"
+# Which listener accepted a connection. _handle allows only that socket's
+# verbs: askpass -> "request"; control -> approve/cancel/pending/stats.
+SOCKET_ASKPASS = "askpass"
+SOCKET_CONTROL = "control"
+UI_VERBS = ("approve", "cancel", "pending", "stats")
+# Fixed install location of the setgid askpass binary (root:doorman-askpass,
+# mode 2755). Overridable only for tests (--askpass-binary).
+DEFAULT_ASKPASS_BINARY = "/usr/local/lib/omarchy-doorman/doorman-askpass"
 # How many extra parent-process hops, beyond the caller itself, the broker
 # follows while looking for the trusted executable (bridge.py runs as a
 # direct child of Quickshell — 1 hop is enough in practice; the slack covers
@@ -92,6 +111,9 @@ class PendingRequest:
     process_start_time: str | None = None
     process_cmdline: str | None = None
     process_uid: int | None = None
+    # The configured owner uid this request was created for; the approving UI
+    # connection's peer uid must equal it (see Broker._approve/_cancel).
+    owner_uid: int | None = None
     attempt: int = 1
     delivered: bool = False
     decision_event: threading.Event = field(default_factory=threading.Event)
@@ -103,33 +125,35 @@ class Broker:
     def __init__(
         self,
         socket_path: Path,
-        session_token: str,
-        llm_capability: str,
         timeout: float,
+        owner_uid: int,
         trusted_ui_exe: str = DEFAULT_TRUSTED_UI_EXE,
         trusted_sudo_exe: str = DEFAULT_TRUSTED_SUDO_EXE,
         trusted_sudo_requires_escalation: bool = DEFAULT_TRUSTED_SUDO_REQUIRES_ESCALATION,
-        identity_helper_socket: Path | None = None,
+        trusted_askpass_gid: int | None = None,
         trusted_askpass_skip_identity_check: bool = False,
+        askpass_binary: Path | None = None,
+        control_socket_path: Path | None = None,
     ) -> None:
         self.socket_path = socket_path
-        self.session_token = session_token
-        self.llm_capability = llm_capability
+        self.control_socket_path = control_socket_path
         self.timeout = timeout
+        self.owner_uid = owner_uid
         self.trusted_ui_exe = trusted_ui_exe
         self.trusted_sudo_exe = trusted_sudo_exe
         self.trusted_sudo_requires_escalation = trusted_sudo_requires_escalation
-        self.identity_helper_socket = identity_helper_socket or Path(_default_identity_helper_socket())
-        # Test-only: lets a test exercise request creation without running a
-        # real identity-helper process. Never set in production.
+        # Test-only: pins the trusted gid instead of resolving the
+        # `doorman-askpass` group, so unprivileged CI can exercise the egid
+        # gate without a real group or setgid binary. Never set in production.
+        self._trusted_askpass_gid_override = trusted_askpass_gid
+        self.askpass_binary = Path(askpass_binary or DEFAULT_ASKPASS_BINARY)
+        # Test-only: lets a test exercise request creation without a peer that
+        # carries the askpass egid. Never set in production.
         self.trusted_askpass_skip_identity_check = trusted_askpass_skip_identity_check
         self._askpass_unavailable_last_logged = 0.0
-        if trusted_askpass_skip_identity_check:
-            self.askpass_identity_available = True
-        else:
-            self.askpass_identity_available = self._ping_identity_helper()
-            if not self.askpass_identity_available:
-                self._log_askpass_unavailable()
+        self.askpass_identity_available = self._compute_askpass_identity_available()
+        if not self.askpass_identity_available:
+            self._log_askpass_unavailable()
         self.pending: dict[str, PendingRequest] = {}
         # sudo_pid -> {"attempt": int, "last_seen": float, "request_id": str}.
         # See RETRY_WINDOW_SECONDS.
@@ -140,86 +164,138 @@ class Broker:
         self.metrics = {"approved": 0, "cancelled": 0, "expired": 0, "requests": 0}
         self.last_activity_at: float | None = None
 
+    def _trusted_askpass_gid(self) -> int | None:
+        if self._trusted_askpass_gid_override is not None:
+            return self._trusted_askpass_gid_override
+        try:
+            return grp.getgrnam(ASKPASS_GROUP).gr_gid
+        except KeyError:
+            return None
+
+    def _compute_askpass_identity_available(self) -> bool:
+        # True only if requests can actually be admitted: the group resolves
+        # AND the installed binary exists at the fixed path with the setgid
+        # bit set and root:<group> ownership. Re-evaluated on every `stats`.
+        if self.trusted_askpass_skip_identity_check:
+            return True
+        gid = self._trusted_askpass_gid()
+        if gid is None:
+            return False
+        try:
+            st = os.stat(self.askpass_binary)
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(st.st_mode)
+            and bool(st.st_mode & stat.S_ISGID)
+            and st.st_uid == 0
+            and st.st_gid == gid
+        )
+
     def _log_askpass_unavailable(self) -> None:
         self._askpass_unavailable_last_logged = time.time()
         print(
-            f"doorman broker: identity-helper at {self.identity_helper_socket!r} "
-            "was not reachable at startup — askpass requests will be refused "
-            "(identity_helper_unreachable) until omarchy-doorman-identity-helper"
-            ".service is running. This is deliberate: it's quieter to fail "
-            "loudly here than to silently accept the weaker, pre-#9558 "
-            "guarantee.",
+            f"doorman broker: no installed setgid askpass binary at "
+            f"{str(self.askpass_binary)!r} (root:{ASKPASS_GROUP}, setgid) or the "
+            f"{ASKPASS_GROUP!r} group does not resolve — askpass requests will "
+            "be refused (untrusted_askpass_helper) until it is installed "
+            "(scripts/doorman-install-askpass).",
             file=sys.stderr,
             flush=True,
         )
 
     def serve(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.socket_path.parent, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        try:
-            existing = self.socket_path.lstat()
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            if not stat.S_ISSOCK(existing.st_mode):
-                raise RuntimeError(f"socket path is not a Unix socket: {self.socket_path}")
-            if existing.st_uid != os.getuid():
-                raise RuntimeError("Unix socket belongs to another user")
-            self.socket_path.unlink()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-            server.bind(str(self.socket_path))
-            os.chmod(self.socket_path, stat.S_IRUSR | stat.S_IWUSR)
-            server.listen(16)
+        # Directory mode is owned by the unit's RuntimeDirectoryMode in
+        # production; only a directory created here gets a restrictive mode.
+        self.socket_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        self._remove_stale_socket(self.socket_path)
+        if self.control_socket_path is None:
+            raise RuntimeError("no control socket configured")
+        if self.control_socket_path == self.socket_path:
+            raise RuntimeError("control socket must differ from the askpass socket")
+        self.control_socket_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        self._remove_stale_socket(self.control_socket_path)
+        # The socket's group is always the real group, never a test seam.
+        # Under a test seam (which only unprivileged CI uses) an unresolvable
+        # group or a refused chgrp falls back to owner-only 0600 (stricter,
+        # can only break functionality); in production either is a hard error.
+        seam = (
+            self.trusted_askpass_skip_identity_check
+            or self._trusted_askpass_gid_override is not None
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as askpass_server, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control_server:
+            # askpass socket: chgrp doorman-askpass + 0660, so only a process
+            # carrying that gid (the setgid askpass binary) can even connect.
+            # The real gate is the egid check in _handle; this is the first,
+            # kernel-enforced layer.
+            self._bind_listener(askpass_server, self.socket_path, ASKPASS_GROUP, seam)
+            # control socket: chgrp doorman-ui + 0660 (the trusted UI's group).
+            self._bind_listener(control_server, self.control_socket_path, UI_GROUP, seam)
+            listeners = {
+                askpass_server: SOCKET_ASKPASS,
+                control_server: SOCKET_CONTROL,
+            }
             cleanup = threading.Thread(target=self._cleanup_loop, daemon=True)
             cleanup.start()
-            print(f"doorman broker listening on {self.socket_path}", flush=True)
+            print(
+                f"doorman broker listening on {self.socket_path} (askpass) and "
+                f"{self.control_socket_path} (control)",
+                flush=True,
+            )
             while not self.stop_event.is_set():
                 try:
-                    server.settimeout(1.0)
-                    conn, _ = server.accept()
-                except socket.timeout:
+                    ready, _, _ = select.select(list(listeners), [], [], 1.0)
+                except (OSError, ValueError):
                     continue
-                stopped_pid = (
-                    None if self.trusted_askpass_skip_identity_check
-                    else self._stop_peer_for_identity_check(conn)
-                )
-                threading.Thread(target=self._handle, args=(conn, stopped_pid), daemon=True).start()
-        try:
-            self.socket_path.unlink()
-        except FileNotFoundError:
-            pass
+                for server in ready:
+                    try:
+                        conn, _ = server.accept()
+                    except (socket.timeout, BlockingIOError, InterruptedError):
+                        continue
+                    # Which listener accepted the connection decides the verb
+                    # set _handle will allow; a peer cannot influence it.
+                    threading.Thread(
+                        target=self._handle, args=(conn, listeners[server]), daemon=True,
+                    ).start()
+        for path in (self.socket_path, self.control_socket_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
-    def _handle(self, conn: socket.socket, stopped_pid: int | None) -> None:
+    @staticmethod
+    def _remove_stale_socket(path: Path) -> None:
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(existing.st_mode):
+            raise RuntimeError(f"socket path is not a Unix socket: {path}")
+        if existing.st_uid != os.getuid():
+            raise RuntimeError("Unix socket belongs to another user")
+        path.unlink()
+
+    @staticmethod
+    def _bind_listener(server: socket.socket, path: Path, group: str, seam: bool) -> None:
+        server.bind(str(path))
+        try:
+            try:
+                gid = grp.getgrnam(group).gr_gid
+            except KeyError:
+                raise PermissionError(f"group {group!r} does not resolve")
+            os.chown(path, -1, gid)
+            os.chmod(path, 0o660)
+        except PermissionError:
+            if not seam:
+                raise
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        server.listen(16)
+
+    def _handle(self, conn: socket.socket, which: str) -> None:
         with conn:
-            # The identity check runs first, before any data is read from
-            # this connection — a check performed any later could be fooled
-            # by a fork()+exec() on the same connection (the original
-            # connecting process execs into the trusted binary purely to
-            # manipulate what a later check would see, while a forked
-            # sibling that inherited the live socket drives the rest of the
-            # protocol). See docs/superpowers/specs/
-            # 2026-11-05-askpass-identity-6th-design.md, "Validated
-            # findings" item 3. UI-type connections (approve/cancel/
-            # pending/stats) never consult this result — it only matters for
-            # "request" — but running it unconditionally keeps the ordering
-            # (and the accept-time SO_PEERCRED pid) the same for every
-            # connection, rather than making it something a caller's message
-            # can route around.
-            #
-            # stopped_pid was captured, and SIGSTOP already sent, by
-            # _stop_peer_for_identity_check in serve()'s own main accept
-            # loop — synchronously, before this thread was even spawned. See
-            # "Addendum 2" in docs/superpowers/specs/
-            # 2026-11-05-askpass-identity-6th-design.md: doing the SIGSTOP
-            # from inside this thread instead (the original design) left a
-            # thread-dispatch-latency gap wide enough for a pre-connect()
-            # fork() attacker's bare execve() to win the race.
-            identity_outcome = (
-                "match" if self.trusted_askpass_skip_identity_check
-                else self._check_peer_identity(stopped_pid)
-            )
-            # Without a timeout here, any process of the same user (even
-            # without a token) could connect and never send data, holding
+            # Without a timeout here, any process that can reach the socket
+            # could connect and never send data, holding
             # this thread forever. There's no cap on concurrent threads, so
             # that becomes local exhaustion. The handshake is the only read
             # on this connection; subsequent responses only send, so the
@@ -237,39 +313,41 @@ class Broker:
             except json.JSONDecodeError:
                 self._send(conn, {"ok": False, "error": "invalid_message"})
                 return
-            if not secrets.compare_digest(str(message.get("token", "")), self.session_token):
-                self._send(conn, {"ok": False, "error": "unauthorized"})
-                return
             kind = message.get("type")
+            # Per-socket verb routing, checked BEFORE any gate: a caller that
+            # can reach one socket must not exercise the other's verb set,
+            # even if it would otherwise pass that verb's gate.
+            if kind == "request" and which != SOCKET_ASKPASS:
+                self._send(conn, {"ok": False, "error": "wrong_socket"})
+                return
+            if kind in UI_VERBS and which != SOCKET_CONTROL:
+                self._send(conn, {"ok": False, "error": "wrong_socket"})
+                return
             if kind == "request":
-                if identity_outcome == "unreachable":
-                    self._send(conn, {"ok": False, "error": "identity_helper_unreachable"})
-                    return
-                if identity_outcome == "no_match":
+                # The egid gate. SO_PEERCRED's gid is the peer's *effective*
+                # gid as recorded by the kernel at connect(); an execve()
+                # after connect() cannot change it, and a process only has
+                # the doorman-askpass egid if it exec'd the setgid binary.
+                # Nothing is read from the peer to decide this.
+                if not self._peer_has_trusted_egid(conn):
                     self._send(conn, {"ok": False, "error": "untrusted_askpass_helper"})
                     return
-                if not self._valid_llm_origin(message):
-                    self._send(conn, {"ok": False, "error": "invalid_llm_origin"})
-                    return
                 self._create_request(conn, message)
-            elif kind in ("approve", "cancel", "pending", "stats"):
-                # Origin=llm + capability only controls who can CREATE a
-                # request; approve/cancel/pending/stats used to only check
-                # the session token, and any process of the same user that
-                # can create a request can also read that token (it's the
-                # same 0600 file). Without this check, a compromised agent
-                # could self-approve straight over the socket, with no UI
-                # and no human — confirmed manually before this fix.
+            elif kind in UI_VERBS:
+                # approve/cancel/pending/stats must come from the trusted UI;
+                # without this check a compromised agent could self-approve
+                # straight over the socket, with no UI and no human.
                 # SO_PEERCRED is verified by the kernel from the process that
                 # called connect(); it's not something the remote process
                 # can forge.
-                if not self._peer_is_trusted_ui(conn):
+                ui_uid = self._trusted_ui_peer_uid(conn)
+                if ui_uid is None:
                     self._send(conn, {"ok": False, "error": "untrusted_caller"})
                     return
                 if kind == "approve":
-                    self._approve(conn, message)
+                    self._approve(conn, message, ui_uid)
                 elif kind == "cancel":
-                    self._cancel(conn, message)
+                    self._cancel(conn, message, ui_uid)
                 elif kind == "pending":
                     self._pending(conn)
                 else:
@@ -295,11 +373,12 @@ class Broker:
             return None
         return bytes(buf[:newline_idx])
 
-    def _valid_llm_origin(self, message: dict[str, Any]) -> bool:
-        return (
-            message.get("origin") == "llm"
-            and secrets.compare_digest(str(message.get("capability", "")), self.llm_capability)
-        )
+    def _peer_has_trusted_egid(self, conn: socket.socket) -> bool:
+        if self.trusted_askpass_skip_identity_check:
+            return True
+        creds = self._peer_credentials(conn)
+        gid = self._trusted_askpass_gid()
+        return creds is not None and gid is not None and creds[2] == gid
 
     def _create_request(self, conn: socket.socket, message: dict[str, Any]) -> None:
         pid = self._positive_pid(message.get("pid"))
@@ -307,9 +386,8 @@ class Broker:
             self._send(conn, {"ok": False, "error": "invalid_pid"})
             return
         # The "pid" field above is self-reported in the message payload — an
-        # agent holding the normal request token/capability could otherwise
-        # claim to be any PID that happens to exist (not even a real sudo
-        # process), get a human to approve what looks like a legitimate
+        # agent could otherwise claim to be any PID that happens to exist (not
+        # even a real sudo process), get a human to approve what looks like a legitimate
         # request for it, and receive the secret itself on this very
         # connection, since the response goes back over whoever is actually
         # connected, not over the claimed pid. Requiring the kernel-verified
@@ -319,7 +397,7 @@ class Broker:
         # does (it reports os.getpid(), its own real pid), so it changes
         # nothing for the legitimate flow.
         creds = self._peer_credentials(conn)
-        if creds is None or creds[1] != os.getuid() or creds[0] != pid:
+        if creds is None or creds[1] != self.owner_uid or creds[0] != pid:
             self._send(conn, {"ok": False, "error": "pid_mismatch"})
             return
         # Closes the pid_mismatch check's remaining gap: it only stops a
@@ -341,10 +419,9 @@ class Broker:
         # sudo). sudo itself lets the caller pick SUDO_ASKPASS, so the peer
         # process — the one that actually holds this connection and would
         # receive the secret — could still be the attacker's own script,
-        # genuinely spawned by a genuine sudo. That's what identity_outcome,
-        # computed in _handle at accept() time (before _create_request is
-        # even entered), already ruled out — see _check_peer_identity and
-        # SPEC.md §6.11 — so there's nothing left to check here.
+        # genuinely spawned by a genuine sudo. That's what the peer-egid gate
+        # in _handle (before _create_request is even entered) already ruled
+        # out, so there's nothing left to check here.
         identity = self._process_identity(pid)
         if identity is None:
             self._send(conn, {"ok": False, "error": "process_not_found"})
@@ -376,6 +453,7 @@ class Broker:
             process_start_time=identity["start_time"],
             process_cmdline=identity["cmdline"],
             process_uid=identity["uid"],
+            owner_uid=creds[1],
         )
         with self.lock:
             if len(self.pending) >= MAX_PENDING:
@@ -447,17 +525,9 @@ class Broker:
 
     def _stats(self, conn: socket.socket) -> None:
         now = time.time()
-        # self.askpass_identity_available is otherwise only ever set once,
-        # at __init__ time. If the broker starts before the identity-helper's
-        # socket exists (After= only orders process start, not socket
-        # readiness for a Type=simple unit), the flag would stay stuck False
-        # for the whole session even once the helper comes up — or stuck
-        # True if the helper dies later. Re-pinging here, live, on every
-        # `stats` call (which the UI polls periodically) keeps it honest.
-        # The __init__-time ping and its log message, and _cleanup_loop's
-        # periodic re-log, are unrelated and stay as-is.
-        if not self.trusted_askpass_skip_identity_check:
-            self.askpass_identity_available = self._ping_identity_helper()
+        # Re-evaluated live on every `stats` call (which the UI polls): the
+        # binary may be installed/removed or the group created after startup.
+        self.askpass_identity_available = self._compute_askpass_identity_available()
         with self.lock:
             payload = {
                 "ok": True,
@@ -472,7 +542,7 @@ class Broker:
             }
         self._send(conn, payload)
 
-    def _approve(self, conn: socket.socket, message: dict[str, Any]) -> None:
+    def _approve(self, conn: socket.socket, message: dict[str, Any], ui_uid: int) -> None:
         request_id = str(message.get("request_id", ""))
         nonce = str(message.get("nonce", ""))
         secret = message.get("secret")
@@ -481,6 +551,8 @@ class Broker:
             identity_valid = request is not None and self._identity_matches(request)
             valid = (
                 request is not None
+                and request.owner_uid is not None
+                and request.owner_uid == ui_uid
                 and not request.delivered
                 and secrets.compare_digest(request.nonce, nonce)
                 and request.expires_at > time.time()
@@ -500,13 +572,15 @@ class Broker:
         # The secret is returned only in this response and never written by the broker.
         self._send(conn, {"ok": True})
 
-    def _cancel(self, conn: socket.socket, message: dict[str, Any]) -> None:
+    def _cancel(self, conn: socket.socket, message: dict[str, Any], ui_uid: int) -> None:
         request_id = str(message.get("request_id", ""))
         nonce = str(message.get("nonce", ""))
         with self.lock:
             request = self.pending.get(request_id)
             removed = (
                 request is not None
+                and request.owner_uid is not None
+                and request.owner_uid == ui_uid
                 and not request.delivered
                 and secrets.compare_digest(request.nonce, nonce)
             )
@@ -527,7 +601,8 @@ class Broker:
         return pid if pid > 0 else None
 
     @staticmethod
-    def _peer_credentials(conn: socket.socket) -> tuple[int, int] | None:
+    def _peer_credentials(conn: socket.socket) -> tuple[int, int, int] | None:
+        # Returns (pid, uid, gid) — gid is the peer's *effective* gid.
         # Verified by the kernel from the process that called connect(); not
         # something the remote process can forge, unlike anything carried in
         # the message payload itself (see _create_request's pid check).
@@ -535,108 +610,37 @@ class Broker:
             creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         except OSError:
             return None
-        pid, uid, _gid = struct.unpack("3i", creds)
+        pid, uid, gid = struct.unpack("3i", creds)
         if pid <= 0:
             return None
-        return pid, uid
+        return pid, uid, gid
 
-    def _ping_identity_helper(self) -> bool:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                conn.settimeout(IDENTITY_HELPER_TIMEOUT)
-                conn.connect(str(self.identity_helper_socket))
-        except OSError:
-            return False
-        return True
-
-    def _query_identity_helper(self, pid: int) -> str:
-        """Returns "match", "no_match", or "unreachable"."""
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                conn.settimeout(IDENTITY_HELPER_TIMEOUT)
-                conn.connect(str(self.identity_helper_socket))
-                conn.sendall((json.dumps({"pid": pid}) + "\n").encode())
-                line = conn.makefile("rb").readline(256)
-        except OSError:
-            return "unreachable"
-        try:
-            resp = json.loads(line)
-        except json.JSONDecodeError:
-            return "unreachable"
-        return "match" if resp.get("ok") is True else "no_match"
-
-    def _stop_peer_for_identity_check(self, conn: socket.socket) -> int | None:
-        # Must run in the main accept loop, before any thread is spawned for
-        # this connection — see docs/superpowers/specs/2026-11-05-askpass-
-        # identity-6th-design.md, "Addendum 2": an attacker who fork()s
-        # BEFORE calling connect() has only execve() left in their
-        # post-connect() critical path (no fork() call to pay for), which is
-        # fast enough to beat SIGSTOP if SIGSTOP is sent from inside a
-        # freshly-spawned thread instead of here. Confirmed live,
-        # 2026-11-08: thread-dispatch latency alone was enough to flip an
-        # otherwise-correct mitigation.
-        creds = self._peer_credentials(conn)
-        if creds is None or creds[1] != os.getuid():
-            return None
-        pid = creds[0]
-        try:
-            os.kill(pid, signal.SIGSTOP)
-        except OSError:
-            return None
-        return pid
-
-    def _check_peer_identity(self, pid: int | None) -> str:
-        # pid is None when _stop_peer_for_identity_check (run earlier, in
-        # the main accept loop, before this thread existed) couldn't
-        # validate the peer's credentials or couldn't stop it — nothing was
-        # frozen, so there's nothing to resume here either.
-        if pid is None:
-            return "no_match"
-        outcome = "no_match"
-        try:
-            try:
-                # Pins this exact pid against kernel reuse for the duration
-                # of the broker<->helper round trip (pidfd_open(2)). The
-                # peer is already stopped by now, so this isn't closing the
-                # fork/exec race — just the separate pid-reuse one.
-                pidfd = os.pidfd_open(pid, 0)
-            except OSError:
-                return "no_match"
-            try:
-                outcome = self._query_identity_helper(pid)
-                return outcome
-            finally:
-                os.close(pidfd)
-        finally:
-            try:
-                os.kill(pid, signal.SIGCONT)
-            except OSError:
-                pass  # ESRCH (peer already gone) — nothing left to resume
-
-    def _peer_is_trusted_ui(self, conn: socket.socket) -> bool:
+    def _trusted_ui_peer_uid(self, conn: socket.socket) -> int | None:
+        # Returns the UI peer's uid (== owner_uid) if the peer is the trusted
+        # UI, else None. The uid is what approve/cancel bind to the request.
         creds = self._peer_credentials(conn)
         if creds is None:
-            return False
-        pid, uid = creds
-        if uid != os.getuid():
-            return False
+            return None
+        pid, uid, _gid = creds
+        if uid != self.owner_uid:
+            return None
         for _ in range(_TRUSTED_UI_MAX_HOPS):
             info = self._process_ppid_and_comm(pid)
             if info is None:
-                return False
+                return None
             ppid, comm = info
             if comm == self.trusted_ui_exe:
-                return True
+                return uid
             if ppid <= 1:
-                return False
+                return None
             pid = ppid
-        return False
+        return None
 
     def _peer_is_sudo_child(self, conn: socket.socket) -> bool:
         return self._resolve_sudo_parent_pid(conn) is not None
 
     def _resolve_sudo_parent_pid(self, conn: socket.socket) -> int | None:
-        # Deliberately a single hop, not a walk like _peer_is_trusted_ui's:
+        # Deliberately a single hop, not a walk like _trusted_ui_peer_uid's:
         # sudo's askpass mechanism forks and execs the helper directly, with
         # no shell in between (confirmed in this project's own wrapper
         # scripts), so the real chain is always exactly peer -> sudo. Walking
@@ -647,8 +651,8 @@ class Broker:
         creds = self._peer_credentials(conn)
         if creds is None:
             return None
-        pid, uid = creds
-        if uid != os.getuid():
+        pid, uid, _gid = creds
+        if uid != self.owner_uid:
             return None
         info = self._process_ppid_and_comm(pid)
         if info is None:
@@ -668,7 +672,7 @@ class Broker:
         privilege_escalated = parent_effective_uid != parent_real_uid
         if (
             parent_comm == self.trusted_sudo_exe
-            and parent_real_uid == os.getuid()
+            and parent_real_uid == self.owner_uid
             and (privilege_escalated or not self.trusted_sudo_requires_escalation)
         ):
             return parent_pid
@@ -697,7 +701,7 @@ class Broker:
         # that permission. This trades "impossible to forge" for "requires
         # a deliberate step" (renaming the process via prctl/argv[0]) —
         # worse than ideal, but much better than accepting any caller with
-        # the token, which is what existed before this fix.
+        # any caller at all, which is what existed before this fix.
         try:
             comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
         except OSError:
@@ -780,7 +784,9 @@ class Broker:
                 not self.askpass_identity_available
                 and now - self._askpass_unavailable_last_logged > 60.0
             ):
-                self._log_askpass_unavailable()
+                self.askpass_identity_available = self._compute_askpass_identity_available()
+                if not self.askpass_identity_available:
+                    self._log_askpass_unavailable()
             with self.lock:
                 expired = [rid for rid, req in self.pending.items() if req.expires_at <= now]
                 for rid in expired:
@@ -807,30 +813,36 @@ class Broker:
             pass
 
 
-def _default_identity_helper_socket() -> str:
-    return f"/run/user/{os.getuid()}/omarchy-doorman-identity-helper/helper.sock"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
-    parser.add_argument("--token", default=None)
-    parser.add_argument("--llm-capability", default=None)
+    parser.add_argument("--control-socket", type=Path, default=None)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--trusted-ui-exe", default=None)
     parser.add_argument("--trusted-sudo-exe", default=None)
     parser.add_argument(
         "--trusted-sudo-allow-unprivileged-parent", action="store_true", default=False,
     )
-    parser.add_argument("--identity-helper-socket", type=Path, default=None)
+    parser.add_argument("--owner-uid", type=int, default=None)
+    parser.add_argument("--trusted-askpass-gid", type=int, default=None)
+    parser.add_argument("--askpass-binary", type=Path, default=None)
     parser.add_argument(
         "--trusted-askpass-skip-identity-check", action="store_true", default=False,
     )
     args = parser.parse_args()
-    token = args.token or os.environ.get("DOORMAN_TOKEN")
-    capability = args.llm_capability or os.environ.get("DOORMAN_LLM_CAPABILITY")
-    if not token or not capability:
-        parser.error("use --token/DOORMAN_TOKEN and --llm-capability/DOORMAN_LLM_CAPABILITY")
+    control_socket = args.control_socket or (
+        Path(os.environ["DOORMAN_CONTROL_SOCKET"]) if os.environ.get("DOORMAN_CONTROL_SOCKET") else None
+    )
+    if control_socket is None:
+        parser.error("use --control-socket/DOORMAN_CONTROL_SOCKET")
+    owner_uid = args.owner_uid
+    if owner_uid is None and os.environ.get("DOORMAN_OWNER_UID"):
+        try:
+            owner_uid = int(os.environ["DOORMAN_OWNER_UID"])
+        except ValueError:
+            parser.error("DOORMAN_OWNER_UID must be an integer")
+    if owner_uid is None:
+        parser.error("use --owner-uid/DOORMAN_OWNER_UID (the login user's uid)")
     trusted_ui_exe = (
         args.trusted_ui_exe
         or os.environ.get("DOORMAN_TRUSTED_UI_EXE")
@@ -845,19 +857,25 @@ def main() -> None:
         args.trusted_sudo_allow_unprivileged_parent
         or os.environ.get("DOORMAN_TRUSTED_SUDO_ALLOW_UNPRIVILEGED_PARENT") == "1"
     )
-    identity_helper_socket = Path(
-        args.identity_helper_socket
-        or os.environ.get("DOORMAN_IDENTITY_HELPER_SOCKET")
-        or _default_identity_helper_socket()
+    trusted_askpass_gid = args.trusted_askpass_gid
+    if trusted_askpass_gid is None and os.environ.get("DOORMAN_TRUSTED_ASKPASS_GID"):
+        try:
+            trusted_askpass_gid = int(os.environ["DOORMAN_TRUSTED_ASKPASS_GID"])
+        except ValueError:
+            parser.error("DOORMAN_TRUSTED_ASKPASS_GID must be an integer")
+    askpass_binary = (
+        args.askpass_binary
+        or (Path(os.environ["DOORMAN_ASKPASS_BINARY"]) if os.environ.get("DOORMAN_ASKPASS_BINARY") else None)
     )
     trusted_askpass_skip_identity_check = (
         args.trusted_askpass_skip_identity_check
         or os.environ.get("DOORMAN_TRUSTED_ASKPASS_SKIP_IDENTITY_CHECK") == "1"
     )
     Broker(
-        args.socket, token, capability, max(1.0, min(args.timeout, 300.0)),
+        args.socket, max(1.0, min(args.timeout, 300.0)), owner_uid,
         trusted_ui_exe, trusted_sudo_exe, trusted_sudo_requires_escalation,
-        identity_helper_socket, trusted_askpass_skip_identity_check,
+        trusted_askpass_gid, trusted_askpass_skip_identity_check, askpass_binary,
+        control_socket,
     ).serve()
 
 

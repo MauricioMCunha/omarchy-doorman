@@ -12,8 +12,9 @@ doesn't send secrets to the agent, logs, clipboard, or network.
 ## Normative flow
 
 1. The authorized process calls the `askpass` helper.
-2. The broker authenticates the session token and the `llm` origin's
-   capability.
+2. The broker admits the request only if the peer's effective gid is the
+   `doorman-askpass` group's (the setgid askpass binary) and the peer's
+   parent is a genuine `sudo`; there is no session token or capability.
 3. The broker creates a request with a nonce, a deadline, and the
    process's identity.
 4. The UI lists the request and shows the command, PID, terminal, and
