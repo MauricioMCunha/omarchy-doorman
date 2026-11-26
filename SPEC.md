@@ -461,16 +461,17 @@ depend on any login session; the UI simply needs them to exist. The
 `ExecStart` is `scripts/run-doorman-broker`, with `@PROJECT_DIR@` in the unit
 template replaced at install time by the checkout the script was run from.
 
-**Known pending deployment item.** The broker's code is read from that
-checkout, which today is under the login user's home (e.g.
-`~/.config/omarchy/plugins/mauricio.doorman`). The broker runs as `doorman`
-with `ProtectHome=read-only`, and a home directory is normally mode `0700`
-for its owner — so `doorman` may be unable to read its own code. `ProtectHome=read-only`
-does not grant access; it only removes write access. This is not resolved in
-the current tree. Fixing it may require installing the broker code outside
-`/home` (as the askpass binary already is, under `/usr/local/lib`); the unit
-file carries a comment to the same effect. Until that is settled and
-verified, treat the install/run flow as not yet end-to-end proven.
+**Deployment note (resolved).** The broker's code is read from a root-owned
+copy installed under `/usr/local/lib/omarchy-doorman`, not from the login
+user's home checkout — `scripts/doorman-install-askpass` places it there and
+the installed unit's `WorkingDirectory`/`ExecStart` point at it. Confirmed
+live: the running unit executes
+`/usr/local/lib/omarchy-doorman/scripts/run-doorman-broker` as `doorman`, so
+`ProtectHome=read-only` never has to grant the broker access to anything
+under `/home`. (Earlier revisions ran the broker from the home checkout,
+where `ProtectHome` plus a `0700` home could block it — the askpass binary
+was already under `/usr/local/lib`, and the broker code now follows it; the
+unit file still carries a comment about the older arrangement.)
 
 The unit additionally sets `NoNewPrivileges`, `PrivateTmp`,
 `RestrictAddressFamilies=AF_UNIX` (the broker never needs any other socket
@@ -911,11 +912,11 @@ reopened trust boundary.
 ### 6.13 Askpass identity is a kernel-recorded credential (the effective gid), not something the broker inspects or is handed
 
 > **Status.** This is the "shape B" design as it exists in the code. It is
-> implemented and unit-tested but **has not yet been live-verified end to
-> end** against the real system unit, a real `sudo` round trip and a real
-> Quickshell session — that is a separate, human-run step (see "What is and
-> is not verified" at the end of this section). Issue #9558 is not reopened
-> until it passes.
+> implemented, unit-tested, and **live-verified end to end** on 2026-11-13
+> against the real system unit, a real `sudo` round trip and a real
+> Quickshell session (see "What is and is not verified" at the end of this
+> section). The fix is merged to `main` (`f108332`); issue #9558 remains
+> closed pending maintainer action.
 
 This section supersedes both mechanisms that came before it: §6.11's
 `SCM_RIGHTS`/`cap_dac_read_search` fd-passing check, and the intermediate
@@ -1051,20 +1052,27 @@ fork-then-exec race (identity is the connect-time egid, not a check made
 afterward — for a post-connect fork the child has no ACL access to the
 socket and shares no egid; for a pre-connect fork the connector is judged by
 its own egid), and the same-uid ptrace/memory read of the secret
-(`PR_SET_DUMPABLE`). What has been confirmed live is limited to the four
-kernel assumptions in the design record's spike (setgid survives `sudo -A`;
-the socket group ACL refuses a non-member; the ancestor ptrace attack is
-blocked against a setgid target; `SO_PEERCRED` reads the egid of a
-non-dumpable client). **What has not been done:** the end-to-end check
-against the real system unit, a real `sudo` round trip and real Quickshell,
-including the repeated fork-exec attacker runs, the ptrace attempt against
-the real binary, the symlink/environment reproduction, the second-user
-rejection and the degraded-state check. Those are enumerated as Task 12 of
-`docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md` and are run
-by a human with root; until they pass, the fork-exec race and the ptrace
-read are *closed by design, live verification pending*, not "fixed and
-verified". The unit-test suite does not substitute for that (this project's
-own repeated lesson).
+(`PR_SET_DUMPABLE`). **Confirmed live on 2026-11-13**, against the real
+system unit (`User=doorman`, broker running from
+`/usr/local/lib/omarchy-doorman`), a real `sudo` round trip and a real
+Quickshell session: the full human round trip (`sudo id` → modal → approve →
+a genuine `uid=0`); the four kernel assumptions from the design spike
+(setgid survives `sudo -A`; the socket group ACL refuses a non-member; the
+ancestor ptrace attack is blocked against a setgid target; `SO_PEERCRED`
+reads the egid of a non-dumpable client); the repeated fork-exec attacker
+runs (20/20 rejected at the sudo-parent gate, 0 pending, 0 secret released);
+the ptrace attempt against the real binary; the O_PATH and
+symlink/environment audits (absent in the shipped code); the second-user
+(cross-uid) rejection; and the degraded-state check. The full unit-test
+suite (37/37) passes alongside. These were run by a human with root, as
+enumerated in Task 12 of
+`docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`. **Still not
+done:** the same exercise from a *clean* account that never had Doorman
+installed (fresh install → reload → approve → removal → rollback), and any
+independent third-party review — both tracked in §7. The unit-test suite
+alone does not substitute for live verification (this project's own repeated
+lesson), which is why the above was run against real units rather than
+claimed from the tests.
 
 ## 7. Known limitations
 
@@ -1096,10 +1104,11 @@ own repeated lesson).
 - No automated test against a real Quickshell session or real Omarchy —
   the test suite drives the broker's own protocol directly and via the
   askpass helper, with the trusted egid supplied through a test-only seam
-  so no root, real group or setgid binary is needed in regular CI. A real
+  so no root, real group or setgid binary is needed in regular CI. The real
   `sudo` round trip through the installed setgid C binary, the real socket
-  ACLs and a real Quickshell approval still need to be verified live on the
-  maintainer's own machine, outside automated CI (§6.13).
+  ACLs and a real Quickshell approval are verified live on the maintainer's
+  own machine, outside automated CI, rather than in it (done 2026-11-13;
+  §6.13).
 - No `qmllint` or static analysis on the QML yet.
 - The plugin's manifest `id` is load-bearing for Omarchy's bar layout
   (`~/.config/omarchy/shell.json` tracks placed widgets by id) — renaming it
@@ -1123,28 +1132,28 @@ own repeated lesson).
     `DOORMAN_OWNER_UID` names one), and every uid check is pinned to that
     uid. Adding a second member is an unsupported configuration, not a
     multi-user feature; a different user who did gain access would still be
-    refused by the owner-uid checks (§6.1), but that behavior is part of the
-    live verification, not yet confirmed.
+    refused by the owner-uid checks (§6.1); that cross-uid rejection was
+    confirmed live on 2026-11-13.
   - *`fs.suid_dumpable` dependence.* Whether a setgid `exec` leaves the
     process dumpable depends on that sysctl, which varies by machine. The
     explicit `prctl(PR_SET_DUMPABLE, 0)` in the askpass binary is therefore
     mandatory, not defense in depth; removing it would reopen the same-uid
     ptrace/memory read of the secret on machines where the sysctl is `1`.
-  - *The broker code must be readable by `doorman`.* The unit runs as
-    `doorman` with `ProtectHome=read-only` against a checkout that is
-    currently in the login user's home (§6.7). This may require installing
-    the broker code outside `/home`; it is an open deployment item, not
-    solved.
+  - *The broker code is readable by `doorman`.* The unit runs as `doorman`
+    with `ProtectHome=read-only`, but the broker code is installed root-owned
+    under `/usr/local/lib/omarchy-doorman`, not in the login user's home, so
+    `ProtectHome` does not block it (§6.7, resolved).
   - *Directory traversal for the socket callers.* `/run/doorman` is
     `0750 doorman:doorman` (§6.6); that the askpass binary (egid
-    `doorman-askpass`) and the UI (group `doorman-ui`) can reach their
-    sockets through it is unverified (§6.13).
-  - *Pending final live verification.* The fork-exec race (both the
-    post-connect and pre-connect variants) and the ptrace read of the secret
-    are closed by design but **not yet live-verified** against the real
-    system unit and a real `sudo` round trip (§6.13; Task 12 of
-    `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`). Issue
-    #9558 is not reopened until that passes.
+    `doorman-askpass`) and the UI (group `doorman-ui`) reach their sockets
+    through it was confirmed live on 2026-11-13 (§6.13).
+  - *Live verification done.* The fork-exec race (both the post-connect and
+    pre-connect variants) and the same-user ptrace read of the secret were
+    verified closed on 2026-11-13 against the real system unit and a real
+    `sudo` round trip (§6.13; Task 12 of
+    `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`). The fix
+    is merged to `main` (`f108332`); issue #9558 remains closed pending
+    maintainer action.
 
 ## 8. Acceptance criteria
 

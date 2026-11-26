@@ -82,11 +82,11 @@ we found and fixed while building this.
 ## Installing
 
 > **Status of this flow.** The system-service design below is implemented
-> but has **not yet been verified end to end** on a real machine (real unit,
-> real `sudo` round trip, real Quickshell) — that is the last pending step
-> before this is offered for review again. The broker runs from a
-> root-installed copy under `/usr/local/lib/omarchy-doorman`, not from your
-> home checkout. Expect the steps below to change until that is settled.
+> and verified end to end on a real machine — the real `omarchy-doorman.service`
+> system unit, a real `sudo` round trip through the Quickshell modal to a
+> genuine `uid=0`, with the full unit-test suite and `omarchy plugin validate`
+> passing. The broker runs from a root-installed copy under
+> `/usr/local/lib/omarchy-doorman`, not from your home checkout.
 
 Doorman has two parts: the **plugin**, an Omarchy bar widget, and the
 **broker**, a **system** service (`omarchy-doorman.service`, running as a
@@ -173,9 +173,9 @@ process cannot fake, and the kernel can provide one:
 
 There is no session token or other bearer secret anywhere in this design.
 See [`SPEC.md` §6.13](SPEC.md#613-askpass-identity-is-a-kernel-recorded-credential-the-effective-gid-not-something-the-broker-inspects-or-is-handed)
-for the full reasoning and, in its last paragraphs, exactly what has and
-has not been verified live — the fork-exec race and the ptrace read of the
-secret are closed by design but their live verification is still pending.
+for the full reasoning and, in its last paragraphs, exactly what has been
+verified live — including the fork-exec race and the same-user ptrace read
+of the secret, both exercised against the real broker on 2026-11-13.
 
 ### Activating, updating, and removing
 
@@ -307,13 +307,14 @@ reviewed by anyone outside the project. Current gaps before a wider release:
 - Threat model and plugin lifecycle haven't had an independent review.
 - The current identity design (a setgid askpass binary plus kernel-checked
   socket ACLs, [`SPEC.md` §6.13](SPEC.md#7-known-limitations)) is
-  implemented and unit-tested, but **not yet verified live** against the
-  real system unit, a real `sudo` round trip and a real Quickshell session.
-  Until it is, the fork-exec race and the same-user ptrace read of the
-  secret are closed by design, not confirmed closed. The install flow also
-  has an open deployment item (the broker's code location, see
-  **Installing**). Issue #9558 is not reopened until that live verification
-  passes.
+  implemented, unit-tested, and **verified live** on 2026-11-13 against the
+  real system unit, a real `sudo` round trip and a real Quickshell session:
+  a full round trip to a genuine `uid=0`, the repeated fork-exec attacker
+  runs all rejected, and the same-user ptrace read blocked by the
+  non-dumpable binary. The broker runs from its root-installed copy under
+  `/usr/local/lib/omarchy-doorman` (see **Installing**). That verification
+  was on an already-set-up account, not a clean one (see above), and #9558
+  remains closed pending maintainer action — the fix is on `main` (`f108332`).
 
 None of that changes what's already true today: the secret never leaves the
 approval path, every request is single-use and identity-checked, and the

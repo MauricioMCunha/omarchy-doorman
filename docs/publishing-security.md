@@ -338,8 +338,9 @@ project and has to go along with any submission.
     final task. Still only a partial review. *(The mechanism in this item
     was itself replaced; see item 12.)*
 
-12. **OPEN** — Shape B ("7th design") for the #9558 identity findings:
-    implemented, **not yet verified live, and #9558 is not reopened.** What
+12. **VERIFIED (2026-11-13)** — Shape B ("7th design") for the #9558 identity
+    findings: implemented and **verified live**; the fix is merged to `main`
+    (`f108332`) and #9558 remains closed pending maintainer action. What
     changed, as shipped in the code and described in SPEC.md §6.13: the
     broker became a system service (`User=doorman`) with two sockets
     (`askpass.sock`, group `doorman-askpass`; `control.sock`, group
@@ -351,25 +352,26 @@ project and has to go along with any submission.
     `--owner-uid` and `approve`/`cancel` are bound to the request's owner uid;
     and the whole token/capability/`origin=llm` layer was removed. The
     identity-helper, `SIGSTOP`, `pidfd` and `/proc/<pid>/exe` mechanisms of
-    item 11 no longer exist in the code. Closed by design, live
-    verification pending: the `O_PATH` fd bypass (nothing is read from the
-    peer), the symlink/environment exfiltration (no file read, fixed socket
-    path), the fork-exec race (identity is the connect-time egid), and the
-    same-uid ptrace/memory read of the secret (non-dumpable). Confirmed live
-    so far: only the four kernel assumptions in the design record's spike.
-    Still to do, by a human with root (Task 12 of
+    item 11 no longer exist in the code. The findings are closed by design —
+    the `O_PATH` fd bypass (nothing is read from the peer), the
+    symlink/environment exfiltration (no file read, fixed socket path), the
+    fork-exec race (identity is the connect-time egid), and the same-uid
+    ptrace/memory read of the secret (non-dumpable) — and that closure was
+    confirmed live on 2026-11-13, by a human with root (Task 12 of
     `docs/superpowers/plans/2026-11-09-askpass-identity-shape-b.md`): the
-    real-unit end-to-end round trip, setgid surviving real `sudo -A`, the
-    socket ACL, §6.1's cross-uid `/proc` reads under the system unit, the
-    ptrace attempt against the real binary, the symlink/environment
-    reproduction, both fork-exec variants 20/20, the second-user
-    rejection, and the degraded-state check. Open deployment item: the
-    broker's code lives in the user's home, which `doorman` may not be able
-    to read under `ProtectHome=read-only`; it may need to be installed
-    outside `/home`. Also unresolved: the `/run/doorman` directory is
-    `0750 doorman:doorman`, and that the askpass binary and the UI can
-    traverse it to their sockets is unverified. Items 10 and 11 above are
-    kept as the record of the earlier designs; the mechanisms they describe
-    were replaced.
+    real-unit end-to-end round trip to `uid=0`, setgid surviving real
+    `sudo -A`, the socket ACL, §6.1's cross-uid `/proc` reads under the
+    system unit, the ptrace attempt against the real binary, the
+    symlink/environment audit, both fork-exec variants (20/20 rejected), the
+    second-user rejection, and the degraded-state check, with 37/37 unit
+    tests alongside. The earlier open deployment item is resolved: the
+    broker's code is installed root-owned under
+    `/usr/local/lib/omarchy-doorman`, not in the user's home, so
+    `ProtectHome=read-only` does not block it; and `/run/doorman`
+    (`0750 doorman:doorman`) was confirmed traversable by the askpass binary
+    and the UI to their sockets. What remains before release is a
+    from-clean-account run and an independent review, not the core
+    verification. Items 10 and 11 above are kept as the record of the earlier
+    designs; the mechanisms they describe were replaced.
 
 Don't submit while any blocker above is still open.

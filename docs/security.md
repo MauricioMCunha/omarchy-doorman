@@ -22,8 +22,10 @@
   cancellation.
 
 This document doesn't yet authorize use in financial operations or in a
-production environment. Release depends on testing and on a review of the
-threat model. The current identity design is implemented and unit-tested but
-**not yet verified live** against the real system unit and a real `sudo`
-round trip (`SPEC.md` §6.13); until that passes, the fork-exec race and the
-same-user ptrace read are closed by design, not confirmed closed.
+production environment. Release depends on a clean-machine test pass and an
+independent review of the threat model. The current identity design is
+implemented, unit-tested, and **verified live** on 2026-11-13 against the
+real system unit and a real `sudo` round trip (`SPEC.md` §6.13) — the
+fork-exec race and the same-user ptrace read confirmed closed, not merely
+closed by design. What remains before release is a from-clean-account run
+and third-party review, not the core verification.
