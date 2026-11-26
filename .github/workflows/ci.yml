@@ -55,7 +55,7 @@ jobs:
             -o /tmp/doorman-askpass-asan askpass/doorman-askpass.c
 
       - name: Askpass identity round trip (positive path)
-        run: python3 -m unittest tests.test_broker.BrokerTest.test_request_with_real_trusted_askpass_identity_is_accepted -v
+        run: python3 -m unittest tests.test_broker.BrokerTest.test_request_is_accepted_when_peer_egid_matches_the_trusted_gid -v
 
   security:
     runs-on: ubuntu-latest
