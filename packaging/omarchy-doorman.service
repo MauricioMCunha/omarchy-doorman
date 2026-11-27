@@ -5,11 +5,11 @@ After=local-fs.target
 
 [Service]
 Type=simple
-# @PROJECT_DIR@ is substituted by scripts/doorman-install-askpass with the
-# system install dir /usr/local/lib/omarchy-doorman (root-owned, outside the
-# checkout), so the service does not depend on the user's home at all.
-WorkingDirectory=@PROJECT_DIR@
-ExecStart=@PROJECT_DIR@/scripts/run-doorman-broker
+# Installed by the omarchy-doorman package under /usr/lib/omarchy-doorman
+# (root-owned, outside any user checkout), so the service never depends on
+# the user's home.
+WorkingDirectory=/usr/lib/omarchy-doorman
+ExecStart=/usr/lib/omarchy-doorman/scripts/run-doorman-broker
 User=doorman
 Group=doorman
 SupplementaryGroups=doorman-askpass doorman-ui
