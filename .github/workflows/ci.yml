@@ -79,6 +79,49 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
 
+  package:
+    # Proves the omarchy-doorman package builds from source on a real Arch
+    # toolchain. Pre-release (no published tag yet) it builds from the
+    # checked-out tree via a local source override; Task 4's `makepkg` against
+    # the SHA-256-pinned tag tarball is the integrity-anchored build.
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tooling
+        run: pacman -Sy --needed --noconfirm base-devel namcap
+
+      - name: Create build user (makepkg refuses to run as root)
+        run: |
+          useradd -m builder
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder:builder /home/builder/src
+
+      - name: Lint PKGBUILD and validate .SRCINFO
+        run: |
+          su builder -c 'cd /home/builder/src/packaging && namcap PKGBUILD || true'
+          su builder -c 'cd /home/builder/src/packaging && makepkg --printsrcinfo > /dev/null'
+
+      - name: Build the package from the checked-out tree
+        run: |
+          su builder -c 'set -eu
+            pkgver=$(. /home/builder/src/packaging/PKGBUILD >/dev/null 2>&1; echo "$pkgver")
+            work=/home/builder/pkgbuild
+            mkdir -p "$work/omarchy-doorman-$pkgver"
+            cp -a /home/builder/src/. "$work/omarchy-doorman-$pkgver/"
+            cd "$work"
+            tar czf "omarchy-doorman-$pkgver.tar.gz" "omarchy-doorman-$pkgver"
+            cp /home/builder/src/packaging/PKGBUILD /home/builder/src/packaging/omarchy-doorman.install .
+            sed -i "s|^source=.*|source=(\"omarchy-doorman-$pkgver.tar.gz\")|" PKGBUILD
+            makepkg -f --noconfirm --skipinteg
+            pkg=omarchy-doorman-$pkgver-*-x86_64.pkg.tar.zst
+            echo "built:"; printf "%s\n" $pkg
+            tar tf $pkg | grep -qx "usr/lib/omarchy-doorman/doorman-askpass"
+            tar tf $pkg | grep -qx "usr/lib/systemd/system/omarchy-doorman.service"
+            tar tf $pkg | grep -qx "usr/lib/sysusers.d/omarchy-doorman.conf"
+          '
+
   # qmllint runs locally (scripts/qmllint-check), not here: it needs a real
   # Quickshell + Omarchy shell install to resolve Quickshell's `qs.*`
   # reserved import and the `Quickshell`/`Quickshell.Io`/`Quickshell.Wayland`

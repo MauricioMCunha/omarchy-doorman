@@ -1,0 +1,46 @@
+_bin=/usr/lib/omarchy-doorman/doorman-askpass
+
+post_install() {
+  # Create the system user and groups NOW, not via the pacman systemd-sysusers
+  # hook: that hook runs at end-of-transaction, after this scriptlet, so the
+  # doorman-askpass group would not yet exist when we chgrp below. Explicit and
+  # idempotent — safe to run here and again at the hook.
+  systemd-sysusers /usr/lib/sysusers.d/omarchy-doorman.conf
+
+  # Apply the setgid identity now that the group exists.
+  chgrp doorman-askpass "$_bin"
+  chmod 2755 "$_bin"
+
+  # Fail the transaction loudly if the identity did not stick (e.g. nosuid fs).
+  local owner_group
+  owner_group=$(stat -c '%U:%G' "$_bin")
+  if [ "$owner_group" != "root:doorman-askpass" ]; then
+    echo "omarchy-doorman: ERROR: $_bin is $owner_group, expected root:doorman-askpass" >&2
+    return 1
+  fi
+  if [ $(( 0$(stat -c '%a' "$_bin") & 02000 )) -eq 0 ]; then
+    echo "omarchy-doorman: ERROR: setgid bit missing on $_bin" >&2
+    return 1
+  fi
+
+  systemctl daemon-reload || true
+
+  cat <<'MSG'
+omarchy-doorman: installed. Two manual steps remain (single-user by design):
+  1) Add your login user to the doorman-ui group, then re-login:
+       sudo usermod -aG doorman-ui "$USER"
+  2) Enable and start the broker:
+       sudo systemctl enable --now omarchy-doorman.service
+MSG
+}
+
+post_upgrade() {
+  post_install "$@"
+}
+
+pre_remove() {
+  # Stop and disable the unit before its file is removed, so removal is clean.
+  # The doorman user and the doorman-askpass/doorman-ui groups are left in
+  # place (sysusers does not remove; they own nothing once the files are gone).
+  systemctl disable --now omarchy-doorman.service 2>/dev/null || true
+}

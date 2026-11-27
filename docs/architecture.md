@@ -10,9 +10,9 @@
    trusted UI — plus per-request nonce, timeout, process binding, and buffer
    cleanup. It holds no session token or capability.
 3. **Authentication helper** — a small, dependency-free native binary
-   (`askpass/doorman-askpass.c`), installed once by root at a fixed path
-   outside the plugin's own checkout
-   (`/usr/local/lib/omarchy-doorman/doorman-askpass`), owned
+   (`askpass/doorman-askpass.c`), installed by the `omarchy-doorman` package
+   at a fixed path outside the plugin's own checkout
+   (`/usr/lib/omarchy-doorman/doorman-askpass`), owned
    `root:doorman-askpass`, mode `2755` (**setgid**). Its identity is the
    effective gid the kernel gives any process that executes it: the request
    socket is owned `doorman:doorman-askpass`, `0660`, so only such a process

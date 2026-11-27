@@ -981,5 +981,19 @@ class BrokerTest(unittest.TestCase):
                 self.assertEqual(response, expected)
 
 
+class DefaultInstallPathTest(unittest.TestCase):
+    def test_default_askpass_binary_is_under_usr_lib_package_prefix(self):
+        # The privileged files are shipped by the omarchy-doorman pacman
+        # package under /usr/lib/omarchy-doorman (not /usr/local, which is for
+        # unpackaged local installs). The runner starts the broker without
+        # --askpass-binary, so this default is the path the broker checks.
+        from broker.broker import DEFAULT_ASKPASS_BINARY
+
+        self.assertEqual(
+            DEFAULT_ASKPASS_BINARY,
+            "/usr/lib/omarchy-doorman/doorman-askpass",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -81,51 +81,58 @@ we found and fixed while building this.
 
 ## Installing
 
-> **Status of this flow.** The system-service design below is implemented
-> and verified end to end on a real machine — the real `omarchy-doorman.service`
-> system unit, a real `sudo` round trip through the Quickshell modal to a
-> genuine `uid=0`, with the full unit-test suite and `omarchy plugin validate`
-> passing. The broker runs from a root-installed copy under
-> `/usr/local/lib/omarchy-doorman`, not from your home checkout.
+> **Status of this flow.** The security model below — the setgid askpass
+> identity, the dedicated `doorman` system user, and the socket group ACLs —
+> is implemented and was verified end to end on a real machine on 2026-11-13
+> (the real `omarchy-doorman.service` unit, a real `sudo` round trip through
+> the Quickshell modal to a genuine `uid=0`), with the full unit-test suite
+> and `omarchy plugin validate` passing. The privileged half now ships as the
+> **`omarchy-doorman` pacman package** (installed under
+> `/usr/lib/omarchy-doorman`, not your home checkout); the package-based
+> install is pending its own end-to-end live re-check.
 
 Doorman has two parts: the **plugin**, an Omarchy bar widget, and the
 **broker**, a **system** service (`omarchy-doorman.service`, running as a
-dedicated `doorman` user). `omarchy plugin add` handles the first; the
-broker needs one root step, and the `sudo` wrapper one more by hand.
+dedicated `doorman` user). `omarchy plugin add` handles the first; the broker
+is a package, with one group step and the `sudo` wrapper to wire up by hand.
 
 ```bash
-# 1. Add and enable the plugin — validates the manifest, clones it into
-#    ~/.config/omarchy/plugins/mauricio.doorman as a git checkout, and
-#    places the bar widget without a full shell restart.
+# 1. Add and enable the plugin (the bar widget) — validates the manifest,
+#    clones it into ~/.config/omarchy/plugins/mauricio.doorman, and places
+#    the widget without a full shell restart.
 omarchy plugin add https://github.com/MauricioMCunha/omarchy-doorman.git --enable
 
-# 2. The one root step. Creates the `doorman` system user and the
-#    `doorman-askpass` / `doorman-ui` groups, builds and installs the setgid
-#    askpass binary under /usr/local/lib/omarchy-doorman, adds YOU (the
-#    sudo-invoking user) to `doorman-ui`, and installs the system unit.
-#    Safe to re-run. See "Why this step needs root" below.
-sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass
+# 2. Install the broker package (the privileged half). It builds from a
+#    SHA-256-pinned release and installs the setgid askpass binary, the
+#    broker, and the system unit under /usr/lib/omarchy-doorman, and creates
+#    the `doorman` system user and the `doorman-askpass` / `doorman-ui`
+#    groups. Nothing is read from the plugin checkout. See "Why a package,
+#    and why it needs root" below.
+yay -S omarchy-doorman
 
-# 3. Start the broker (and have it start at boot).
+# 3. Add yourself to the `doorman-ui` group (single-user by design; the
+#    package does not guess who you are).
+sudo usermod -aG doorman-ui "$USER"
+
+# 4. Start the broker (and have it start at boot).
 sudo systemctl enable --now omarchy-doorman.service
 
-# 4. Shadow `sudo` for this user so agents pick it up without any
+# 5. Shadow `sudo` for this user so agents pick it up without any
 #    per-agent configuration — see "Wiring up sudo" below for why this
 #    step is the one that actually makes Doorman useful.
 ln -s ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo ~/.local/bin/sudo
 
-# 5. Log out and back in. Group membership is read at login, so the bar
+# 6. Log out and back in. Group membership is read at login, so the bar
 #    widget (which runs as you, inside Quickshell) cannot reach the broker's
 #    control socket until you do.
 ```
 
 Nothing here replaces `/usr/bin/sudo`, edits `sudoers`, or touches anything
-under `/usr/share/omarchy/`. Step 2 is the one exception to "everything else
-is unprivileged": it creates a system user and two groups, installs one
-small setgid binary (owned by root, not writable by you, outside this
-plugin's own git checkout so `omarchy plugin update` never touches it), and
-installs a system unit. Every step is explicit and reversible — see
-**Activating, updating, and removing** below.
+under `/usr/share/omarchy/`. The `omarchy-doorman` package (step 2) is the one
+privileged part: it creates a system user and two groups, installs one small
+setgid binary (owned by root, not writable by you, under `/usr/lib`, outside
+this plugin's git checkout) and a system unit. Every step is explicit and
+reversible — see **Activating, updating, and removing** below.
 
 **Exactly one login user.** `doorman-ui` must have exactly one login member:
 the broker is pinned to that one user's uid and refuses to start otherwise
@@ -137,9 +144,19 @@ and healthy, the pending queue and recent activity, and hosts the approval
 modal. It does not start or stop the service — that is `systemctl`, above.
 If the broker is down it tells you to run `sudo systemctl enable --now
 omarchy-doorman.service`; if the askpass binary is missing or lost its
-setgid bit it tells you to run `doorman-install-askpass`.
+setgid bit it tells you to install the `omarchy-doorman` package.
 
-### Why this step needs root
+### Why a package, and why it needs root
+
+**Why a package and not an install script in the checkout.** The privileged
+files must not be built or copied from the plugin checkout: that directory is
+writable by your login user, hence by a background agent, so a root install
+step that compiled its C or installed its systemd unit from there could be
+fed attacker-controlled inputs and run them as root. The `omarchy-doorman`
+package closes that: `makepkg` verifies the release tarball against a
+SHA-256 pinned in the package and builds only from its own integrity-checked
+copy, and `pacman` installs root-owned files under `/usr/lib` — none of it
+reads the checkout. The trust anchor is the pinned hash, outside your machine.
 
 `sudo` lets *whoever calls it* choose the `SUDO_ASKPASS` helper. Nothing
 stops a background agent from invoking real `sudo` directly (bypassing
@@ -191,14 +208,14 @@ omarchy plugin enable mauricio.doorman
 sudo systemctl stop omarchy-doorman.service
 sudo systemctl start omarchy-doorman.service
 
-# Pull the latest plugin code (it's a git checkout) and restart the broker
-# to pick up any broker/ changes — the bar widget's QML hot-reloads on its
-# own, the broker does not. The broker runs from a root-installed system copy,
-# so `omarchy plugin update` (an unprivileged git pull) does NOT update it:
-# re-run the install script (refreshes the system copy and askpass binary),
-# then restart the unit.
+# Pull the latest plugin code — the bar widget's QML hot-reloads on its own.
+# `omarchy plugin update` (an unprivileged git pull) never touches the
+# privileged files, which live under /usr/lib.
 omarchy plugin update mauricio.doorman
-sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass
+
+# Update the broker package. Its install scriptlet re-applies the setgid
+# identity and reloads systemd; then restart the unit to pick up the change.
+yay -Syu omarchy-doorman
 sudo systemctl restart omarchy-doorman.service
 ```
 
@@ -210,21 +227,23 @@ sudo systemctl restart omarchy-doorman.service
 [ "$(readlink -f ~/.local/bin/sudo 2>/dev/null)" = "$(readlink -f ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-sudo 2>/dev/null)" ] \
   && rm -f ~/.local/bin/sudo
 
-# 2. Tear down the system side (while the plugin checkout still exists,
-#    since the script lives in it): stops and disables the unit, removes the
-#    unit file and the installed askpass binary, removes you from
-#    `doorman-ui`, and deletes the `doorman` user and the two groups.
-sudo ~/.config/omarchy/plugins/mauricio.doorman/scripts/doorman-install-askpass --uninstall
+# 2. Remove the broker package. Its pre-remove scriptlet stops and disables
+#    the unit; pacman then removes the unit, the askpass binary, and the
+#    broker under /usr/lib.
+sudo pacman -R omarchy-doorman
 
 # 3. Remove the plugin (disables and unloads the widget, then backs up or
 #    deletes the plugin folder, since it is a git checkout).
 omarchy plugin remove mauricio.doorman --yes
 
-# 4. Log out and back in to drop the stale `doorman-ui` membership.
+# 4. Optionally drop yourself from `doorman-ui`, then log out and back in.
+sudo gpasswd -d "$USER" doorman-ui
 ```
 
-`--uninstall` tolerates a group that is still in use (it prints a notice and
-leaves it) and is safe to re-run.
+The `doorman` system user and the `doorman-askpass` / `doorman-ui` groups are
+left in place by `pacman -R` (they own nothing once the package is gone).
+Remove them by hand if you want: `sudo userdel doorman` and
+`sudo groupdel doorman-askpass doorman-ui`.
 
 ### Wiring up `sudo`
 
@@ -269,7 +288,7 @@ scripts/doorman-run -- sudo systemctl restart some-service
 
 # Or point SUDO_ASKPASS at the installed helper directly, the way a real
 # `sudo -A` invocation (or an agent's own shell) would:
-export SUDO_ASKPASS=/usr/local/lib/omarchy-doorman/doorman-askpass
+export SUDO_ASKPASS=/usr/lib/omarchy-doorman/doorman-askpass
 sudo -A whoami
 ```
 
@@ -311,10 +330,13 @@ reviewed by anyone outside the project. Current gaps before a wider release:
   real system unit, a real `sudo` round trip and a real Quickshell session:
   a full round trip to a genuine `uid=0`, the repeated fork-exec attacker
   runs all rejected, and the same-user ptrace read blocked by the
-  non-dumpable binary. The broker runs from its root-installed copy under
-  `/usr/local/lib/omarchy-doorman` (see **Installing**). That verification
-  was on an already-set-up account, not a clean one (see above), and #9558
-  remains closed pending maintainer action — the fix is on `main` (`f108332`).
+  non-dumpable binary. That verification ran with the broker installed under
+  `/usr/local/lib/omarchy-doorman`; the privileged half now ships as the
+  `omarchy-doorman` package under `/usr/lib/omarchy-doorman` (see
+  **Installing**), whose package-based install is pending its own live
+  re-check. That verification was on an already-set-up account, not a clean
+  one (see above). The shape-B fix is on `main` (`f108332`); #9558 stayed
+  closed and the plugin is resubmitted for review as #15997.
 
 None of that changes what's already true today: the secret never leaves the
 approval path, every request is single-use and identity-checked, and the

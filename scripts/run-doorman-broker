@@ -13,7 +13,7 @@ readonly project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # Early existence check only: the broker resolves the gid itself via getgrnam
 # (passing --trusted-askpass-gid would trip the test seam in production).
 if ! getent group doorman-askpass >/dev/null; then
-  echo "run-doorman-broker: group doorman-askpass not found (run doorman-install-askpass)" >&2
+  echo "run-doorman-broker: group doorman-askpass not found (install the omarchy-doorman package)" >&2
   exit 1
 fi
 
