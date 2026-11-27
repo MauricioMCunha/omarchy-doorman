@@ -7,6 +7,9 @@ arch=('x86_64')
 url="https://github.com/MauricioMCunha/omarchy-doorman"
 license=('MIT')
 depends=('python' 'systemd' 'bash')
+# No separate -debug package: the one tiny C binary carries no useful debuginfo
+# split, and a single artifact keeps install/verify simple.
+options=('!debug')
 install="$pkgname.install"
 # The source is a fixed, tagged release tarball; its sha256 (set at release
 # time, Task 4) is the trust anchor. makepkg verifies it and builds only from
