@@ -72,10 +72,10 @@ Quickshell plugin ─ bridge.py ─ /run/doorman/control.sock ┘
   `doorman-askpass` gid and the single owner uid (`--owner-uid`). It holds no
   token, capability or other secret: there is none (§6.9).
 - **askpass helper** (`askpass/doorman-askpass.c`, compiled and installed by
-  `scripts/doorman-install-askpass`): implements the `SUDO_ASKPASS`
+  the `omarchy-doorman` package): implements the `SUDO_ASKPASS`
   contract — reads a prompt on argv, writes the secret to stdout, nothing
-  else. Installed once by root at
-  `/usr/local/lib/omarchy-doorman/doorman-askpass`, outside the plugin's
+  else. Installed by root at
+  `/usr/lib/omarchy-doorman/doorman-askpass`, outside the plugin's
   own git checkout, owned `root:doorman-askpass`, mode `2755` (setgid), not
   writable by the user. Its identity is its effective gid, which the kernel
   records for the broker at `connect()` (§6.13) — the helper hands the broker
@@ -449,29 +449,28 @@ something the unit-test suite exercises.
 
 ### 6.7 Systemd sandboxing
 
-The broker is a **system** unit, `/etc/systemd/system/omarchy-doorman.service`
-(installed by `scripts/doorman-install-askpass`, started with
+The broker is a **system** unit,
+`/usr/lib/systemd/system/omarchy-doorman.service` (installed by the
+`omarchy-doorman` package, started with
 `systemctl enable --now omarchy-doorman.service`), not a `systemd --user`
 unit. It sets `User=doorman`, `Group=doorman`,
 `SupplementaryGroups=doorman-askpass doorman-ui` (so it may `chgrp` both
-sockets), `RuntimeDirectory=doorman`, `RuntimeDirectoryMode=0750`,
+sockets), `RuntimeDirectory=doorman`, `RuntimeDirectoryMode=0711`,
 `ReadWritePaths=/run/doorman` and `UMask=0007`, and is
 `WantedBy=multi-user.target`. Its sockets live in `/run/doorman` and do not
 depend on any login session; the UI simply needs them to exist. The
-`ExecStart` is `scripts/run-doorman-broker`, with `@PROJECT_DIR@` in the unit
-template replaced at install time by the checkout the script was run from.
+`ExecStart` is `/usr/lib/omarchy-doorman/scripts/run-doorman-broker`; the unit
+hardcodes that path (the package installs everything there), so it depends on
+no checkout and needs no install-time substitution.
 
-**Deployment note (resolved).** The broker's code is read from a root-owned
-copy installed under `/usr/local/lib/omarchy-doorman`, not from the login
-user's home checkout — `scripts/doorman-install-askpass` places it there and
-the installed unit's `WorkingDirectory`/`ExecStart` point at it. Confirmed
-live: the running unit executes
-`/usr/local/lib/omarchy-doorman/scripts/run-doorman-broker` as `doorman`, so
-`ProtectHome=read-only` never has to grant the broker access to anything
-under `/home`. (Earlier revisions ran the broker from the home checkout,
-where `ProtectHome` plus a `0700` home could block it — the askpass binary
-was already under `/usr/local/lib`, and the broker code now follows it; the
-unit file still carries a comment about the older arrangement.)
+**Deployment note (resolved).** The broker's code is read from the root-owned
+package copy under `/usr/lib/omarchy-doorman`, not from the login user's home
+checkout — the `omarchy-doorman` package places it there and the unit's
+`WorkingDirectory`/`ExecStart` point at it. So `ProtectHome=read-only` never
+has to grant the broker access to anything under `/home`. (Earlier revisions
+ran the broker from the home checkout, where `ProtectHome` plus a `0700` home
+could block it; the broker code now lives under `/usr/lib` alongside the
+askpass binary.)
 
 The unit additionally sets `NoNewPrivileges`, `PrivateTmp`,
 `RestrictAddressFamilies=AF_UNIX` (the broker never needs any other socket
@@ -731,7 +730,7 @@ what "the password never reaches the agent" promises never happens
 same request-to-password boundary).
 
 The fix installs the askpass binary (`askpass/doorman-askpass.c`) once, by
-root (`scripts/doorman-install-askpass`), at a fixed path *outside* the
+root (by Doorman's install step of the time), at a fixed path *outside* the
 plugin's own git checkout, owned `root:root`, mode `0711`, and not writable
 or readable by the user the broker and every agent run as (only
 executable). The broker resolves that path's device+inode once at startup.
@@ -752,7 +751,7 @@ hard way (below): it goes through the exact same DAC read check as opening
 the target file by its real path, so mode `0711` that blocks a forged
 `open()`-by-path also blocks the legitimate binary's own self-open. The
 installed binary therefore also carries a file capability,
-`cap_dac_read_search` (applied by `scripts/doorman-install-askpass` via
+`cap_dac_read_search` (applied by Doorman's install step of the time via
 `setcap`, after `chown`/`chmod` but before the file is moved into place —
 writing to a file's content clears any capability already set on it, so
 order matters), letting *that exact binary, once exec'd* bypass this one
@@ -857,8 +856,8 @@ reintroduced by accident, not just in theory:
   with `askpass_identity_unavailable` until it's fixed.
 
 - **The capability has to actually be there, not silently dropped.**
-  `scripts/doorman-install-askpass` applies `setcap cap_dac_read_search=ep`
-  as the *last* step before the binary is moved into place — writing to a
+  Doorman's install step of the time applied `setcap cap_dac_read_search=ep`
+  as the *last* step before the binary was moved into place — writing to a
   file's content strips any capability already on it, so compiling, then
   `chown`/`chmod`, then `setcap`, then `mv` is the only safe order. The
   script also refuses to install onto a `nosuid` mount (that mount option
@@ -940,15 +939,15 @@ here.
 **The mechanism.** The broker is a **system** service running as a dedicated
 system user, `doorman` (§6.7). Three things work together:
 
-1. *The askpass binary is setgid.* `scripts/doorman-install-askpass`
-   compiles `askpass/doorman-askpass.c` and installs it at
-   `/usr/local/lib/omarchy-doorman/doorman-askpass`, owned
-   `root:doorman-askpass`, mode `2755`. The install script verifies the
-   owner and the setgid bit after the move and fails if either did not
-   stick. A process that `exec`s this file runs with effective gid
-   `doorman-askpass`. The group owns no other file, and the install script
-   adds no login user to it (the only account added to it is the service
-   user `doorman`, so the broker can `chgrp` its socket).
+1. *The askpass binary is setgid.* The `omarchy-doorman` package compiles
+   `askpass/doorman-askpass.c` and installs it at
+   `/usr/lib/omarchy-doorman/doorman-askpass`, owned `root:doorman-askpass`,
+   mode `2755`. The package's install scriptlet applies that ownership and
+   setgid bit (after `systemd-sysusers` has created the group) and fails the
+   transaction if either did not stick. A process that `exec`s this file runs
+   with effective gid `doorman-askpass`. The group owns no other file, and the
+   packaging adds no login user to it (the only account added to it is the
+   service user `doorman`, so the broker can `chgrp` its socket).
 2. *The kernel enforces it at `connect()`.* The request socket
    `/run/doorman/askpass.sock` is owned `doorman:doorman-askpass`, mode
    `0660`. Because the owner (`doorman`) is not the connecting uid, the
@@ -1053,8 +1052,10 @@ afterward — for a post-connect fork the child has no ACL access to the
 socket and shares no egid; for a pre-connect fork the connector is judged by
 its own egid), and the same-uid ptrace/memory read of the secret
 (`PR_SET_DUMPABLE`). **Confirmed live on 2026-11-13**, against the real
-system unit (`User=doorman`, broker running from
-`/usr/local/lib/omarchy-doorman`), a real `sudo` round trip and a real
+system unit (`User=doorman`, broker then running from
+`/usr/local/lib/omarchy-doorman`; now `/usr/lib/omarchy-doorman` via the
+`omarchy-doorman` package, whose packaged deployment is pending its own live
+re-check), a real `sudo` round trip and a real
 Quickshell session: the full human round trip (`sudo id` → modal → approve →
 a genuine `uid=0`); the four kernel assumptions from the design spike
 (setgid survives `sudo -A`; the socket group ACL refuses a non-member; the
@@ -1094,7 +1095,7 @@ claimed from the tests.
   is losing the friendly retry labeling and `DOORMAN_COMMAND` hint that
   come from going through the wrapper.
 - The askpass identity (§6.13) requires a one-time, root-privileged install
-  step (`scripts/doorman-install-askpass`) that didn't exist before — every
+  step (installing the `omarchy-doorman` package) that didn't exist before — every
   other install step stays fully unprivileged. If that step is skipped, or
   the installed file is later removed or its setgid bit lost, the broker is
   designed to fail loudly (`stats` reports `askpass_identity_available:
@@ -1141,7 +1142,7 @@ claimed from the tests.
     ptrace/memory read of the secret on machines where the sysctl is `1`.
   - *The broker code is readable by `doorman`.* The unit runs as `doorman`
     with `ProtectHome=read-only`, but the broker code is installed root-owned
-    under `/usr/local/lib/omarchy-doorman`, not in the login user's home, so
+    under `/usr/lib/omarchy-doorman`, not in the login user's home, so
     `ProtectHome` does not block it (§6.7, resolved).
   - *Directory traversal for the socket callers.* `/run/doorman` is
     `0750 doorman:doorman` (§6.6); that the askpass binary (egid

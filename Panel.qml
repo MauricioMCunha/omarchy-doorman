@@ -41,7 +41,7 @@ Panel {
     ? (setupOk ? "No pending authorization" : "Setup incomplete")
     : "Broker unavailable"
   readonly property string statusSubtitle: online
-    ? (setupOk ? "All clear — new requests appear here." : "Run doorman-install-askpass to finish setup.")
+    ? (setupOk ? "All clear — new requests appear here." : "Install the omarchy-doorman package to finish setup.")
     : "sudo systemctl enable --now omarchy-doorman.service"
 
   function open() {

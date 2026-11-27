@@ -23,9 +23,9 @@ project and has to go along with any submission.
 - The UI calls absolute executables and the bridge ships alongside the
   plugin; there's no path override via environment variable.
 - The service is explicit and reversible; the plugin doesn't silently
-  install a service or package. The broker is a system service installed by
-  one explicit root step (`scripts/doorman-install-askpass`, with
-  `--uninstall`), not a `systemd --user` unit.
+  install a service or package. The broker is a system service shipped as the
+  `omarchy-doorman` pacman package (removed with `pacman -R`), not a
+  `systemd --user` unit.
 
 ## Blockers before submission
 
@@ -51,10 +51,10 @@ project and has to go along with any submission.
    as a git checkout, and places the widget without a full shell restart.
    The broker step (the `systemd --user` service) stays manual, since
    `omarchy plugin add` doesn't manage units — documented explicitly as
-   such. *(Superseded 2026-11: the broker is now a system service installed
-   by `scripts/doorman-install-askpass` and started with
-   `systemctl enable --now`; the README documents that flow and its
-   `--uninstall` counterpart. Item 12 tracks that change.)*
+   such. *(Superseded 2026-11: the broker is now a system service shipped as
+   the `omarchy-doorman` pacman package and started with
+   `systemctl enable --now`; the README documents that flow and `pacman -R`
+   removal. Item 12 tracks that change.)*
 4. Test on a clean account: installation, shell restart, toggling the
    broker, approval, cancellation, expiry, removal, and rollback.
 5. ~~Add dependency review, `qmllint`, Python tests, and secret inspection
@@ -207,10 +207,10 @@ project and has to go along with any submission.
     for a non-owner caller (`EACCES`, identical to the real binary's
     failure for its own non-root invoker).
 
-    Fourth, current fix: same `SCM_RIGHTS`/`fstat()` design, with the
-    installed binary additionally granted the `cap_dac_read_search` Linux
-    file capability (via `setcap`, applied by
-    `scripts/doorman-install-askpass` after `chown`/`chmod` but before the
+    Fourth fix (later superseded — see item 11): same `SCM_RIGHTS`/`fstat()`
+    design, with the installed binary additionally granted the
+    `cap_dac_read_search` Linux file capability (via `setcap`, applied by
+    Doorman's install step of the time after `chown`/`chmod` but before the
     file is moved into place, since writing to a file clears any capability
     already on it). That capability lets *this exact binary, once exec'd*
     bypass the one read check it needs to pass on itself, without running
@@ -218,7 +218,7 @@ project and has to go along with any submission.
     can then only read a file it shouldn't, not execute arbitrary code as
     root) and without granting anything to an attacker's own substitute
     binary (file capabilities apply only at `execve()` of the specific
-    capability-bearing file). `scripts/doorman-install-askpass` also
+    capability-bearing file). That install step also
     refuses to install onto a `nosuid` mount — that mount option drops file
     capabilities at exec time the same way it drops `setuid`/`setgid`, and
     verifies via `getcap` after install that the capability actually stuck
@@ -310,7 +310,7 @@ project and has to go along with any submission.
 
     The askpass binary (`askpass/doorman-askpass.c`) goes back to being
     privilege-free: no file capability, no `setuid`/`setgid`, no
-    `SCM_RIGHTS`, no self-exe open. `scripts/doorman-install-askpass` lost
+    `SCM_RIGHTS`, no self-exe open. Doorman's install step lost
     the `setcap`/`nosuid`-check/`getcap`-verification logic entirely, and
     the installed mode reverted from `0711` to `0755`. Independently, the
     binary's token/capability reads now open with `O_NOFOLLOW` and verify
@@ -366,7 +366,7 @@ project and has to go along with any submission.
     second-user rejection, and the degraded-state check, with 37/37 unit
     tests alongside. The earlier open deployment item is resolved: the
     broker's code is installed root-owned under
-    `/usr/local/lib/omarchy-doorman`, not in the user's home, so
+    `/usr/lib/omarchy-doorman`, not in the user's home, so
     `ProtectHome=read-only` does not block it; and `/run/doorman`
     (`0750 doorman:doorman`) was confirmed traversable by the askpass binary
     and the UI to their sockets. What remains before release is a

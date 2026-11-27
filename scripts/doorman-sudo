@@ -6,7 +6,7 @@ set -euo pipefail
 # Explicit non-interactive/stdin modes remain untouched.
 
 readonly real_sudo="/usr/bin/sudo"
-# The helper installed by scripts/doorman-install-askpass (SPEC.md §6.13)
+# The helper installed by the omarchy-doorman package (SPEC.md §6.13)
 # is a root-owned, setgid `doorman-askpass` binary (mode 2755) at a fixed path
 # outside the plugin's checkout. Its identity is its effective gid, which the
 # kernel records at connect() and the broker reads via SO_PEERCRED. The socket
@@ -18,7 +18,7 @@ readonly real_sudo="/usr/bin/sudo"
 # DOORMAN_ASKPASS is a dev/test override only (e.g. a wrapper running the
 # Python broker.askpass, which needs DOORMAN_SOCKET set by the caller). Being
 # non-setgid, it is rejected by the production broker, which is correct.
-readonly askpass="${DOORMAN_ASKPASS:-/usr/local/lib/omarchy-doorman/doorman-askpass}"
+readonly askpass="${DOORMAN_ASKPASS:-/usr/lib/omarchy-doorman/doorman-askpass}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -46,7 +46,7 @@ esac
 
 [[ -x "$askpass" || -f "$askpass" ]] || {
   echo "doorman: askpass helper not installed at $askpass — run" \
-       "'sudo scripts/doorman-install-askpass' once first" >&2
+       "'yay -S omarchy-doorman' once first" >&2
   exit 1
 }
 

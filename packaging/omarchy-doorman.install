@@ -37,3 +37,10 @@ MSG
 post_upgrade() {
   post_install "$@"
 }
+
+pre_remove() {
+  # Stop and disable the unit before its file is removed, so removal is clean.
+  # The doorman user and the doorman-askpass/doorman-ui groups are left in
+  # place (sysusers does not remove; they own nothing once the files are gone).
+  systemctl disable --now omarchy-doorman.service 2>/dev/null || true
+}

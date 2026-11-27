@@ -82,7 +82,7 @@ SOCKET_CONTROL = "control"
 UI_VERBS = ("approve", "cancel", "pending", "stats")
 # Fixed install location of the setgid askpass binary (root:doorman-askpass,
 # mode 2755). Overridable only for tests (--askpass-binary).
-DEFAULT_ASKPASS_BINARY = "/usr/local/lib/omarchy-doorman/doorman-askpass"
+DEFAULT_ASKPASS_BINARY = "/usr/lib/omarchy-doorman/doorman-askpass"
 # How many extra parent-process hops, beyond the caller itself, the broker
 # follows while looking for the trusted executable (bridge.py runs as a
 # direct child of Quickshell — 1 hop is enough in practice; the slack covers
@@ -199,7 +199,7 @@ class Broker:
             f"{str(self.askpass_binary)!r} (root:{ASKPASS_GROUP}, setgid) or the "
             f"{ASKPASS_GROUP!r} group does not resolve — askpass requests will "
             "be refused (untrusted_askpass_helper) until it is installed "
-            "(scripts/doorman-install-askpass).",
+            "(install the omarchy-doorman package).",
             file=sys.stderr,
             flush=True,
         )
