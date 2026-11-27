@@ -1,0 +1,48 @@
+# Maintainer: MauricioMCunha <https://github.com/MauricioMCunha>
+pkgname=omarchy-doorman
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local, human-approved sudo for background AI agents — privileged broker and setgid askpass helper"
+arch=('x86_64')
+url="https://github.com/MauricioMCunha/omarchy-doorman"
+license=('MIT')
+depends=('python' 'systemd' 'bash')
+install="$pkgname.install"
+# The source is a fixed, tagged release tarball; its sha256 (set at release
+# time, Task 4) is the trust anchor. makepkg verifies it and builds only from
+# its own integrity-checked srcdir — nothing is read from the plugin checkout.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/MauricioMCunha/omarchy-doorman/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_src="omarchy-doorman-$pkgver"
+
+build() {
+  cd "$srcdir/$_src"
+  # Exact hardened flags (match CI and SPEC); do not inherit makepkg CFLAGS.
+  cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic \
+    -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+    -o doorman-askpass askpass/doorman-askpass.c
+}
+
+package() {
+  cd "$srcdir/$_src"
+  local libdir="$pkgdir/usr/lib/omarchy-doorman"
+
+  # Binary installed root:root 0755 here; the setgid identity
+  # (root:doorman-askpass 2755) is applied in post_install, once the group
+  # exists (see omarchy-doorman.install).
+  install -Dm0755 doorman-askpass "$libdir/doorman-askpass"
+
+  # Broker runtime (stdlib only). Runner does `python3 -m broker.broker` with
+  # cwd=/usr/lib/omarchy-doorman, so these two modules are the whole set.
+  install -Dm0644 broker/__init__.py "$libdir/broker/__init__.py"
+  install -Dm0644 broker/broker.py   "$libdir/broker/broker.py"
+  install -Dm0755 scripts/run-doorman-broker "$libdir/scripts/run-doorman-broker"
+
+  install -Dm0644 packaging/omarchy-doorman.service \
+    "$pkgdir/usr/lib/systemd/system/omarchy-doorman.service"
+  install -Dm0644 packaging/omarchy-doorman.sysusers.conf \
+    "$pkgdir/usr/lib/sysusers.d/omarchy-doorman.conf"
+
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
